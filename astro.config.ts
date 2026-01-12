@@ -20,7 +20,6 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   site: 'https://0xNoramiya.github.io',
-  base: '/kudaliar.github.io',
   integrations: [
     expressiveCode({
       themes: ['github-light', 'github-dark'],
