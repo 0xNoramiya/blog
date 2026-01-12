@@ -4,7 +4,7 @@ export const SITE: Site = {
   title: "kudaliar's blog",
   description:
     'CTF writeups and security research by kudaliar.',
-  href: 'https://kudaliar.id',
+  href: 'https://0xNoramiya.github.io/blog',
   author: 'kudaliar',
   locale: 'en-US',
   featuredPostCount: 2,
