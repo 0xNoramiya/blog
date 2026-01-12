@@ -1,0 +1,165 @@
+---
+title: 'UofTCTF 2026 - UofT LFSR Labyrinth'
+description: 'Crypto challenge involving a custom nonlinear filter generator (LFSR) broken via algebraic attack using Z3 solver.'
+date: 2026-01-12
+tags: ['writeup', 'crypto', 'lfsr', 'z3', 'algebraic-attack', 'python', 'uoftctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Overview
+
+We are presented with a custom stream cipher implementation involving a **Linear Feedback Shift Register (LFSR)** and a nonlinear filter function.
+
+| Category | Difficulty | Flag |
+|----------|------------|------|
+| Crypto | Medium | `uoftctf{l33ky_lfsr_w17h_n0n_l1n34r_fl4v0rrrr}` |
+
+---
+
+## Analysis
+
+The system describes a classic **Nonlinear Filter Generator**.
+
+*   **Source Files:** `crypto.py` handles key derivation and encryption, while `filter_cipher.py` implements the LFSR logic.
+*   **Parameters:** The LFSR has a state size of 48 bits.
+*   **Data:** We are given 80 bits of generated `keystream`, a `nonce`, and the `ct` (ciphertext).
+
+### System Properties
+
+1.  **State Size:** The internal state is 48 bits ($2^{48}$ possibilities). While brute-forcing this is computationally expensive, it is small enough for algebraic attacks.
+2.  **Overdefined System:** We have 48 unknown variables (the initial state bits) but are given 80 bits of output (equations). This suggests the system is solvable.
+3.  **Vulnerability:** The complexity of the filter function (WG-style ANF terms) is high, but the state transitions are linear. A SAT solver (like Z3) can easily model the linear shifts and the nonlinear constraints to recover the initial state essentially instantly.
+
+---
+
+## Solution Strategy
+
+We will perform an algebraic attack using **Z3**:
+
+1.  **Symbolic State:** Define 48 symbolic boolean variables representing the initial LFSR state.
+2.  **Simulation:** Replicate the `clock()` function from `filter_cipher.py` using Z3 operations. For each of the 80 known keystream bits:
+    *   Calculate the symbolic output of the filter function.
+    *   Add a constraint that this symbolic output must equal the actual keystream bit.
+    *   Symbolically update the LFSR state (shift and XOR feedback).
+3.  **Solve & Decrypt:** Ask Z3 to find a satisfying model (the initial bits). Use these bits to derive the key via HKDF and decrypt the flag using ChaCha20-Poly1305.
+
+```mermaid
+graph TD
+    A[Symbolic State (48 vars)] --> B{Loop 80 times}
+    B --> C[Calc Filter Output]
+    C --> D[Add Constraint: out == keystream[i]]
+    D --> E[Clock LFSR State]
+    E --> B
+    B -- Done --> F[Z3 Solve]
+    F --> G[Recover Initial State]
+    G --> H[Derive Key & Decrypt]
+```
+
+---
+
+## Solver Script
+
+```python
+import binascii
+from z3 import *
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+
+# --- Challenge Parameters ---
+L = 48
+feedback_taps = [0, 1, 2, 3, 47]
+filter_taps = [0, 4, 7, 11, 16, 22, 29]
+keystream = [
+    1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 1,
+    1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1,
+    0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1
+]
+nonce_hex = "8592d59a1c2c0491dab7ed39"
+ct_hex = "d2a9a529dfcb9b02ad497f9ed915285cc175edbd9c2e1c6f2144a7228fd00c2ba2db21470abb6f4de0bdec24c0eeddf13fa1a2935f735d5d429f932a21"
+
+# ANF Terms (WG-style transformation)
+WG_ANF_TERMS = [
+    (1, 2, 3, 4, 5, 6), (0, 1, 2, 3, 5), (0, 1, 2, 4, 5), (0, 1, 3, 4, 5),
+    (1, 2, 3, 4, 5), (0, 1, 2, 4, 6), (0, 2, 3, 4, 6), (1, 2, 3, 4, 6),
+    (0, 1, 2, 5, 6), (0, 2, 3, 5, 6), (1, 2, 3, 5, 6), (0, 3, 4, 5, 6),
+    (1, 3, 4, 5, 6), (0, 1, 2, 4), (0, 1, 2, 5), (1, 2, 3, 5),
+    (0, 1, 4, 5), (1, 3, 4, 5), (2, 3, 4, 5), (1, 2, 3, 6),
+    (0, 1, 4, 6), (1, 2, 4, 6), (0, 3, 4, 6), (1, 3, 4, 6),
+    (1, 2, 5, 6), (0, 3, 5, 6), (1, 4, 5, 6), (2, 4, 5, 6),
+    (3, 4, 5, 6), (0, 1, 2), (0, 1, 4), (0, 2, 4),
+    (1, 2, 4), (0, 1, 5), (0, 3, 5), (1, 3, 5),
+    (2, 3, 5), (3, 4, 5), (0, 1, 6), (0, 3, 6),
+    (2, 3, 6), (3, 4, 6), (0, 5, 6), (2, 5, 6),
+    (4, 5, 6), (2, 3), (3, 4), (0, 5),
+    (3, 5), (1, 6), (3, 6), (4, 6),
+    (0,), (3,), (5,), (6,)
+]
+
+def solve():
+    print("[*] Setting up Z3 Solver...")
+    solver = Solver()
+    
+    # 1. Initialize Symbolic State (48 bits)
+    initial_state = [BitVec(f's_{i}', 1) for i in range(L)]
+    current_state = list(initial_state)
+
+    # 2. Simulate LFSR steps
+    for k_bit in keystream:
+        # Extract taps for filter function
+        taps = [current_state[i] for i in filter_taps]
+        
+        # Calculate symbolic output using ANF terms
+        z_out = BitVecVal(0, 1)
+        for term in WG_ANF_TERMS:
+            term_val = BitVecVal(1, 1)
+            for idx in term:
+                term_val &= taps[idx] # Logical AND
+            z_out ^= term_val         # Logical XOR
+        
+        # Constraint: Symbolic output == Known keystream bit
+        solver.add(z_out == k_bit)
+
+        # Clock LFSR: Calculate feedback and shift
+        fb = BitVecVal(0, 1)
+        for idx in feedback_taps:
+            fb ^= current_state[idx]
+        current_state = [fb] + current_state[:-1]
+
+    # 3. Solve
+    print("[*] Solving constraints...")
+    if solver.check() == sat:
+        print("[+] SAT! Model found.")
+        model = solver.model()
+        recovered_bits = [model[v].as_long() for v in initial_state]
+        print(f"[+] Recovered Initial State: {recovered_bits}")
+        return recovered_bits
+    else:
+        print("[-] UNSAT. Constraints are impossible.")
+        return None
+
+def decrypt_flag(state_bits):
+    print("[*] Deriving key and decrypting...")
+    # Helper from crypto.py
+    data = bytes(state_bits)
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"nlfg-ctf")
+    key = hkdf.derive(data)
+    
+    nonce = binascii.unhexlify(nonce_hex)
+    ct = binascii.unhexlify(ct_hex)
+    aead = ChaCha20Poly1305(key)
+    
+    try:
+        flag = aead.decrypt(nonce, ct, associated_data=None)
+        print(f"\n[+] FLAG: {flag.decode()}")
+    except Exception as e:
+        print(f"[-] Decryption Error: {e}")
+
+if __name__ == "__main__":
+    state = solve()
+    if state:
+        decrypt_flag(state)
+```
+
+**Flag:** `uoftctf{l33ky_lfsr_w17h_n0n_l1n34r_fl4v0rrrr}`
