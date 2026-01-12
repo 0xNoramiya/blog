@@ -58,7 +58,7 @@ def xor_file(data, key):
 | **Key** | `G0G0Squ1d3Ncrypt10n` |
 | **Encoding** | XORed data → Hex string (`.hex()`) |
 | **Exfil Target** | `POST http://34.134.77.90:8080/upload` |
-| **Target Extensions** | `.docx`, `.png`, `.jpeg`, `.jpg` |
+| **Target Extensions** | `.jpg` |
 
 > [!IMPORTANT]
 > The malware uses a simple XOR cipher with a hardcoded key - this makes decryption trivial since XOR is symmetric!
@@ -75,11 +75,11 @@ http.request.method == "POST" && ip.dst == 34.134.77.90
 
 I found **5 distinct POST requests**. Each request body contained a `file` parameter with a large hexadecimal string and a filename:
 
-1. `3G2BHzj.jpeg`
-2. `[File2].png`
-3. `[File3].docx`
+1. `3G2BHzj.jpg`
+2. `[File2].jpg`
+3. `[File3].jpg`
 4. `[File4].jpg`
-5. `[File5].png`
+5. `[File5].jpg`
 
 ---
 
@@ -122,11 +122,11 @@ def decrypt_file(hex_data, output_filename):
     print(f"[+] Recovered {output_filename}")
 
 # Run for all 5 hex blobs extracted from Wireshark
-decrypt_file(hex_blob_1, "recovered_1.jpeg")
-decrypt_file(hex_blob_2, "recovered_2.png")
-decrypt_file(hex_blob_3, "recovered_3.docx")
+decrypt_file(hex_blob_1, "recovered_1.jpg")
+decrypt_file(hex_blob_2, "recovered_2.jpg")
+decrypt_file(hex_blob_3, "recovered_3.jpg")
 decrypt_file(hex_blob_4, "recovered_4.jpg")
-decrypt_file(hex_blob_5, "recovered_5.png")
+decrypt_file(hex_blob_5, "recovered_5.jpg")
 ```
 
 ---
@@ -144,8 +144,6 @@ import flagImage from './flag.jpg';
 > [!TIP]
 > **How to verify file recovery:** Check the magic bytes at the start of each file!
 > - JPEG: `FF D8 FF`
-> - PNG: `89 50 4E 47`
-> - DOCX (ZIP): `50 4B 03 04`
 
 ---
 
