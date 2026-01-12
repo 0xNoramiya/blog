@@ -10,10 +10,16 @@ interface Props {
 }
 
 const { href, external, class: className, underline, ...rest } = Astro.props
+
+// Prepend base path for internal links (starting with /)
+const base = import.meta.env.BASE_URL || ''
+const resolvedHref = !external && href.startsWith('/') && !href.startsWith(base) 
+  ? `${base}${href}` 
+  : href
 ---
 
 <a
-  href={href}
+  href={resolvedHref}
   target={external ? '_blank' : '_self'}
   class={cn(
     'inline-block transition-colors duration-300 ease-in-out',
