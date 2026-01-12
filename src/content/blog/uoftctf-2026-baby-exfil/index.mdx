@@ -135,6 +135,12 @@ decrypt_file(hex_blob_5, "recovered_5.png")
 
 After running the script, I successfully recovered 5 files. Opening them one by one, I found the flag inside one of the recovered images (which verified correctly with the JPEG Magic Bytes `FF D8 FF`).
 
+import flagImage from './flag.jpg';
+
+<img src={flagImage.src} alt="Recovered image containing the flag" style="max-width: 100%; border-radius: 8px; margin: 1rem 0;" />
+
+*The recovered image with the flag embedded: `uoftctf{b4by_w1r3sh4rk_an4lys1s}`*
+
 > [!TIP]
 > **How to verify file recovery:** Check the magic bytes at the start of each file!
 > - JPEG: `FF D8 FF`
