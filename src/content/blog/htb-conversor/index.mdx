@@ -32,9 +32,6 @@ graph TD
     E -->|5. Lateral Movement| F[User 'fismathack']
     F -->|6. Sudo Misconfiguration| G[Root Privilege Escalation]
     G --> H((System Compromise))
-    
-    style A fill:#f96,stroke:#333
-    style H fill:#f96,stroke:#333
 ```
 
 ---
@@ -109,9 +106,3 @@ sudo /usr/sbin/needrestart -c exploit.conf
 1.  **Input Sanitation:** Implement strict validation of filenames in the `convert` function. Use `werkzeug.utils.secure_filename` to strip directory traversal characters.
 2.  **Secure Storage:** Migrate from MD5 to a secure hashing algorithm like Argon2 or bcrypt for password storage.
 3.  **Principle of Least Privilege:** Restrict `sudo` permissions. Prevent the use of command-line flags that allow configuration overrides for `needrestart`.
-
----
-
-**Artifacts Redacted for Public Release.**
-*User Flag:* `8451df**************************`
-*Root Flag:* `e161d1**************************`
