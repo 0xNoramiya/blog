@@ -1,0 +1,223 @@
+---
+title: '0xL4ugh CTF V5 - SpiralFloat'
+description: 'Writeup for the SpiralFloat challenge from 0xL4ugh CTF V5. A Hard Crypto challenge involving chaotic map inversion using Interval Arithmetic and Depth-First Search (DFS).'
+date: 2026-01-26
+tags: ['writeup', 'crypto', 'hard', 'chaos-theory', 'interval-arithmetic', 'dfs', 'sage']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Challenge:** SpiralFloat
+**CTF:** 0xL4ugh CTF V5
+**Category:** Crypto
+**Difficulty:** Hard
+**Flag:** `0xL4ugh{B1naryS3archM0not0n1c}`
+
+SpiralFloat challenges us to reverse a chaotic map function applied to a flag. The transformation involves 81 iterations of a spiral function based on the golden ratio. While the function is contracting in the forward direction, it is expanding in reverse, making direct inversion difficult due to precision loss. The solution utilizes **Interval Arithmetic** to track possible input ranges and a **Depth-First Search (DFS)** with pruning based on valid ASCII constraints to recover the flag digits.
+
+---
+
+## Problem Description
+
+We are provided with a SageMath script `prob.sage` that implements a chaotic map function called `spiral`. The script takes a flag, converts it to a floating-point number, applies the spiral transformation 81 times, and marks about 13% of the resulting digits as `?`.
+
+Our goal is to recover the unknown digits and reverse the transformation to find the flag.
+
+## Analysis
+
+The core transformation is:
+
+$$
+x_{i+1} = r \sqrt{x_i^2 + 1} + (1-r)(x_i + \phi)
+$$
+
+where $r = i/N$ and $\phi$ is the golden ratio.
+
+Analysis reveals that this function is **contracting** in the forward direction but **expanding** in the reverse direction. This means that if we try to reverse the function from $x_{i+1}$ to $x_i$, any small error in $x_{i+1}$ will be amplified.
+
+However, the "Expansion Ratio" is not infinite. It's finite but large. This allows us to use **interval arithmetic** to track the set of all possible inputs $x_0$ that could result in a given output $y$.
+
+## Solution Strategy
+
+1.  **Interval Arithmetic**: We use the `mpmath` library's interval arithmetic (`iv` context) to represent the unknown digits `?` as intervals `[0, 9]`.
+2.  **Depth-First Search (DFS)**: We perform a DFS to guess the unknown digits one by one.
+3.  **Pruning Conditions**:
+    *   **Range Check**: The starting $x_0$ must correspond to a valid flag format (30 bytes, starting with `0xL4ugh{`). If the reversed interval falls outside $[x_{min}, x_{max}]$, we prune the branch.
+    *   **ASCII Constraint**: This was the critical step. Even valid numerical ranges contained "garbage" solutions. We implemented `prune_interval` to convert the interval of potential $x_0$ values back to bytes. If any fully determined bytes are NOT printable ASCII, we prune the branch.
+
+## Solver Script
+
+```python
+from mpmath import mp, iv
+import sys
+
+# Configure precision
+mp.dps = 110 # Extra precision for scalar operations
+iv.dps = 110 # Extra precision for interval operations
+
+def spiral_inverse_interval(y_interval, phi, r):
+    # f(x) = r*sqrt(x^2+1) + (1-r)*(x+phi)
+    # y = f(x)
+    # x = f_inv(y)
+    # Since f is monotonic increasing, f(Interval) = [f(a), f(b)]
+    # So f_inv([y_a, y_b]) = [f_inv(y_a), f_inv(y_b)]
+    # We just need a scalar inverse function
+    
+    def scalar_inverse(target_y):
+        try:
+            # guess: x ~ target_y - (1-r)phi
+            if r == 0:
+                return target_y - phi
+            guess = target_y
+            # Use mp.findroot (scalar)
+            return mp.findroot(lambda x: r * mp.sqrt(x*x + 1) + (1 - r) * (x + phi) - target_y, guess, tol=mp.mpf('1e-105'))
+        except:
+            # Fallback binary search
+            low = mp.mpf(-50)
+            high = mp.mpf(500)
+            for _ in range(100):
+                mid = (low+high)/2
+                val = r * mp.sqrt(mid*mid + 1) + (1 - r) * (mid + phi)
+                if val < target_y:
+                    low = mid
+                else:
+                    high = mid
+            return (low+high)/2
+
+    a = scalar_inverse(y_interval.a)
+    b = scalar_inverse(y_interval.b)
+    # Return new interval
+    return iv.mpf([a, b])
+
+# Constants
+masked_str = "?7086013?3756162?51694057?5285516?54803756?9202316?39221780?4895755?50591029"
+
+# Precompute target range
+from Crypto.Util.number import bytes_to_long
+prefix = b'0xL4ugh{'
+suffix = b'}'
+wildcards = 21
+min_flag_bytes = prefix + b'\x00' * wildcards + suffix
+max_flag_bytes = prefix + b'\xff' * wildcards + suffix
+
+flag_min_int = bytes_to_long(min_flag_bytes)
+flag_max_int = bytes_to_long(max_flag_bytes)
+
+# x0 = flag * 10^-flen
+flen_min = len(str(flag_min_int))
+flen = flen_min
+x0_min = mp.mpf(flag_min_int) * (mp.mpf(10) ** -flen)
+x0_max = mp.mpf(flag_max_int) * (mp.mpf(10) ** -flen)
+
+print(f"Target x0 range: [{x0_min}, {x0_max}]")
+
+phi = (1 + mp.sqrt(5)) / 2
+iterations = 81
+
+# Indices of question marks
+q_indices = [i for i, c in enumerate(masked_str) if c == '?']
+print(f"Unknown indices: {q_indices}")
+
+def prune_interval(iv_val):
+    # Check if interval allows any valid ASCII flag
+    scaled = iv_val * (mp.mpf(10) ** flen)
+    
+    # Get conservative integer bounds
+    low_int = int(mp.floor(scaled.a))
+    high_int = int(mp.ceil(scaled.b))
+    
+    from Crypto.Util.number import long_to_bytes
+    
+    try:
+        low_b = long_to_bytes(low_int)
+        high_b = long_to_bytes(high_int)
+    except:
+        return True 
+        
+    if len(low_b) != len(high_b):
+        return True 
+        
+    for i in range(len(low_b)):
+        if low_b[i] == high_b[i]:
+            b = low_b[i]
+            if not (32 <= b <= 126):
+                return False # Prune!
+        else:
+            break
+            
+    return True
+
+def solve(q_idx_ptr, current_masked):
+    low_list = list(current_masked)
+    high_list = list(current_masked)
+    
+    for i in range(len(current_masked)):
+        if current_masked[i] == '?':
+            low_list[i] = '0'
+            high_list[i] = '9'
+            
+    low_s = "".join(low_list)
+    high_s = "".join(high_list)
+    
+    potential_decimal_pos = [1, 2, 3] 
+    valid_dec_pos = []
+    
+    for dec_pos in potential_decimal_pos:
+        def to_mpf(s, dp):
+             return mp.mpf(s[:dp] + "." + s[dp:])
+             
+        val_iv = iv.mpf([to_mpf(low_s, dec_pos), to_mpf(high_s, dec_pos)])
+        
+        curr_iv = val_iv
+        for i in range(iterations - 1, -1, -1):
+             r = mp.mpf(i) / iterations
+             curr_iv = spiral_inverse_interval(curr_iv, phi, r)
+        
+        if not prune_interval(curr_iv):
+            continue
+
+        if not (curr_iv.b < x0_min or curr_iv.a > x0_max):
+            valid_dec_pos.append(dec_pos)
+
+    if not valid_dec_pos:
+        return None 
+        
+    if q_idx_ptr == len(q_indices):
+        dec_pos = valid_dec_pos[0]
+        final_s = to_mpf(current_masked, dec_pos)
+        
+        x = final_s
+        for i in range(iterations - 1, -1, -1):
+            r = mp.mpf(i) / iterations
+            x = spiral_inverse_interval(iv.mpf([x, x]), phi, r).a 
+            
+        flag_val = x * (mp.mpf(10) ** flen)
+        flag_int = int(mp.nint(flag_val.mid))
+        
+        from Crypto.Util.number import long_to_bytes
+        try:
+            flag_b = long_to_bytes(flag_int)
+            if flag_b.startswith(prefix) and flag_b.endswith(suffix):
+                if all(32 <= b <= 126 for b in flag_b):
+                    print(f"FOUND ASCII FLAG: {flag_b}")
+                    return flag_b
+        except:
+            pass
+        return None
+
+    target_idx = q_indices[q_idx_ptr]
+    print(f"Level {q_idx_ptr}: solving index {target_idx}")
+    
+    for digit in range(10):
+        next_masked = list(current_masked)
+        next_masked[target_idx] = str(digit)
+        next_masked = "".join(next_masked)
+        
+        res = solve(q_idx_ptr + 1, next_masked)
+        if res: return res 
+
+if __name__ == "__main__":
+    solve(0, masked_str)
+```
