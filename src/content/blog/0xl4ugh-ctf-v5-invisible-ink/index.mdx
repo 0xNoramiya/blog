@@ -1,0 +1,143 @@
+---
+title: '0xL4ugh CTF V5 - Invisible Ink'
+description: 'Writeup for the Invisible Ink challenge from 0xL4ugh CTF V5. An Easy Misc challenge involving stegonography using Unicode Tag Characters, Zlib decompression, and Ascii85 decoding.'
+date: 2026-01-26
+tags: ['writeup', 'misc', 'easy', 'steganography', 'unicode', 'encoding', 'python']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Challenge:** Invisible Ink
+**CTF:** 0xL4ugh CTF V5
+**Category:** Misc
+**Difficulty:** Easy (17 Solves)
+**Flag:** `0xL4ugh{hiding_in_unicode_codepoint!!}`
+
+Invisible Ink is a steganography challenge where the flag data is hidden within a string using invisible Unicode Tag Characters (Plane 14). The solution involves extracting these hidden characters, decoding them from a custom hex mapping, de-interleaving the resulting byte stream, decompressing it via Zlib, and finally decoding an Ascii85 string.
+
+---
+
+## Challenge Description
+
+**Name**: Invisible Ink
+**Description**: No󠄧󠄨󠅕󠅔󠄢󠄨 f󠄩󠅓󠅕󠄢󠄥󠅕i󠄠󠄥󠅕󠄠󠄣󠅖l󠄤󠄠󠅖󠅔󠄠󠅑e󠄣󠅒󠅓󠄣󠅔󠄧s󠄠󠅑󠄡󠄤󠅖󠄣 n󠄨󠄠󠄤󠄦󠅖󠄠e󠄣󠄠󠅒󠄦󠄢󠄤e󠄠󠅓󠅕󠅔󠄠󠄧d󠄣󠅔󠄥󠅕󠄣󠅔e󠄨󠅒󠄤󠄡󠅓󠅑d󠄣󠄨󠄣󠄨󠄠󠅔, h󠅖󠄨󠅒󠄥󠄧󠅑e󠄤󠄣󠅓󠅑r󠄧󠄠󠄦󠅑e󠄤󠅒󠅖󠅔 i󠄠󠄤󠄩󠄢s󠄡󠄡󠄧󠄤 y󠅖󠄢󠅑󠄧o󠄠󠄨󠅑󠄣u󠄨󠄢󠄤󠄥r󠄥󠄩󠅕󠅕 f󠄩󠄤󠄩󠅑l󠅕󠅕󠄢󠄢a󠄥󠄥󠄤󠄡g󠅓󠄤󠅒󠅕👀󠅑󠅔󠄥󠄧︊
+
+## Analysis
+
+Upon inspecting the challenge description, we identified the presence of invisible characters interspersed within the visible text. A closer look reveals these are **Unicode Tag Characters** from Plane 14 (Special Purpose Plane), specifically in the range `U+E0000` to `U+E007F` and `U+E100`+.
+
+The raw text contains visible characters like "No... files needed...", but hidden between them are these tag characters which carry the payload.
+
+## Solution Steps
+
+### 1. Extraction of Hidden Characters
+We iterate through the provided text to extract any character with a code point in the range `0xE0000` to `0xE01FF`.
+These characters have an offset of `0xE0100`. For example, a tag character `U+E0127` corresponds to the value `0x27`.
+
+### 2. Decoding the Hex Stream
+The values extracted from the tags fall into two specific ranges, suggesting a hex-like encoding:
+- `0x20` - `0x29`: Mapped to digits `0` - `9`.
+- `0x51` - `0x56`: Mapped to letters `A` - `F` (Hex).
+
+**Mappings:**
+- `0x20` $\rightarrow$ `0`
+- ...
+- `0x29` $\rightarrow$ `9`
+- `0x51` $\rightarrow$ `A`
+- ...
+- `0x56` $\rightarrow$ `F`
+
+Constructing a string from these mappings yields a hexadecimal string, which is then converted into raw bytes.
+
+### 3. De-interleaving and Decompression
+The resulting byte stream appeared high-entropy (random). However, analysis revealed a Zlib header (`78 9C`) pattern emerging at indices 0, 3, 6...
+This strongly indicated that the data was split into three interleaved streams.
+
+We separated the bytes:
+- **Stream 1**: Indices 0, 3, 6...
+- **Stream 2**: Indices 1, 4, 7...
+- **Stream 3**: Indices 2, 5, 8...
+
+Concatenating these streams reassembled the valid Zlib-compressed data.
+
+### 4. Final Decoding
+After inflating the data with `zlib`, we obtained the string:
+`0R-8JF_>B7BPD!kDJ*<jDI7O(Bk)'lARAqcA7]^uBl8#9+aj`
+
+This character set (`<`, `>`, `!`, etc.) is characteristic of **Ascii85** (Base85) encoding. Decoding this string revealed the flag.
+
+## Solver Script
+
+```python
+import zlib
+import base64
+
+def solve():
+    # The raw string containing unicode tag characters
+    raw_text = "No\udb40\udd27\udb40\udd28\udb40\udd55\udb40\udd54\udb40\udd22\udb40\udd28 f\udb40\udd29\udb40\udd53\udb40\udd55\udb40\udd22\udb40\udd25\udb40\udd55i\udb40\udd20\udb40\udd25\udb40\udd55\udb40\udd20\udb40\udd23\udb40\udd56l\udb40\udd24\udb40\udd20\udb40\udd56\udb40\udd54\udb40\udd20\udb40\udd51e\udb40\udd23\udb40\udd52\udb40\udd53\udb40\udd23\udb40\udd54\udb40\udd27s\udb40\udd20\udb40\udd51\udb40\udd21\udb40\udd24\udb40\udd56\udb40\udd23 n\udb40\udd28\udb40\udd20\udb40\udd24\udb40\udd26\udb40\udd56\udb40\udd20e\udb40\udd23\udb40\udd20\udb40\udd52\udb40\udd26\udb40\udd22\udb40\udd24e\udb40\udd20\udb40\udd53\udb40\udd55\udb40\udd54\udb40\udd20\udb40\udd27d\udb40\udd23\udb40\udd54\udb40\udd25\udb40\udd55\udb40\udd23\udb40\udd54e\udb40\udd28\udb40\udd52\udb40\udd24\udb40\udd21\udb40\udd53\udb40\udd51d\udb40\udd23\udb40\udd28\udb40\udd23\udb40\udd28\udb40\udd20\udb40\udd54, h\udb40\udd56\udb40\udd28\udb40\udd52\udb40\udd25\udb40\udd27\udb40\udd51e\udb40\udd24\udb40\udd23\udb40\udd53\udb40\udd51r\udb40\udd27\udb40\udd20\udb40\udd26\udb40\udd51e\udb40\udd24\udb40\udd52\udb40\udd56\udb40\udd54 i\udb40\udd20\udb40\udd24\udb40\udd29\udb40\udd22s\udb40\udd21\udb40\udd21\udb40\udd27\udb40\udd24 y\udb40\udd56\udb40\udd22\udb40\udd51\udb40\udd27o\udb40\udd20\udb40\udd28\udb40\udd51\udb40\udd23u\udb40\udd28\udb40\udd22\udb40\udd24\udb40\udd25r\udb40\udd25\udb40\udd29\udb40\udd55\udb40\udd55 f\udb40\udd29\udb40\udd24\udb40\udd29\udb40\udd51l\udb40\udd55\udb40\udd55\udb40\udd22\udb40\udd22a\udb40\udd25\udb40\udd25\udb40\udd24\udb40\udd21g\udb40\udd53\udb40\udd24\udb40\udd52\udb40\udd55\ud83d\udc40\udb40\udd51\udb40\udd54\udb40\udd25\udb40\udd27\ufe0a"
+
+    try:
+        # Ensure proper encoding for surrogate pairs if needed
+        fixed_text = raw_text.encode('utf-16', 'surrogatepass').decode('utf-16')
+    except:
+        fixed_text = raw_text
+
+    stream1, stream2, stream3 = bytearray(), bytearray(), bytearray()
+    current_tags = []
+
+    # Iterate characters to preserve grouping structure
+    for char in fixed_text:
+        code = ord(char)
+        if 0xE0000 <= code <= 0xE01FF:
+            current_tags.append(code - 0xE0100)
+        elif code >= 32: # Visible character marks end of previous group
+            if current_tags:
+                # Convert tags to nibbles
+                nibbles = []
+                for t in current_tags:
+                    if 0x20 <= t <= 0x29: nibbles.append(t - 0x20)
+                    elif 0x51 <= t <= 0x56: nibbles.append(t - 0x51 + 10)
+                
+                # Convert nibbles to bytes
+                bytes_list = []
+                for i in range(0, len(nibbles), 2):
+                    if i+1 < len(nibbles):
+                        bytes_list.append((nibbles[i] << 4) | nibbles[i+1])
+                
+                # Distribute to streams
+                if len(bytes_list) >= 1: stream1.append(bytes_list[0])
+                if len(bytes_list) >= 2: stream2.append(bytes_list[1])
+                if len(bytes_list) >= 3: stream3.append(bytes_list[2])
+                
+                current_tags = []
+    
+    # Process last group
+    if current_tags:
+        nibbles = []
+        for t in current_tags:
+            if 0x20 <= t <= 0x29: nibbles.append(t - 0x20)
+            elif 0x51 <= t <= 0x56: nibbles.append(t - 0x51 + 10)
+        bytes_list = []
+        for i in range(0, len(nibbles), 2):
+            if i+1 < len(nibbles):
+                bytes_list.append((nibbles[i] << 4) | nibbles[i+1])
+        if len(bytes_list) >= 1: stream1.append(bytes_list[0])
+        if len(bytes_list) >= 2: stream2.append(bytes_list[1])
+        if len(bytes_list) >= 3: stream3.append(bytes_list[2])
+
+    # Decompress
+    try:
+        decompressed = zlib.decompress(stream1 + stream2 + stream3)
+        print(f"Decompressed: {decompressed}")
+        
+        # Decode Base85
+        flag = base64.a85decode(decompressed)
+        print(f"Flag: {flag.decode()}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    solve()
+```
