@@ -1,0 +1,75 @@
+---
+title: '0xL4ugh CTF V5 - HashCashSlash'
+description: 'Writeup for the HashCashSlash challenge from 0xL4ugh CTF V5. A Medium Misc challenge involving restricted shell escape and local privilege escalation via hidden socat service.'
+date: 2026-01-26
+tags: ['writeup', 'misc', 'medium', 'jail-escape', 'privilege-escalation', 'linux', 'bash']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Challenge:** HashCashSlash
+**CTF:** 0xL4ugh CTF V5
+**Category:** Misc
+**Difficulty:** Medium
+**Flag:** `0xL4ugh{m1n1m4l_1nput_m4x1mum_d4m4g3_a1459db5ef149c1e}`
+
+HashCashSlash presents a restricted environment where the goal is to escape a jail and find a hidden flag. The solution involves escaping the restrictive shell using specific allowed characters (`#`, `$`, `\`), creating a shell, and then enumerating running processes to discover a root-owned `socat` service exposing the flag on a local port.
+
+---
+
+## 1. Initial Reconnaissance
+
+The challenge begins with SSH/Netcat access to a restricted environment. We are given a hint regarding three characters: Hash (`#`), Cash (`$`), and Slash (`\`).
+
+Trying various combinations, we found that we could escape the jail using the sequence `\$$#`. This exploit allowed us to break out of the restricted context and obtain a proper shell interface.
+
+Basic enumeration of the file system revealed a standard Linux structure.
+- **Flag File:** `/flag` (readable only by root: `-r-------- 1 root root`)
+- **User Files:** Two scripts in the home directory (`chall.sh` and `run.sh`).
+- **User:** We are logged in as `ctf`.
+
+Checking permissions confirmed we could not read the flag directly.
+
+```text
+-r-------- 1 root root 55 Jan 23 16:42 flag
+```
+
+## 2. Privilege Escalation
+
+Now inside a proper shell as user `ctf`, we looked for ways to escalate privileges.
+- `sudo` was missing.
+- `chall.sh` did not have SUID permissions.
+
+Since standard tools like `ps` were not installed, we performed manual process enumeration by reading directly from the `/proc` directory. This technique allows us to inspect the command line arguments of all running processes.
+
+```bash
+for pid in $(ls /proc | grep -E '^[0-9]+$'); do 
+  echo -n "PID $pid: "; 
+  cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' '; 
+  echo; 
+done
+```
+
+### The Discovery
+The process list output revealed a critical hidden service running as **root** (PID 9):
+
+```text
+PID 9: socat TCP-LISTEN:24797,bind=127.0.0.1,reuseaddr,fork EXEC:cat /flag
+```
+
+This indicated that a `socat` listener was active on **localhost port 24797**. The argument `EXEC:cat /flag` is the "smoking gun" — it means that any connection established to this specific port will trigger the execution of `cat /flag` by the root user, sending the flag content back to the client.
+
+## 3. Capture the Flag
+
+With the target identified, we simply needed to connect to the local port. Since we didn't have `nc` (netcat) or `telnet`, we used Bash's built-in TCP capabilities to open a connection to the socket.
+
+```bash
+cat < /dev/tcp/127.0.0.1/24797
+```
+
+Upon connection, the service executed the command and returned the flag.
+
+**Flag:**
+`0xL4ugh{m1n1m4l_1nput_m4x1mum_d4m4g3_a1459db5ef149c1e}`
