@@ -1,0 +1,97 @@
+---
+title: 'Daily Alpacahack 2026 #27 - ToyPQC'
+description: 'Writeup for ToyPQC from Daily Alpacahack 2026 #27. A Hard Crypto challenge involving LWE with small error space vulnerable to brute-force.'
+date: 2026-01-27
+tags: ['writeup', 'crypto', 'hard', 'lwe', 'lattice', 'bruteforce', 'sage', 'alpacahack']
+authors: ['kudaliar']
+draft: false
+---
+
+## Executive Summary
+
+**Challenge:** ToyPQC
+**CTF:** Daily Alpacahack 2026 #27
+**Category:** Cryptography
+**Difficulty:** Hard
+**Flag:** `Alpaca{sa6em4th_i5_u5efu1^_^}`
+
+ToyPQC is a cryptography challenge based on the Learning With Errors (LWE) problem. We are given an overdetermined system of linear equations over a finite field, perturbed by a "noise" vector. The critical vulnerability lies in the small size of the error vector (binary elements, length 10), which allows for a brute-force attack to recover the correct error, solve the linear system, and decrypt the flag.
+
+---
+
+## 1. Challenge Analysis
+
+The provided SageMath script implements an LWE-based system:
+
+1.  **Setup:** Defines a finite field $F_p$ with $p = 8380417$.
+2.  **Secret ($s$):** The flag is split into 7 chunks, forming the secret vector $s \in F_p^7$.
+3.  **Matrix ($A$):** A random $10 \times 7$ matrix $A$ is generated.
+4.  **Error ($e$):** A random error vector $e \in \{0, 1\}^{10}$ is generated.
+5.  **Encryption:** The public vector $b$ is computed as $b = A \cdot s + e$.
+
+We are provided with $A$ and $b$.
+
+## 2. Vulnerability Assessment
+
+The equation $b = A \cdot s + e$ represents a noisy system of linear equations. while LWE is typically hard, the specific parameters here make it vulnerable.
+
+The error vector $e$ has length $m=10$, and each element is chosen from $\{0, 1\}$.
+Total search space: $2^{10} = 1024$.
+
+This extremely small search space allows us to brute-force the error vector $e$.
+
+## 3. Solution Strategy
+
+1.  **Iterate:** Generate all $2^{10}$ possible binary vectors for $e$.
+2.  **Clean:** Compute candidate target $b' = b - e_{guess}$.
+3.  **Solve:** Attempt to solve $A \cdot s = b'$.
+    *   If $e_{guess}$ is incorrect, the system is inconsistent (no solution).
+    *   If $e_{guess}$ is correct, we find the unique $s$.
+4.  **Decode:** Convert the resulting secret vector $s$ back to bytes.
+
+## 4. Solve Script (SageMath)
+
+```python
+import itertools
+from Crypto.Util.number import long_to_bytes
+
+# Challenge Parameters
+p = 8380417
+n = 7
+m = 10
+F = GF(p)
+
+# Assume A (matrix) and b (vector) are loaded from challenge output
+# A = matrix(F, ...)
+# b = vector(F, ...)
+
+print("[-] Starting Brute-Force on Error Vector...")
+
+possible_errors = itertools.product([0, 1], repeat=m)
+
+for err_tuple in possible_errors:
+    e_guess = vector(F, err_tuple)
+    target = b - e_guess
+    
+    try:
+        # Attempt to solve A * s = target
+        s_candidate = A.solve_right(target)
+        
+        flag_content = b""
+        for val in s_candidate:
+            flag_content += int(val).to_bytes(3, "big")
+            
+        full_flag = f"Alpaca{{{flag_content.decode()}}}"
+        print(f"[+] Success! Error vector: {err_tuple}")
+        print(f"[+] FLAG: {full_flag}")
+        break
+
+    except ValueError:
+        continue
+    except UnicodeDecodeError:
+        continue
+```
+
+## 5. Conclusion
+
+By exploiting the low entropy of the error vector, we reduced the problem to a trivial brute-force check. Validating each of the 1024 possibilities against the linear system allowed us to isolate the correct error and recover the plaintext.
