@@ -1,0 +1,85 @@
+---
+title: 'Eschaton 2026 Quals - Now You See Me'
+description: 'Writeup for Now You See Me from Eschaton 2026 Quals. A Web challenge involving JavaScript obfuscation and deobfuscation.'
+date: 2026-02-01
+tags: ['writeup', 'web', 'javascript', 'obfuscation', 'deobfuscation', 'eschaton']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Web
+**Flag:** `esch{y0u_s33_,_but_u_d0_n0t_0bs3rv3}`
+
+The challenge presents a web page with a physics simulation of eyeballs that track the user's cursor.
+There are basic client-side preventions against inspection:
+- Right-click context menu is disabled with a "You try to see me, and you dont!" alert.
+- `Ctrl+U` (View Source) is disabled with a similar alert.
+
+However, the source code can still be accessed using `view-source:http://node-2.mcsc.space:10627/`.
+
+## Analysis
+
+The core logic is in a script that sets up a `Matter.js` physics engine. However, at the very bottom of the script, there is a block of obfuscated code:
+
+```javascript
+new Proxy(
+  {},
+  {
+    get: (_, n) =>
+      eval(
+        [...n].map((n) => +("ï¾ " > n)).join``.replace(/.{8}/g, (n) =>
+          String.fromCharCode(+("0b" + n)),
+        ),
+      ),
+  },
+).ï¾ ï¾ ã…¤ï¾ ï¾ ... (long string of unicode)
+```
+
+### Deobfuscation
+
+The obfuscation relies on a `Proxy` object with a `get` trap. This trap executes whenever a property is accessed on the proxy.
+The obfuscated payload is actually the *name of the property* being accessed on the proxy.
+
+The decoding logic inside the `get` trap:
+1.  `[...n]`: Converts the property name string into an array of characters.
+2.  `.map((n) => +("ï¾ " > n))`: Compares each character `n` against the character `ï¾ ` (U+FF5E).
+    *   If `ï¾ ` > `n`, the result is `true` (converted to `1`).
+    *   Otherwise, the result is `false` (converted to `0`).
+    In the payload, the character `ã…¤` (U+3164) is lesser than `ï¾ `, so it becomes `1`. The character `ï¾ ` is equal, so it becomes `0`.
+3.  `.join`` `: Joins the 1s and 0s into a binary string.
+4.  `.replace(/.{8}/g, ...)`: Takes chunks of 8 bits.
+5.  `String.fromCharCode(+("0b" + n))`: Converts each 8-bit chunk from binary to an ASCII character.
+6.  `eval(...)`: Executes the resulting string as JavaScript.
+
+## The Hidden Code
+
+Decoding the massive Unicode property name results in the following JavaScript:
+
+```javascript
+const messageDiv = document.createElement("div");
+messageDiv.id = "message";
+const spritesDiv = document.querySelector(".eyeball-sprites");
+document.body.insertBefore(messageDiv, spritesDiv);
+
+// ... styling code ...
+
+messageDiv.textContent = "Do you see me?";
+// esch{y0u_s33_,_but_u_d0_n0t_0bs3rv3}
+// Said Sherlock Holmes.
+```
+
+The script injects a `div` into the page asking "Do you see me?". Crucially, the flag is hidden in a comment within this injected code.
+
+## Solution
+
+To solve the challenge, you can either:
+1.  **Paste the `Proxy` code block** into your browser's developer console. The `eval` will run, injecting the visible message relative to the simulation, but to see the flag, you'd need to intercept the eval or inspect the executed string.
+2.  **Manually decode the string** using the logic described above (convert `ã…¤` -> 1, `ï¾ ` -> 0, parse as ASCII).
+
+## Flag
+
+```text
+esch{y0u_s33_,_but_u_d0_n0t_0bs3rv3}
+```
