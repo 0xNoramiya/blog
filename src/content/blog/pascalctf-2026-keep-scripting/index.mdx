@@ -1,0 +1,504 @@
+---
+title: 'PascalCTF 2026 - Keep Scripting'
+description: 'Writeup for Keep Scripting from PascalCTF 2026. A Misc challenge involving KTANE simulation and networking.'
+date: 2026-02-01
+tags: ['writeup', 'misc', 'scripting', 'networking', 'ktane', 'pascalctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+**Target**: `scripting.ctf.pascalctf.it:6004` (TCP)
+**Objective**: Defuse 100 modules simulating the "Keep Talking and Nobody Explodes" game.
+**Constraints**: Strict implicit time limit (1 minutes) and custom module variations.
+
+## Solution Overview
+The solution involved developing an optimized Python solver (`solver.py`) using `asyncio` for high-performance TCP interaction. We started with a base solver and modified it to handle custom symbol mappings and keypad columns, as well as optimizing network I/O to prevent timeouts.
+
+### 1. Keypads Module Logic Fixes
+The primary hurdle was the **Keypads** module, where standard KTANE manuals were insufficient. The challenge used variant symbols and custom column orderings.
+
+#### A. Custom Column Orders
+We identified symbol combinations that contradicted standard columns. For example, `['¶', 'Җ', 'ټ', 'ƀ']` required the order `¶` → `ƀ` → `Җ` → `ټ`. Standard columns (or standard sorting logic) produced incorrect sequences for these sets.
+
+- Introduced `KEYPAD_COLS_RAW` to define custom columns that take precedence over standard ones.
+- Added specific columns derived from failure analysis:
+    - `['ψ', 'ټ', 'ƀ', 'Ͼ', '¶', 'Ѣ', 'Ѯ', '★']` (Handles `ψ` vs `ټ` ordering)
+    - `['¶', 'ƀ', 'Җ', 'ټ']` (Handles `¶` vs `ƀ` ordering)
+    - `['б', 'ƀ', '¿', 'ټ']` (Ensures `б` → `ƀ`)
+
+#### B. Symbol Mapping Corrections
+Certain Unicode symbols used in the CTF differed from standard references or required specific mapping to work with our column definitions.
+
+**Fix Details**:
+- **Restored Mappings**: Re-added missing mappings for `ψ` mapped to `Ψ` (U+03A8) and `ƀ` mapped to `Ϭ` (U+03EC).
+- **Sorting Logic Repair**: Changed the mapping of `Ԇ` (Komi Dzje) from `Җ` to `Ҋ` (Short I with Tail). This was critical because assigning `Ԇ` to the same index as `Җ` caused incorrect stable sorting when both appeared in the same module. Mapping it to `Ҋ` placed it correctly after `Җ` in Column 3.
+
+### 2. Performance Engineering
+The initial solver functioned correctly but timed out around module 60/100 ("TIME'S UP!"). We implemented aggressive optimizations to speed up processing:
+
+- **Debloating I/O**: Disabled extensive debug printing (`print(data...)`). Console I/O was a significant bottleneck.
+- **Network Optimization**: Replaced `asyncio.wait_for(reader.read(...), timeout=0.1)` with a direct `await reader.read(65536)`. The timeout introduced unnecessary latency during idle periods or packet fragmentation.
+- **Regex Caching**: Added guards to static metadata checks (`Serial Number`, `Batteries`, etc.) so they execute only once per session rather than on every data packet, reducing CPU overhead.
+- **Buffer Management**: Increased the read buffer size from 8KB to 64KB to handle larger data chunks efficiently.
+
+### 3. Deployment Note
+Running the solver locally (particularly from Indonesia) proved difficult due to high network latency, which contributed to timeouts despite the code optimizations. Deploying the solver to a VPS closer to the target server eliminated the latency bottleneck, allowing the solver to complete the challenge instantly.
+
+Even then this solver still have to get lucky on some difficult edge-cases (play KTANE for more details on hardest module)
+
+### 4. Verification & Results
+After applying logic fixes and optimizations, the solver successfully defused all **100 modules** without timing out.
+
+**Final Flag**:
+`pascalCTF{H0w_4r3_Y0u_s0_g0Od_4t_BOMBARE?}`
+
+## Solver
+Run the solver using Python 3:
+```bash
+python3 solve.py
+```
+
+```python
+#!/usr/bin/env python3
+import asyncio
+import re
+import json
+
+serial_number = ""
+batteries = 0
+label = ""
+ports = []
+strikes = 0
+
+PASSWORDS = ['about', 'after', 'again', 'below', 'could', 'every', 'first', 'found', 'great', 'house',
+    'large', 'learn', 'never', 'other', 'place', 'plant', 'point', 'right', 'small', 'sound',
+    'spell', 'still', 'study', 'their', 'there', 'these', 'thing', 'think', 'three', 'water',
+    'where', 'which', 'world', 'would', 'write']
+
+MORSE_WORDS = {'shell': '3.505', 'halls': '3.515', 'slick': '3.522', 'trick': '3.532',
+    'boxes': '3.535', 'leaks': '3.542', 'strobe': '3.545', 'bistro': '3.552',
+    'flick': '3.555', 'bombs': '3.565', 'break': '3.572', 'brick': '3.575',
+    'steak': '3.582', 'sting': '3.592', 'vector': '3.595', 'beats': '3.600'}
+
+# Symbol mapping for case/variant normalization
+SYMBOL_MAP = {
+    'Ԇ': 'Ҋ', 'ԅ': 'Ҋ', 'Ҭ': 'Ѭ', 'ϙ': 'Ϙ', 'ψ': 'Ψ', 'ω': 'Ω',
+    'Ʊ': 'Ͽ', '϶': 'Ͽ', '∈': 'Ͻ', 'ҩ': 'Ҩ', 'ҋ': 'Ҋ', 'ѯ': 'Ѯ',
+    'ѧ': 'Ѧ', 'ѡ': 'Ѡ', 'ѣ': 'Ѣ', 'ӭ': 'Ӭ', 'ϭ': 'Ϭ', 'ϟ': 'Ϟ',
+    'Ҁ': 'Ҋ', 'ҁ': 'Ҋ', 'Ѽ': 'Ѡ', 'ѽ': 'Ѡ',
+    'б': 'Ϭ', 'Б': 'Ϭ', 'ᖵ': 'Ҋ', 'Ꮾ': 'Ϭ', 'ƀ': 'Ϭ',
+}
+
+# Standard KTANE Keypad Columns (from official bomb defusal manual)
+# Symbols appear in reading order (top to bottom)
+KEYPAD_COLS = [
+    # Column 1
+    ['Ϙ', 'Ѧ', 'ƛ', 'Ϟ', 'Ѭ', 'ϗ', 'Ͽ'],
+    # Column 2
+    ['Ӭ', 'Ϙ', 'Ͽ', 'Ҩ', '☆', 'ϗ', '¿'],
+    # Column 3
+    ['©', 'Ѡ', 'Ҩ', 'Җ', 'Ҋ', 'ƛ', '☆'],
+    # Column 4
+    ['Ϭ', '¶', 'Ѣ', 'Ѭ', 'Җ', '¿', 'ټ'],
+    # Column 5
+    ['Ψ', 'ټ', 'Ѣ', 'Ͼ', '¶', 'Ѯ', '★'],
+    # Column 6
+    ['Ϭ', 'Ӭ', '҂', 'æ', 'Ψ', 'Ҋ', 'Ω'],
+]
+
+# Additional columns for CTF variants - these may contain raw/unmapped symbols
+# These columns are checked first (before standard KTANE columns)
+KEYPAD_COLS_RAW = [
+    # Combined column with all observed symbols in order
+    # Covers both ['ψ', '¶', 'ټ', 'ƀ'] → [1, 3, 4, 2] (ψ→ټ→ƀ→¶)
+    # And ['ټ', 'Ͼ', 'ƀ', 'ψ'] → [4, 1, 3, 2] (ψ→ټ→ƀ→Ͼ)
+    ['ψ', 'ټ', 'ƀ', 'Ͼ', '¶', 'Ѣ', 'Ѯ', '★'],
+    # New column for ['¶', 'Җ', 'ټ', 'ƀ'] → [1, 4, 2, 3] (¶→ƀ→Җ→ټ)
+    # Note: This ordering of ¶ and ƀ contradicts the column above, so they must be distinct
+    ['¶', 'ƀ', 'Җ', 'ټ'],
+    # New column for ['б', 'ƀ', '¿', 'ټ'] → [1, 4, 2, 3] (б→ƀ→¿→ټ)
+    ['б', 'ƀ', '¿', 'ټ'],
+]
+
+RED_WIRE = {1: ['C'], 2: ['B'], 3: ['A'], 4: ['A', 'C'], 5: ['B'], 6: ['A', 'C'], 7: ['A', 'B', 'C'], 8: ['A', 'B'], 9: ['B']}
+BLUE_WIRE = {1: ['B'], 2: ['A', 'C'], 3: ['B'], 4: ['A'], 5: ['B'], 6: ['B', 'C'], 7: ['C'], 8: ['A', 'C'], 9: ['A']}
+BLACK_WIRE = {1: ['A', 'B', 'C'], 2: ['A', 'C'], 3: ['B'], 4: ['A', 'C'], 5: ['B'], 6: ['B', 'C'], 7: ['A', 'B'], 8: ['C'], 9: ['C']}
+
+SIMON_V = {0: {'red': 'blue', 'blue': 'red', 'green': 'yellow', 'yellow': 'green'},
+    1: {'red': 'yellow', 'blue': 'green', 'green': 'blue', 'yellow': 'red'},
+    2: {'red': 'green', 'blue': 'red', 'green': 'yellow', 'yellow': 'blue'}}
+SIMON_NV = {0: {'red': 'blue', 'blue': 'yellow', 'green': 'green', 'yellow': 'red'},
+    1: {'red': 'red', 'blue': 'blue', 'green': 'yellow', 'yellow': 'green'},
+    2: {'red': 'yellow', 'blue': 'green', 'green': 'blue', 'yellow': 'red'}}
+
+WHOS1 = {'YES': 2, 'FIRST': 1, 'DISPLAY': 5, 'OKAY': 1, 'SAYS': 5, 'NOTHING': 2,
+    '': 4, 'BLANK': 3, 'NO': 5, 'LED': 2, 'LEAD': 5, 'READ': 3,
+    'RED': 3, 'REED': 4, 'LEED': 4, 'HOLD ON': 5, 'YOU': 3, 'YOU ARE': 5,
+    'YOUR': 3, "YOU'RE": 3, 'UR': 0, 'THERE': 5, "THEY'RE": 4, 'THEIR': 3,
+    'THEY ARE': 2, 'SEE': 5, 'C': 1, 'CEE': 5}
+
+WHOS2 = {
+    'READY': ['YES', 'OKAY', 'WHAT', 'MIDDLE', 'LEFT', 'PRESS', 'RIGHT', 'BLANK', 'READY', 'NO', 'FIRST', 'UHHH', 'NOTHING', 'WAIT'],
+    'FIRST': ['LEFT', 'OKAY', 'YES', 'MIDDLE', 'NO', 'RIGHT', 'NOTHING', 'UHHH', 'WAIT', 'READY', 'BLANK', 'WHAT', 'PRESS', 'FIRST'],
+    'NO': ['BLANK', 'UHHH', 'WAIT', 'FIRST', 'WHAT', 'READY', 'RIGHT', 'YES', 'NOTHING', 'LEFT', 'PRESS', 'OKAY', 'NO', 'MIDDLE'],
+    'BLANK': ['WAIT', 'RIGHT', 'OKAY', 'MIDDLE', 'BLANK', 'PRESS', 'READY', 'NOTHING', 'NO', 'WHAT', 'LEFT', 'UHHH', 'YES', 'FIRST'],
+    'NOTHING': ['UHHH', 'RIGHT', 'OKAY', 'MIDDLE', 'YES', 'BLANK', 'NO', 'PRESS', 'LEFT', 'WHAT', 'WAIT', 'FIRST', 'NOTHING', 'READY'],
+    'YES': ['OKAY', 'RIGHT', 'UHHH', 'MIDDLE', 'FIRST', 'WHAT', 'PRESS', 'READY', 'NOTHING', 'YES', 'LEFT', 'BLANK', 'NO', 'WAIT'],
+    'WHAT': ['UHHH', 'WHAT', 'LEFT', 'NOTHING', 'READY', 'BLANK', 'MIDDLE', 'NO', 'OKAY', 'FIRST', 'WAIT', 'YES', 'PRESS', 'RIGHT'],
+    'UHHH': ['READY', 'NOTHING', 'LEFT', 'WHAT', 'OKAY', 'YES', 'RIGHT', 'NO', 'PRESS', 'BLANK', 'UHHH', 'MIDDLE', 'WAIT', 'FIRST'],
+    'LEFT': ['RIGHT', 'LEFT', 'FIRST', 'NO', 'MIDDLE', 'YES', 'BLANK', 'WHAT', 'UHHH', 'WAIT', 'PRESS', 'READY', 'OKAY', 'NOTHING'],
+    'RIGHT': ['YES', 'NOTHING', 'READY', 'PRESS', 'NO', 'WAIT', 'WHAT', 'RIGHT', 'MIDDLE', 'LEFT', 'UHHH', 'BLANK', 'OKAY', 'FIRST'],
+    'MIDDLE': ['BLANK', 'READY', 'OKAY', 'WHAT', 'NOTHING', 'PRESS', 'NO', 'WAIT', 'LEFT', 'MIDDLE', 'RIGHT', 'FIRST', 'UHHH', 'YES'],
+    'OKAY': ['MIDDLE', 'NO', 'FIRST', 'YES', 'UHHH', 'NOTHING', 'WAIT', 'OKAY', 'LEFT', 'READY', 'BLANK', 'PRESS', 'WHAT', 'RIGHT'],
+    'WAIT': ['UHHH', 'NO', 'BLANK', 'OKAY', 'YES', 'LEFT', 'FIRST', 'PRESS', 'WHAT', 'WAIT', 'NOTHING', 'READY', 'RIGHT', 'MIDDLE'],
+    'PRESS': ['RIGHT', 'MIDDLE', 'YES', 'READY', 'PRESS', 'OKAY', 'NOTHING', 'UHHH', 'BLANK', 'LEFT', 'FIRST', 'WHAT', 'NO', 'WAIT'],
+    'YOU': ['SURE', 'YOU ARE', 'YOUR', "YOU'RE", 'NEXT', 'UH HUH', 'UR', 'HOLD', 'WHAT?', 'YOU', 'UH UH', 'LIKE', 'DONE', 'U'],
+    'YOU ARE': ['YOUR', 'NEXT', 'LIKE', 'UH HUH', 'WHAT?', 'DONE', 'UH UH', 'HOLD', 'YOU', 'U', "YOU'RE", 'SURE', 'UR', 'YOU ARE'],
+    'YOUR': ['UH UH', 'YOU ARE', 'UH HUH', 'YOUR', 'NEXT', 'UR', 'SURE', 'U', "YOU'RE", 'YOU', 'WHAT?', 'HOLD', 'LIKE', 'DONE'],
+    "YOU'RE": ['YOU', "YOU'RE", 'UR', 'NEXT', 'UH UH', 'YOU ARE', 'U', 'YOUR', 'WHAT?', 'UH HUH', 'SURE', 'DONE', 'LIKE', 'HOLD'],
+    'UR': ['DONE', 'U', 'UR', 'UH HUH', 'WHAT?', 'SURE', 'YOUR', 'HOLD', "YOU'RE", 'LIKE', 'NEXT', 'UH UH', 'YOU ARE', 'YOU'],
+    'U': ['UH HUH', 'SURE', 'NEXT', 'WHAT?', "YOU'RE", 'UR', 'UH UH', 'DONE', 'U', 'YOU', 'LIKE', 'HOLD', 'YOU ARE', 'YOUR'],
+    'UH HUH': ['UH HUH', 'YOUR', 'YOU ARE', 'YOU', 'DONE', 'HOLD', 'UH UH', 'NEXT', 'SURE', 'LIKE', "YOU'RE", 'UR', 'U', 'WHAT?'],
+    'UH UH': ['UR', 'U', 'YOU ARE', "YOU'RE", 'NEXT', 'UH UH', 'DONE', 'YOU', 'UH HUH', 'LIKE', 'YOUR', 'SURE', 'HOLD', 'WHAT?'],
+    'WHAT?': ['YOU', 'HOLD', "YOU'RE", 'YOUR', 'U', 'DONE', 'UH UH', 'LIKE', 'YOU ARE', 'UH HUH', 'UR', 'NEXT', 'WHAT?', 'SURE'],
+    'DONE': ['SURE', 'UH HUH', 'NEXT', 'WHAT?', 'YOUR', 'UR', "YOU'RE", 'HOLD', 'LIKE', 'YOU', 'U', 'YOU ARE', 'UH UH', 'DONE'],
+    'NEXT': ['WHAT?', 'UH HUH', 'UH UH', 'YOUR', 'HOLD', 'SURE', 'NEXT', 'LIKE', 'DONE', 'YOU ARE', 'UR', "YOU'RE", 'U', 'YOU'],
+    'HOLD': ['YOU ARE', 'U', 'DONE', 'UH UH', 'YOU', 'UR', 'SURE', 'WHAT?', "YOU'RE", 'NEXT', 'HOLD', 'UH HUH', 'YOUR', 'LIKE'],
+    'SURE': ['YOU ARE', 'DONE', 'LIKE', "YOU'RE", 'YOU', 'HOLD', 'UH HUH', 'UR', 'SURE', 'U', 'WHAT?', 'NEXT', 'YOUR', 'UH UH'],
+    'LIKE': ["YOU'RE", 'NEXT', 'U', 'UR', 'HOLD', 'DONE', 'UH UH', 'WHAT?', 'UH HUH', 'YOU', 'LIKE', 'SURE', 'YOU ARE', 'YOUR'],
+}
+
+STRIP_DIGIT = {'blue': '4', 'white': '1', 'yellow': '5'}
+
+def has_vowel(s): return any(c in 'AEIOUaeiou' for c in s)
+def last_digit_odd(s):
+    for c in reversed(s):
+        if c.isdigit(): return int(c) % 2 == 1
+    return False
+def last_digit_even(s): return not last_digit_odd(s)
+def has_parallel(p): return 'parallel' in [x.lower() for x in p]
+
+def solve_wires(colors, serial):
+    n, c = len(colors), [x.lower() for x in colors]
+    if n == 3:
+        if 'red' not in c: return 2
+        if c[-1] == 'white': return 3
+        if c.count('blue') > 1:
+            for i in range(n-1, -1, -1):
+                if c[i] == 'blue': return i+1
+        return 3
+    if n == 4:
+        if c.count('red') > 1 and last_digit_odd(serial):
+            for i in range(n-1, -1, -1):
+                if c[i] == 'red': return i+1
+        if c[-1] == 'yellow' and 'red' not in c: return 1
+        if c.count('blue') == 1: return 1
+        if c.count('yellow') > 1: return 4
+        return 2
+    if n == 5:
+        if c[-1] == 'black' and last_digit_odd(serial): return 4
+        if c.count('red') == 1 and c.count('yellow') > 1: return 1
+        if 'black' not in c: return 2
+        return 1
+    if n == 6:
+        if 'yellow' not in c and last_digit_odd(serial): return 3
+        if c.count('yellow') == 1 and c.count('white') > 1: return 4
+        if 'red' not in c: return 6
+        return 4
+    return 1
+
+def solve_button(color, text, batt, inds):
+    c, t = color.lower(), text.lower()
+    if c == 'blue' and t == 'abort': return '2'
+    if batt > 1 and t == 'detonate': return '1'
+    if c == 'white' and any(i.get('label') == 'CAR' and i.get('lit') for i in inds): return '2'
+    if batt > 2 and any(i.get('label') == 'FRK' and i.get('lit') for i in inds): return '1'
+    if c == 'yellow': return '2'
+    if c == 'red' and t == 'hold': return '1'
+    return '2'
+
+def solve_keypads(symbols):
+    """
+    Solve the keypads module by finding a column that contains all 4 symbols
+    and returning the button positions in the order they appear in that column.
+    
+    The keypad has 4 buttons at positions 1-4 with symbols.
+    We need to find which column contains all these symbols and return
+    the positions sorted by their order in the column.
+    """
+    # First, try matching raw symbols directly (no mapping) against all columns
+    all_cols = KEYPAD_COLS_RAW + KEYPAD_COLS
+    for col in all_cols:
+        if all(s in col for s in symbols):
+            # Sort by column order and return original positions
+            pos = sorted([(col.index(s), i + 1) for i, s in enumerate(symbols)])
+            return [p[1] for p in pos]
+    
+    # Next, try with mapped symbols against standard columns
+    mapped = [SYMBOL_MAP.get(s, s) for s in symbols]
+    for col in KEYPAD_COLS:
+        if all(s in col for s in mapped):
+            # Use zip to pair mapped symbol (for index lookup) with original index
+            pos = sorted([(col.index(m), i + 1) for i, m in enumerate(mapped)])
+            return [p[1] for p in pos]
+    
+    # Fallback: return default order if no column matches
+    return [1, 2, 3, 4]
+
+def solve_memory(stage, display, buttons, history):
+    if stage == 1:
+        p = {1:2, 2:2, 3:3, 4:4}.get(display, 2)
+        return p, str(buttons[p-1])
+    if stage == 2:
+        if display == 1: return buttons.index(4)+1 if 4 in buttons else 1, '4'
+        if display in [2,4]: return history[0]['position'], str(buttons[history[0]['position']-1])
+        return 1, str(buttons[0])
+    if stage == 3:
+        if display == 1: lbl = int(history[1]['label']); return buttons.index(lbl)+1 if lbl in buttons else 1, str(lbl)
+        if display == 2: lbl = int(history[0]['label']); return buttons.index(lbl)+1 if lbl in buttons else 1, str(lbl)
+        if display == 3: return 3, str(buttons[2])
+        return buttons.index(4)+1 if 4 in buttons else 1, '4'
+    if stage == 4:
+        if display == 1: return history[0]['position'], str(buttons[history[0]['position']-1])
+        if display == 2: return 1, str(buttons[0])
+        return history[1]['position'], str(buttons[history[1]['position']-1])
+    if stage == 5:
+        lbl = int(history[{1:0, 2:1, 3:3, 4:2}.get(display, 0)]['label'])
+        return buttons.index(lbl)+1 if lbl in buttons else 1, str(lbl)
+    return 1, str(buttons[0])
+
+def solve_simon(flashes, serial, strikes):
+    m = (SIMON_V if has_vowel(serial) else SIMON_NV).get(min(strikes, 2))
+    return [m.get(f.lower(), f.lower()) for f in flashes]
+
+def solve_whos(display, buttons):
+    d, b = display.strip().upper(), [x.strip().upper() for x in buttons]
+    idx = WHOS1.get(d, 4)
+    if idx >= len(b): idx = 0
+    lbl = b[idx]
+    for c in WHOS2.get(lbl, []):
+        if c in b: return b.index(c) + 1
+    return 1
+
+def solve_complicated(color, led, star, serial, batt, ports):
+    c = color.lower()
+    r, bl = 'red' in c, 'blue' in c
+    par, even, b2 = has_parallel(ports), last_digit_even(serial), batt >= 2
+    # No attributes = C
+    if not r and not bl and not star and not led: return True
+    # Single attribute
+    if r and not bl and not star and not led: return even  # S
+    if not r and bl and not star and not led: return even  # S
+    if not r and not bl and star and not led: return True  # C
+    if not r and not bl and not star and led: return False  # D
+    # Two attributes
+    if r and bl and not star and not led: return even  # S
+    if r and not bl and star and not led: return True  # C
+    if r and not bl and not star and led: return b2  # B
+    if not r and bl and star and not led: return False  # D
+    if not r and bl and not star and led: return par  # P
+    if not r and not bl and star and led: return b2  # B
+    # Three attributes
+    if r and bl and star and not led: return par  # P
+    if r and bl and not star and led: return even  # S
+    if r and not bl and star and led: return b2  # B
+    if not r and bl and star and led: return par  # P
+    # All four
+    if r and bl and star and led: return False  # D
+    return False
+
+def solve_password(cols):
+    for w in PASSWORDS:
+        if all(w[i].lower() in [c.lower() for c in cols[i]] for i in range(min(len(w), len(cols)))):
+            return w
+    return 'about'
+
+async def main():
+    serial_number = None
+    batteries = None
+    label = None
+    ports = None
+    strikes = 0
+
+    reader, writer = await asyncio.open_connection('scripting.ctf.pascalctf.it', 6004)
+
+    mem_hist, mem_stage = [], 1
+    wr, wb, wbl = 0, 0, 0
+    buf = ""
+    waiting_digit = False
+    strip_color = ""
+
+    async def send(msg):
+        # print(f">>> {msg}")
+        writer.write((msg + '\n').encode())
+        await writer.drain()
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(reader.read(65536), timeout=0.1)
+                if not data:
+                    break
+                buf += data.decode('utf-8', errors='replace')
+                # print(data.decode('utf-8', errors='replace'), end='', flush=True)
+                print(data.decode('utf-8', errors='replace'), end='')
+            except asyncio.TimeoutError:
+                pass
+
+            if serial_number is None and (m := re.search(r'Serial Number:\s*(\w+)', buf)): serial_number = m.group(1)
+            if batteries is None and (m := re.search(r'Batteries:\s*(\d+)', buf)): batteries = int(m.group(1))
+            if label is None and (m := re.search(r'Label:\s*(\w+)', buf)): label = m.group(1)
+            if ports is None and (m := re.search(r'Ports:\s*(.+)', buf)): ports = [p.strip() for p in m.group(1).split(',')]
+
+            if 'ptm{' in buf.lower() or 'flag{' in buf.lower() or 'CTF{' in buf:
+                print("\n[+] FLAG FOUND!")
+                print(buf)
+                break
+            if 'Game Over' in buf or 'exploded' in buf:
+                print("GAME OVER detected!")
+                print(buf[-2000:])
+                break
+
+            if waiting_digit and 'digit' in buf.lower():
+                await send(STRIP_DIGIT.get(strip_color.lower(), '1'))
+                waiting_digit = False
+                buf = ""
+                continue
+
+            if ('Select Module' in buf or 'press Enter' in buf) and '🔧' not in buf.split('Select Module')[-1]:
+                await send('')
+                buf = ""
+                continue
+
+            # Complicated Wires
+            if 'Module: Complicated Wires' in buf and 'Wire 1:' in buf:
+                cm = re.search(r"'colors':\s*\[([^\]]+)\]", buf)
+                lm = re.search(r"'leds':\s*\[([^\]]+)\]", buf)
+                sm = re.search(r"'stars':\s*\[([^\]]+)\]", buf)
+                if cm and lm and sm:
+                    colors = re.findall(r"'([^']+)'", cm.group(1))
+                    leds = ['True' in x for x in lm.group(1).split(',')]
+                    stars = ['True' in x for x in sm.group(1).split(',')]
+                    for i in range(len(colors)):
+                        ans = 'cut' if solve_complicated(colors[i], leds[i], stars[i], serial_number, batteries, ports) else 'skip'
+                        await send(ans)
+                    buf = ""
+                    continue
+
+            # Simple Wires
+            if 'Module: Wires' in buf and ('wire' in buf.lower() and ('cut' in buf.lower() or 'number' in buf.lower())):
+                wm = re.search(r"'colors':\s*\[([^\]]+)\]", buf)
+                if wm:
+                    wires = re.findall(r"'([^']+)'", wm.group(1))
+                    await send(str(solve_wires(wires, serial_number)))
+                    buf = ""
+                    continue
+
+            # Keypads
+            if 'Module: Keypads' in buf and 'Sequence' in buf:
+                sm = re.search(r"'symbols':\s*\[([^\]]+)\]", buf)
+                if sm:
+                    symbols = re.findall(r"'([^']+)'", sm.group(1))
+                    await send(' '.join(map(str, solve_keypads(symbols))))
+                    buf = ""
+                    continue
+
+            # Button
+            if 'Module: Button' in buf and 'Choose action' in buf:
+                cm = re.search(r"'color':\s*'([^']+)'", buf)
+                tm = re.search(r"'text':\s*'([^']+)'", buf)
+                cs = re.search(r"'color_strip':\s*'([^']+)'", buf)
+                if cm and tm:
+                    inds = [{'label': label, 'lit': True}] if label else []
+                    action = solve_button(cm.group(1), tm.group(1), batteries, inds)
+                    if cs: strip_color = cs.group(1)
+                    if action == '2': waiting_digit = True
+                    await send(action)
+                    buf = ""
+                    continue
+
+            # Memory
+            if 'Module: Memory' in buf and 'position' in buf.lower():
+                dm = re.search(r"'display':\s*(\d+)", buf)
+                bm = re.search(r"'buttons':\s*\[([^\]]+)\]", buf)
+                stm = re.search(r"'stage':\s*(\d+)", buf)
+                if dm and bm:
+                    display = int(dm.group(1))
+                    buttons = [int(x.strip()) for x in bm.group(1).split(',')]
+                    if stm: mem_stage = int(stm.group(1))
+                    pos, lbl = solve_memory(mem_stage, display, buttons, mem_hist)
+                    mem_hist.append({'position': pos, 'label': lbl})
+                    await send(str(pos))
+                    if mem_stage >= 5: mem_hist, mem_stage = [], 1
+                    else: mem_stage += 1
+                    buf = ""
+                    continue
+
+            # Simon Says
+            if 'Module: Simon' in buf and ('flashes' in buf.lower() or 'sequence' in buf.lower()):
+                fm = re.search(r"'flashes':\s*\[([^\]]+)\]", buf)
+                if fm:
+                    flashes = re.findall(r"'([^']+)'", fm.group(1))
+                    await send(' '.join(solve_simon(flashes, serial_number, strikes)))
+                    buf = ""
+                    continue
+
+            # Who's on First
+            if ("Who's on First" in buf or "Module: Who" in buf) and 'buttons' in buf:
+                dm = re.search(r"'display':\s*'([^']*)'", buf)
+                bm = re.search(r"'buttons':\s*\[([^\]]+)\]", buf)
+                if dm and bm:
+                    buttons = re.findall(r"'([^']+)'", bm.group(1))
+                    await send(str(solve_whos(dm.group(1), buttons)))
+                    buf = ""
+                    continue
+
+            # Password
+            if 'Module: Password' in buf and 'columns' in buf:
+                cm = re.search(r"'columns':\s*(\[\[.+?\]\])", buf, re.DOTALL)
+                if cm:
+                    try:
+                        cols = json.loads(cm.group(1).replace("'", '"'))
+                        await send(solve_password(cols))
+                    except: await send('about')
+                    buf = ""
+                    continue
+
+            # Morse Code
+            if 'Module: Morse' in buf and 'word' in buf:
+                wm = re.search(r"'word':\s*'([^']+)'", buf)
+                if wm:
+                    await send(MORSE_WORDS.get(wm.group(1).lower(), '3.500'))
+                    buf = ""
+                    continue
+
+            # Wire Sequences
+            if 'Module: Wire Sequence' in buf and 'wires' in buf:
+                wm = re.search(r"'wires':\s*(\[.+?\])", buf, re.DOTALL)
+                if wm:
+                    try:
+                        wires = json.loads(wm.group(1).replace("'", '"'))
+                        cut = []
+                        for i, w in enumerate(wires):
+                            c, d = w['color'].lower(), w['to'].upper()
+                            if c == 'red': wr += 1; rules = RED_WIRE
+                            elif c == 'blue': wb += 1; rules = BLUE_WIRE
+                            elif c == 'black': wbl += 1; rules = BLACK_WIRE
+                            else: continue
+                            cnt = wr if c == 'red' else (wb if c == 'blue' else wbl)
+                            if d in rules.get(cnt, []): cut.append(i+1)
+                        await send(' '.join(map(str, cut)) if cut else 'none')
+                    except: await send('none')
+                    buf = ""
+                    continue
+
+            if len(buf) > 20000: buf = buf[-10000:]
+
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+if __name__ == '__main__':
+    asyncio.run(main())
+```

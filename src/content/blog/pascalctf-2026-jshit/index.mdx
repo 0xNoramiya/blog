@@ -1,0 +1,66 @@
+---
+title: 'PascalCTF 2026 - JShit'
+description: 'Writeup for JShit from PascalCTF 2026. A Web challenge involving JSFuck obfuscation.'
+date: 2026-02-01
+tags: ['writeup', 'web', 'jsfuck', 'obfuscation', 'pascalctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Challenge Name:** JShit
+**Category:** Web
+**Flag:** `pascalCTF{1_h4t3_j4v4scr1pt_s0o0o0o0_much}`
+
+## 🔍 Analysis
+
+The challenge provided a single HTML file containing a heavily obfuscated JavaScript script using [JSFuck](http://www.jsfuck.com/) (using only 6 characters: `[]()!+`).
+
+### The Source Code
+
+The HTML contained a script block with the obfuscated code:
+
+```html
+<script id="code">
+    [][(![] + [])[+!+[]] + (!![] + [])[+[]]][([][(![] + [])...
+</script>
+```
+
+## 🔓 Solution
+
+1. **Decoding JSFuck**: The JSFuck code evaluates to a JavaScript function. We can decode it by pasting the characters into a browser console (removing the final `()` call to see the function source instead of executing it) or using a dedicated decoder (https://www.dcode.fr/jsfuck-language).
+
+2. **Decoded Logic**:
+   The logic hidden within the obfuscation was revealed to be:
+
+   ```javascript
+   () => {
+     const pageElement = document.getElementById('page');
+     // Checks for a cookie named 'flag'
+     const flag = document.cookie.split('; ').find(row => row.startsWith('flag='));
+     
+     // Compares the cookie value against the hardcoded flag
+     const pageContent = `<div class="container">
+       <h1 class="mt-5">Welcome to JSHit</h1>
+       <p class="lead">${
+         flag && flag.split('=')[1] === 'pascalCTF{1_h4t3_j4v4scr1pt_s0o0o0o0_much}'
+           ? 'You got the flag gg'
+           : 'You got no flag yet lol'
+       }</p>
+     </div>`;
+     
+     pageElement.innerHTML = pageContent;
+     console.log("where's the page gone?");
+     document.getElementById('code').remove(); // Deletes the script tag
+   }
+   ```
+
+3. **Extracting the Flag**:
+   The flag is hardcoded directly in the comparison within the script.
+
+## Flag
+
+```text
+pascalCTF{1_h4t3_j4v4scr1pt_s0o0o0o0_much}
+```
