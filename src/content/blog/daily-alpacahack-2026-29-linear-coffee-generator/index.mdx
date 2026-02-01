@@ -1,0 +1,196 @@
+---
+title: 'Daily Alpacahack 2026 #29 - Linear Coffee Generator'
+description: 'Writeup for Linear Coffee Generator from Daily Alpacahack 2026 #29. A Crypto challenge involving LCG parameter recovery.'
+date: 2026-01-29
+tags: ['writeup', 'crypto', 'lcg', 'math', 'alpacahack']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Crypto
+**Flag:** `Alpaca{how_much_sugar_do_you_need}`
+
+We're given a Python script that implements a **Linear Congruential Generator (LCG)** to produce pseudo-random numbers. The flag is encrypted using AES-CBC, where the key is derived from the LCG parameters `(p, a, b, s)`. Our goal is to recover these secret parameters from the 4 consecutive outputs provided.
+
+### Given Files
+
+**chall.py** - The challenge script:
+```python
+class LCG:
+    def __init__(self):
+        self.p = getPrime(64)
+        self.a = getRandomRange(1, self.p)
+        self.b = getRandomRange(1, self.p)
+        self.s = getRandomRange(1, self.p)
+
+    def serve_coffee(self):
+        self.s = (self.a * self.s + self.b) % self.p
+        return self.s
+```
+
+**output.txt** - The challenge output:
+```
+#1 order: 4052328936969804578
+#2 order: 8676271689691567645
+#3 order: 2647032430467963079
+#4 order: 6612596210231769351
+encrypted flag: 0c5355c5bb76b2a86aa7cf53279fb2350883865f2ca7423ff47512278a59a8db1ed85e82e0d84c2fec52e29d0b3aefd97d791f11edf18efdf1febc07ae860b8b
+```
+
+## Solution
+
+### Understanding the LCG
+
+An LCG generates numbers using the recurrence relation:
+
+$$s_{n+1} = (a \cdot s_n + b) \mod p$$
+
+Where:
+- `p` = modulus (64-bit prime)
+- `a` = multiplier
+- `b` = increment
+- `s` = current state
+
+We have 4 consecutive outputs: `s₁, s₂, s₃, s₄`
+
+### Step 1: Recovering the Modulus `p`
+
+The key insight is that consecutive differences have a multiplicative relationship:
+
+$$t_n = s_{n+1} - s_n$$
+
+Since:
+- $s_2 - s_1 = a \cdot s_1 + b - s_1 - a \cdot s_0 - b = a(s_1 - s_0) = a \cdot t_0$
+- $s_3 - s_2 = a(s_2 - s_1) = a \cdot t_1$
+- $s_4 - s_3 = a(s_3 - s_2) = a \cdot t_2$
+
+This means:
+$$\frac{t_2}{t_1} = \frac{t_3}{t_2} = a \pmod{p}$$
+
+Cross-multiplying:
+$$t_2^2 \equiv t_1 \cdot t_3 \pmod{p}$$
+
+Therefore:
+$$t_2^2 - t_1 \cdot t_3 \equiv 0 \pmod{p}$$
+
+Computing this value gives us a **multiple of p**:
+
+```python
+t1 = s2 - s1  # 4623942752721763067
+t2 = s3 - s2  # -6029239259223604566
+t3 = s4 - s3  # 3965563779763806272
+
+zero_val = t2 * t2 - t3 * t1
+# = 18015186145068426177274734295463492132
+```
+
+Factoring this value:
+```
+18015186145068426177274734295463492132 = 2² × 9197623 × 37447334611 × 13076220846716751461
+```
+
+The 64-bit prime factor is our modulus:
+$$p = 13076220846716751461$$
+
+### Step 2: Recovering the Multiplier `a`
+
+Using the relationship $t_2 = a \cdot t_1 \pmod{p}$:
+
+$$a = t_2 \cdot t_1^{-1} \pmod{p}$$
+
+```python
+a = (t2 * pow(t1, -1, p)) % p
+# a = 6534081916410610007
+```
+
+### Step 3: Recovering the Increment `b`
+
+From $s_2 = a \cdot s_1 + b \pmod{p}$:
+
+$$b = s_2 - a \cdot s_1 \pmod{p}$$
+
+```python
+b = (s2 - a * s1) % p
+# b = 12854780772490122855
+```
+
+### Step 4: Recovering the Initial State `s₀`
+
+From $s_1 = a \cdot s_0 + b \pmod{p}$:
+
+$$s_0 = (s_1 - b) \cdot a^{-1} \pmod{p}$$
+
+```python
+s0 = ((s1 - b) * pow(a, -1, p)) % p
+# s0 = 12938961673315310206
+```
+
+### Step 5: Decrypting the Flag
+
+With all parameters recovered, we can derive the AES key and decrypt:
+
+```python
+params = (p, a, b, s0)
+# = (13076220846716751461, 6534081916410610007, 12854780772490122855, 12938961673315310206)
+
+key = hashlib.sha256(str(params).encode()).digest()
+cipher = AES.new(key, AES.MODE_CBC, iv=enc_flag[:16])
+flag = unpad(cipher.decrypt(enc_flag[16:]), 16)
+```
+
+## Recovered Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| `p` | 13076220846716751461 |
+| `a` | 6534081916410610007 |
+| `b` | 12854780772490122855 |
+| `s₀` | 12938961673315310206 |
+
+## Full Solver
+
+```python
+import hashlib
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+import sympy
+
+def decrypt_flag(ct, params):
+    key = hashlib.sha256(str(params).encode()).digest()
+    cipher = AES.new(key, AES.MODE_CBC, iv=ct[:16])
+    return unpad(cipher.decrypt(ct[16:]), 16)
+
+# Given outputs
+s1 = 4052328936969804578
+s2 = 8676271689691567645
+s3 = 2647032430467963079
+s4 = 6612596210231769351
+enc_flag = bytes.fromhex("0c5355c5bb76b2a86aa7cf53279fb2350883865f2ca7423ff47512278a59a8db1ed85e82e0d84c2fec52e29d0b3aefd97d791f11edf18efdf1febc07ae860b8b")
+
+# Step 1: Recover p
+t1, t2, t3 = s2 - s1, s3 - s2, s4 - s3
+zero_val = t2 * t2 - t3 * t1
+
+factors = sympy.factorint(abs(zero_val))
+for factor in factors:
+    if 63 <= factor.bit_length() <= 64 and sympy.isprime(factor):
+        p = factor
+        break
+
+# Step 2-4: Recover a, b, s0
+a = (t2 * pow(t1, -1, p)) % p
+b = (s2 - a * s1) % p
+s0 = ((s1 - b) * pow(a, -1, p)) % p
+
+# Step 5: Decrypt
+flag = decrypt_flag(enc_flag, (p, a, b, s0))
+print(f"Flag: {flag.decode()}")
+```
+
+## Flag
+
+```
+Alpaca{how_much_sugar_do_you_need}
+```
