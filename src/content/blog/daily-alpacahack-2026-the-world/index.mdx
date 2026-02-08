@@ -95,6 +95,32 @@ except socket.timeout:
 s.close()
 ```
 
+## Intended Solutions
+
+It turns out my solution was completely unintended! The challenge author detailed two other ways to solve this:
+
+1.  **Error Message Leak**: Simply inputting `FLAG` causes bash to try interpreting the string "Alpaca{...}" as an arithmetic operator. This fails, but `set -e` doesn't catch it immediately, and standard error prints: `invalid arithmetic operator (error token is "Alpaca{...}")`. The flag is right there in the error message.
+2.  **Variable Poisoning (Side-Effect)**:
+    - In Stage 1, input `(d2=0)+EPOCHSECONDS`. This sets `d2=0` as a side effect while passing the check.
+    - In Stage 2, input `.` (or any invalid syntax). This causes an error, preventing `d2` from being assigned a new value.
+    - `d2` remains `0` (from Stage 1), so the check `-100 < 0 < 100` passes, revealing the flag.
+
+My array injection technique allows for arbitrary command execution (RCE), which is arguably much more powerful than the intended solutions.
+
+### ACE Demonstration
+
+For example, injecting `whoami` results in `nobody`, proving we have code execution on the server:
+
+```
+[Warmup] current time (seconds)?
+
+Well done.
+[Impossible] current time (nanoseconds)?
+
+nobody
+Hm. diff: -1770393673170697871
+```
+
 ## Flag
 
 ```

@@ -1,0 +1,187 @@
+---
+title: 'Nullcon HackIM CTF Goa 2026 - Pasty'
+description: 'Writeup for Pasty from Nullcon HackIM CTF 2026. A Crypto/Web challenge involving XOR-based signature forgery.'
+date: 2026-02-08
+tags: ['writeup', 'web', 'crypto', 'php', 'xor', 'forgery', 'nullcon']
+authors: ['kudaliar']
+draft: false
+---
+
+**Challenge:** Pasty  
+**Category:** Web  
+**Flag:** `ENO{cr3at1v3_cr7pt0_c0nstruct5_cr4sh_c4rd5}`
+
+## Challenge Overview
+
+Pasty is a pastebin service that protects paste access with "cryptographic signatures." Users create pastes, and the server returns a URL containing a paste `id` and a `sig` parameter. Viewing a paste requires a valid signature for that paste's id. The goal is to forge a valid signature for the paste with `id=flag` to read the flag.
+
+We are given one source file, `sig.php`, containing the signature algorithm.
+
+## Source Code Analysis
+
+The provided `sig.php` contains two functions:
+
+```php
+function _x($a,$b){
+    $r='';
+    for($i=0;$i<strlen($a);$i++)
+        $r.=chr(ord($a[$i])^ord($b[$i]));
+    return $r;
+}
+
+function compute_sig($d,$k){
+    $h=hash('sha256',$d,1);
+    $m=substr(hash('sha256',$k,1),0,24);
+    $o='';
+    for($i=0;$i<4;$i++){
+        $s=$i<<3;
+        $b=substr($h,$s,8);
+        $p=(ord($h[$s])%3)<<3;
+        $c=substr($m,$p,8);
+        $o.=($i?_x(_x($b,$c),substr($o,$s-8,8)):_x($b,$c));
+    }
+    return $o;
+}
+```
+
+### Breaking it down
+
+`_x($a, $b)` simply XORs two byte strings together.
+
+`compute_sig($d, $k)` computes a 32-byte signature from data `$d` (the paste id) and a secret key `$k`:
+
+1. **Hash the data:** `$h = SHA256($d)` - raw 32 bytes, split into 4 blocks of 8 bytes.
+2. **Derive key material:** `$m = SHA256($k)[0:24]` - first 24 bytes of the key's hash, forming 3 blocks of 8 bytes at offsets 0, 8, and 16.
+3. **Four rounds** (i = 0..3), each producing 8 bytes of output:
+   - `$s = i * 8` (byte offset into `$h`)
+   - `$b = $h[$s : $s+8]` (current data block)
+   - `$p = ($h[$s] % 3) * 8` (selects which of the 3 key blocks to use, based on the first byte of the current data block)
+   - `$c = $m[$p : $p+8]` (the selected key block)
+   - **Round 0:** `output[0:8] = $b XOR $c`
+   - **Rounds 1-3:** `output[$s : $s+8] = ($b XOR $c) XOR output[$s-8 : $s]` (XOR with the previous output block, CBC-like chaining)
+
+## The Vulnerability
+
+The scheme is entirely based on XOR, which makes it trivially **invertible**. If we know both the input data (`$d`, i.e., the paste id) and the output signature, we can algebraically recover the key blocks. There is no one-way hardness beyond SHA256 hashing the input -- the key material is mixed in via XOR only.
+
+### Key Recovery
+
+Given a known (id, signature) pair, we can compute `$h = SHA256(id)` and then reverse each round:
+
+**Round 0:**
+```
+sig[0:8] = h[0:8] XOR c[p0]
+=> c[p0] = sig[0:8] XOR h[0:8]
+```
+
+**Rounds 1-3:**
+```
+sig[s:s+8] = (h[s:s+8] XOR c[pi]) XOR sig[s-8:s]
+=> c[pi] = sig[s:s+8] XOR sig[s-8:s] XOR h[s:s+8]
+```
+
+Where `pi = h[s] % 3` tells us which of the 3 key blocks (`m[0:8]`, `m[8:16]`, or `m[16:24]`) was used.
+
+Each round reveals one key block. Since there are 4 rounds per signature but only 3 key blocks, a single paste will typically reveal 1-3 unique key blocks depending on which are selected. In practice, **2-3 pastes** are enough to recover all 3 key blocks.
+
+## Exploitation
+
+### Step 1: Reconnaissance
+
+The web app lets us create pastes via `POST /create.php` and view them via `GET /view.php?id=<id>&sig=<hex_sig>`. Creating a paste returns the full URL with both the id and signature. The signature is the hex-encoded 32-byte output of `compute_sig(id, secret_key)`.
+
+Key observations:
+- The same content produces different ids each time (ids are random).
+- Viewing a paste with an invalid signature returns "Invalid signature".
+- The paste with `id=flag` likely contains the flag.
+
+### Step 2: Recover the Key Material
+
+Create pastes and reverse the XOR operations to extract the key blocks:
+
+```python
+import hashlib, requests, urllib.parse
+
+BASE = "http://52.59.124.14:5005"
+
+def xor_bytes(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def create_paste(content):
+    resp = requests.post(f"{BASE}/create.php",
+                         data={"content": content}, allow_redirects=False)
+    loc = resp.headers['Location']
+    parsed = urllib.parse.urlparse(loc)
+    params = urllib.parse.parse_qs(parsed.query)
+    url = params['url'][0]
+    url_parsed = urllib.parse.urlparse(url)
+    url_params = urllib.parse.parse_qs(url_parsed.query)
+    return url_params['id'][0], url_params['sig'][0]
+
+def recover_key_blocks(paste_id, sig_hex):
+    sig = bytes.fromhex(sig_hex)
+    h = hashlib.sha256(paste_id.encode()).digest()
+    key_blocks = {}
+    for i in range(4):
+        s = i * 8
+        b = h[s:s+8]
+        p_idx = h[s] % 3
+        if i == 0:
+            c = xor_bytes(sig[0:8], b)
+        else:
+            c = xor_bytes(xor_bytes(sig[s:s+8], sig[s-8:s]), b)
+        key_blocks[p_idx] = c
+    return key_blocks
+
+# Recover all 3 key blocks
+all_key_blocks = {}
+for i in range(10):
+    pid, sig = create_paste(f"recover_key_{i}")
+    all_key_blocks.update(recover_key_blocks(pid, sig))
+    if len(all_key_blocks) == 3:
+        break
+
+# Reconstruct the 24-byte key material
+m = all_key_blocks[0] + all_key_blocks[1] + all_key_blocks[2]
+```
+
+In our run, all 3 blocks were recovered after just 2 pastes.
+
+### Step 3: Forge a Signature for the Flag
+
+With the recovered key material `m`, compute a valid signature for `id=flag`:
+
+```python
+def compute_sig(d_str, m):
+    h = hashlib.sha256(d_str.encode()).digest()
+    o = b''
+    for i in range(4):
+        s = i * 8
+        b = h[s:s+8]
+        p = (h[s] % 3) * 8
+        c = m[p:p+8]
+        if i == 0:
+            block = xor_bytes(b, c)
+        else:
+            block = xor_bytes(xor_bytes(b, c), o[s-8:s])
+        o += block
+    return o
+
+forged_sig = compute_sig("flag", m).hex()
+url = f"{BASE}/view.php?id=flag&sig={forged_sig}"
+print(requests.get(url).text)
+```
+
+### Step 4: Retrieve the Flag
+
+Accessing the forged URL returns the flag paste:
+
+```
+http://52.59.124.14:5005/view.php?id=flag&sig=b8e4e53e526806aa641e0dac06294218f67a1e18ea7c2d573d40a266a7703710
+```
+
+## Flag
+
+```
+ENO{cr3at1v3_cr7pt0_c0nstruct5_cr4sh_c4rd5}
+```
