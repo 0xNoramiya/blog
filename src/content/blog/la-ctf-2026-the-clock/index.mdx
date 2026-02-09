@@ -1,0 +1,305 @@
+---
+title: 'LA CTF 2026 - The Clock'
+description: 'Writeup for The Clock from LA CTF 2026. A Crypto challenge involving Diffie-Hellman over a clock group and Pohlig-Hellman attack.'
+date: 2026-02-09
+tags: ['writeup', 'crypto', 'diffie-hellman', 'clock-group', 'pohlig-hellman', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Flag:** `lactf{t1m3_c0m3s_f4r_u_4all}`
+
+## Challenge Overview
+
+This challenge implements a Diffie-Hellman key exchange over a "clock" group, where points satisfy the equation $x^2 + y^2 = 1$ (the unit circle). The goal is to recover the shared secret and decrypt the flag.
+
+## Given Information
+
+- Challenge source code with a missing prime `p`
+- Alice's public key: $(13109366899209289301676180036151662757744653412475893615415990437597518621948, 5214723011482927364940019305510447986283757364508376959496938374504175747801)$
+- Bob's public key: $(1970812974353385315040605739189121087177682987805959975185933521200533840941, 12973039444480670818762166333866292061530850590498312261363790018126209960024)$
+- Encrypted flag: `d345a465538e3babd495cd89b43a224ac93614e987dfb4a6d3196e2d0b3b57d9`
+
+## Step 1: Recover the Prime p
+
+The clock group consists of points $(x, y)$ satisfying $x^2 + y^2 \equiv 1 \pmod{p}$. For valid points, $x^2 + y^2 - 1$ must be divisible by $p$.
+
+```python
+base_x = 13187661168110324954294058945757101408527953727379258599969622948218380874617
+base_y = 5650730937120921351586377003219139165467571376033493483369229779706160055207
+alice_x = 13109366899209289301676180036151662757744653412475893615415990437597518621948
+alice_y = 5214723011482927364940019305510447986283757364508376959496938374504175747801
+bob_x = 1970812974353385315040605739189121087177682987805959975185933521200533840941
+bob_y = 12973039444480670818762166333866292061530850590498312261363790018126209960024
+
+base_sum = base_x**2 + base_y**2 - 1
+alice_sum = alice_x**2 + alice_y**2 - 1
+bob_sum = bob_x**2 + bob_y**2 - 1
+
+p = gcd(gcd(base_sum, alice_sum), bob_sum)
+```
+
+**Result:**
+```
+p = 13767529254441196841515381394007440393432406281042568706344277693298736356611
+```
+
+Verification: $p$ is prime and all given points satisfy the curve equation.
+
+## Step 2: Analyze the Group Structure
+
+For the clock group over $\mathbb{F}_p$ where $p \equiv 3 \pmod{4}$:
+- The group order is $p + 1$
+- The group is isomorphic to the multiplicative subgroup of $\mathbb{F}_{p^2}$ of order $p+1$
+
+**Mapping:** A point $(x, y)$ maps to the element $y + x \cdot i \in \mathbb{F}_{p^2}$, where $i^2 = -1$.
+
+## Step 3: Factor the Group Order
+
+```python
+group_order = p + 1
+# Factorization: 2^2 × 39623 × 41849 × 42773 × 46511 × 47951 × 50587 × 50741 × 51971 × 54983 × 55511 × 56377 × 58733 × 61843 × 63391 × 63839 × 64489
+```
+
+Since the group order factors into small primes, the **Pohlig-Hellman algorithm** is applicable.
+
+## Step 4: Solve Discrete Logarithm
+
+Using Pohlig-Hellman combined with Baby-Step Giant-Step (BSGS) for each prime power:
+
+```python
+def discrete_log_ph(base, target, order, factors, p):
+    # Pohlig-Hellman algorithm
+    results = []
+    moduli = []
+    
+    for q, e in factors.items():
+        qe = q ** e
+        cofactor = order // qe
+        
+        # Reduce to subgroup of order q^e
+        base_q = fp2_pow(base, cofactor, p)
+        target_q = fp2_pow(target, cofactor, p)
+        
+        # Solve in subgroup using BSGS
+        x = solve_prime_power(base_q, target_q, q, e, p)
+        
+        results.append(x)
+        moduli.append(qe)
+    
+    # Combine using CRT
+    return crt(results, moduli)
+
+# Find Alice's secret key
+alice_secret = discrete_log_ph(base_fp2, alice_fp2, group_order, factors, p)
+# Result: 13194345531092541282960468403774854038006010561489947009251825743361373440013
+```
+
+## Step 5: Compute Shared Secret and Decrypt
+
+```python
+def clockadd(P1, P2, p):
+    x1, y1 = P1
+    x2, y2 = P2
+    x3 = (x1 * y2 + y1 * x2) % p
+    y3 = (y1 * y2 - x1 * x2) % p
+    return (x3, y3)
+
+def scalarmult(P, n, p):
+    if n == 0: return (0, 1)
+    if n == 1: return P
+    Q = scalarmult(P, n // 2, p)
+    Q = clockadd(Q, Q, p)
+    if n % 2: Q = clockadd(P, Q, p)
+    return Q
+
+# Compute shared secret
+shared_secret = scalarmult(bob_public, alice_secret, p)
+# (12908236301563930913711454458378166788650310064605426549082577875696820848112, 
+#  6746606992515589635357750300060959445352892536721721582298343132524571854099)
+
+# Derive AES key
+key = md5(f"{shared_secret[0]},{shared_secret[1]}".encode()).digest()
+
+# Decrypt flag
+cipher = AES.new(key, AES.MODE_ECB)
+plaintext = cipher.decrypt(encrypted_flag)
+```
+
+## Key Takeaways
+
+1. **Recovering hidden parameters**: When the prime is missing but points are given, use the curve equation to derive it via GCD.
+
+2. **Clock group structure**: The clock curve $x^2 + y^2 = 1$ over $\mathbb{F}_p$ (with $p \equiv 3 \pmod{4}$) has order $p+1$ and can be mapped to a subgroup of $\mathbb{F}_{p^2}^*$.
+
+3. **Pohlig-Hellman attack**: When the group order has only small prime factors, discrete logarithms become computationally feasible.
+
+## Full Solver Script
+
+```python
+from hashlib import md5
+from Crypto.Cipher import AES
+import math
+
+# Given data
+base_point = (
+    13187661168110324954294058945757101408527953727379258599969622948218380874617,
+    5650730937120921351586377003219139165467571376033493483369229779706160055207
+)
+alice_public = (
+    13109366899209289301676180036151662757744653412475893615415990437597518621948,
+    5214723011482927364940019305510447986283757364508376959496938374504175747801
+)
+bob_public = (
+    1970812974353385315040605739189121087177682987805959975185933521200533840941,
+    12973039444480670818762166333866292061530850590498312261363790018126209960024
+)
+encrypted_flag = bytes.fromhex("d345a465538e3babd495cd89b43a224ac93614e987dfb4a6d3196e2d0b3b57d9")
+
+# Recover p
+base_x, base_y = base_point
+alice_x, alice_y = alice_public
+bob_x, bob_y = bob_public
+
+base_sum = base_x**2 + base_y**2 - 1
+alice_sum = alice_x**2 + alice_y**2 - 1
+bob_sum = bob_x**2 + bob_y**2 - 1
+
+def gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+
+p = gcd(gcd(base_sum, alice_sum), bob_sum)
+print(f"p = {p}")
+
+# Group order
+group_order = p + 1
+
+# Factorization
+factors = {2: 2, 39623: 1, 41849: 1, 42773: 1, 46511: 1, 47951: 1, 
+           50587: 1, 50741: 1, 51971: 1, 54983: 1, 55511: 1, 56377: 1, 
+           58733: 1, 61843: 1, 63391: 1, 63839: 1, 64489: 1}
+
+# F_p2 operations
+def fp2_mul(a, b, p):
+    a_real, a_imag = a
+    b_real, b_imag = b
+    real = (a_real * b_real - a_imag * b_imag) % p
+    imag = (a_real * b_imag + a_imag * b_real) % p
+    return (real, imag)
+
+def fp2_pow(a, n, p):
+    result = (1, 0)
+    base = a
+    while n > 0:
+        if n & 1:
+            result = fp2_mul(result, base, p)
+        base = fp2_mul(base, base, p)
+        n >>= 1
+    return result
+
+def point_to_fp2(point):
+    x, y = point
+    return (y, x)
+
+base_fp2 = point_to_fp2(base_point)
+alice_fp2 = point_to_fp2(alice_public)
+
+# BSGS
+def bsgs(base, target, order, p):
+    m = int(math.isqrt(order)) + 1
+    baby_steps = {}
+    current = (1, 0)
+    for j in range(m):
+        if current not in baby_steps:
+            baby_steps[current] = j
+        current = fp2_mul(current, base, p)
+    
+    base_m_inv = fp2_pow(base, order - m, p)
+    gamma = target
+    for i in range(m):
+        if gamma in baby_steps:
+            return (i * m + baby_steps[gamma]) % order
+        gamma = fp2_mul(gamma, base_m_inv, p)
+    return None
+
+# Pohlig-Hellman
+def discrete_log_ph(base, target, order, factors, p):
+    results = []
+    moduli = []
+    
+    for q, e in factors.items():
+        qe = q ** e
+        cofactor = order // qe
+        base_q = fp2_pow(base, cofactor, p)
+        target_q = fp2_pow(target, cofactor, p)
+        
+        x = 0
+        cur_base = base_q
+        cur_target = target_q
+        
+        for i in range(e):
+            base_reduced = fp2_pow(cur_base, q ** (e - i - 1), p)
+            target_reduced = fp2_pow(cur_target, q ** (e - i - 1), p)
+            xi = bsgs(base_reduced, target_reduced, q, p)
+            x += xi * (q ** i)
+            
+            if i < e - 1:
+                inv = fp2_pow(cur_base, xi, p)
+                inv = (inv[0], (-inv[1]) % p)
+                cur_target = fp2_mul(cur_target, inv, p)
+                cur_base = fp2_pow(cur_base, q, p)
+        
+        results.append(x)
+        moduli.append(qe)
+    
+    # CRT
+    def extended_gcd(a, b):
+        if b == 0:
+            return a, 1, 0
+        g, x1, y1 = extended_gcd(b, a % b)
+        return g, y1, x1 - (a // b) * y1
+    
+    def crt(rems, mods):
+        x = 0
+        M = 1
+        for m in mods:
+            M *= m
+        for ri, mi in zip(rems, mods):
+            Mi = M // mi
+            _, si, _ = extended_gcd(Mi, mi)
+            x = (x + ri * Mi * si) % M
+        return x
+    
+    return crt(results, moduli)
+
+# Get Alice's secret
+alice_secret = discrete_log_ph(base_fp2, alice_fp2, group_order, factors, p)
+print(f"Alice secret: {alice_secret}")
+
+# Compute shared secret
+def clockadd(P1, P2):
+    x1, y1 = P1
+    x2, y2 = P2
+    x3 = (x1 * y2 + y1 * x2) % p
+    y3 = (y1 * y2 - x1 * x2) % p
+    return (x3, y3)
+
+def scalarmult(P, n):
+    if n == 0: return (0, 1)
+    if n == 1: return P
+    Q = scalarmult(P, n // 2)
+    Q = clockadd(Q, Q)
+    if n % 2: Q = clockadd(P, Q)
+    return Q
+
+shared_secret = scalarmult(bob_public, alice_secret)
+print(f"Shared secret: {shared_secret}")
+
+# Decrypt
+key = md5(f"{shared_secret[0]},{shared_secret[1]}".encode()).digest()
+cipher = AES.new(key, AES.MODE_ECB)
+plaintext = cipher.decrypt(encrypted_flag)
+print(f"Flag: {plaintext}")
+```

