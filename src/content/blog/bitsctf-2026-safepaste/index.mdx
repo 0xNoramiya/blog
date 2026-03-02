@@ -112,9 +112,9 @@ The combined payload:
 
 **1. Server-side parsing (jsdom):**
 - `<noscript>` children parsed as HTML (scripting disabled).
-- `<p>` has a `title` attribute containing: `</noscript>$`<img src=x onerror=alert(1)>`
+- `<p>` has a `title` attribute containing: `` `</noscript>$`<img src=x onerror=alert(1)>` ``
 - DOMPurify sees safe text in an attribute, strips the noscript wrapper.
-- Output: `<p title="</noscript>$`<img src=x onerror=alert(1)>"></p>`
+- Output: `` `<p title="</noscript>$`<img src=x onerror=alert(1)>"></p>` ``
 
 **2. Template replacement:**
 - `pasteTemplate.replace("{paste}", sanitizedContent)` is called.
