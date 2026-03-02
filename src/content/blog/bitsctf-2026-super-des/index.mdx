@@ -1,0 +1,154 @@
+---
+title: 'BITSCTF 2026 - Super DES'
+description: 'Writeup for Super DES from BITSCTF 2026. An easy crypto challenge involving a triple DES implementation vulnerability.'
+date: 2026-03-02
+tags: ['writeup', 'crypto', 'easy', 'des', 'bitsctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Cryptography
+**Objective:** Exploit a flaw in a custom Triple DES encryption oracle to recover the secret key and decrypt the flag.
+
+The server allows us to:
+1. Choose `k2` and `k3` (both 8-byte DES keys with odd parity)
+2. Select one of three encryption modes
+3. Either encrypt the flag or encrypt our own plaintext
+
+### Key Observations
+
+1. **`k1` is fixed** throughout the session but unknown to us.
+2. **`ultra_secure_v1`**: $E_{k1}(E_{k2}(E_{k3}(pt)))$ - Triple encryption (EEE mode).
+3. **`ultra_secure_v2`**: $D_{k1}(E_{k2}(E_{k3}(pt)))$ - **Decrypt with secret key as outer operation!**
+
+## 1. Vulnerability
+
+The critical vulnerability lies in **`triple_des_ultra_secure_v2`**:
+
+$$\text{Output} = D_{k1}(E_{k2}(E_{k3}(\text{pad}(pt, 8))))$$
+
+Since we control `k2`, `k3`, and the input `pt`, we can make $E_{k2}(E_{k3}(\text{pad}(pt, 8)))$ equal any value we want. This effectively gives us a **decryption oracle for the secret key $k_1$!**
+
+## 2. Exploitation Strategy
+
+### Attack Flow
+
+1. **Get encrypted flag** using `ultra_secure_v1` with our chosen keys $k_2$, $k_3$:
+   $$C_1 = E_{k1}(E_{k2}(E_{k3}(F)))$$
+   where $F = \text{pad}(\text{flag}, 8)$
+
+2. **Find auxiliary keys** $k_2'$, $k_3'$ such that $D_{k_3'}(D_{k_2'}(C_1))$ ends with PKCS7 padding `\x01`:
+   - This allows us to strip the last byte and send 15 bytes to the oracle.
+   - The server will re-add the padding, resulting in exactly the value we want.
+
+3. **Use `ultra_secure_v2` as decryption oracle**:
+   - Send $P = D_{k_3'}(D_{k_2'}(C_1))[:-1]$ (15 bytes).
+   - Server pads it back to 16 bytes with `\x01`.
+   - Server returns $C_2 = D_{k1}(C_1) = E_{k2}(E_{k3}(F))$.
+
+4. **Recover the flag** using the known keys $k_2$, $k_3$:
+   $$F = D_{k_3}(D_{k_2}(C_2))$$
+   Then unpad to get the flag.
+
+### Why the Padding Trick?
+
+The server always pads input with `pad(pt, 8)`. To send exactly the value we want to the decryption oracle, we need to work around this padding. By finding keys where $D_{k_3'}(D_{k_2'}(C_1))$ ends with `\x01`:
+- We strip that byte (15 bytes remain).
+- The server adds `\x01` back (16 bytes, original value restored).
+- The decryption oracle gives us exactly $D_{k1}(C_1)$.
+
+## 3. Exploit Code
+
+```python
+#!/usr/bin/env python3
+from Crypto.Cipher import DES
+from Crypto.Util.Padding import unpad
+from pwn import remote
+
+def adjust_key(key8: bytes) -> bytes:
+    out = bytearray()
+    for b in key8:
+        b7 = b & 0xFE
+        ones = bin(b7).count("1")
+        out.append(b7 | (ones % 2 == 0))
+    return bytes(out)
+
+def des_encrypt(key, data):
+    cipher = DES.new(key, DES.MODE_ECB)
+    return cipher.encrypt(data)
+
+def des_decrypt(key, data):
+    cipher = DES.new(key, DES.MODE_ECB)
+    return cipher.decrypt(data)
+
+def exploit():
+    io = remote("20.193.149.152", 1340)
+    
+    # Step 1: Choose arbitrary k2, k3 and get encrypted flag
+    k2_raw = b'\x01' * 8
+    k3_raw = b'\x02' * 8
+    k2 = adjust_key(k2_raw)
+    k3 = adjust_key(k3_raw)
+    
+    io.recvuntil(b"enter k2 hex bytes >")
+    io.sendline(k2.hex().encode())
+    io.recvuntil(b"enter k3 hex bytes >")
+    io.sendline(k3.hex().encode())
+    io.recvuntil(b"4. exit")
+    io.sendline(b"2")  # ultra secure v1
+    io.recvuntil(b"enter option >")
+    io.sendline(b"1")  # encrypt flag
+    
+    io.recvuntil(b"ciphertext : ")
+    c1 = bytes.fromhex(io.recvline().strip().decode())
+    print(f"[*] C1 = {c1.hex()}")  # C1 = E_k1(E_k2(E_k3(F)))
+    
+    # Step 2: Find k2', k3' where D_k3'(D_k2'(C1)) ends with 0x01
+    print("[*] Brute-forcing auxiliary keys...")
+    for i in range(256):
+        for j in range(256):
+            k2p = adjust_key(bytes([i] * 8))
+            k3p = adjust_key(bytes([j] * 8))
+            x = des_decrypt(k3p, des_decrypt(k2p, c1))
+            if x[-1:] == b'\x01':
+                p_full, k2p, k3p = x, k2p, k3p
+                print(f"[*] Found keys at ({i}, {j})")
+                break
+        else:
+            continue
+        break
+    
+    # Step 3: Use ultra_secure_v2 as decryption oracle
+    p = p_full[:-1]  # Strip the padding byte
+    
+    io.recvuntil(b"enter k2 hex bytes >")
+    io.sendline(k2p.hex().encode())
+    io.recvuntil(b"enter k3 hex bytes >")
+    io.sendline(k3p.hex().encode())
+    io.recvuntil(b"4. exit")
+    io.sendline(b"3")  # ultra secure v2
+    io.recvuntil(b"enter option >")
+    io.sendline(b"2")  # encrypt own text
+    io.recvuntil(b"enter hex bytes >")
+    io.sendline(p.hex().encode())
+    
+    io.recvuntil(b"ciphertext : ")
+    c2 = bytes.fromhex(io.recvline().strip().decode())[:len(c1)]
+    print(f"[*] C2 = {c2.hex()}")  # C2 = D_k1(C1) = E_k2(E_k3(F))
+    
+    # Step 4: Decrypt using known k2, k3
+    flag = unpad(des_decrypt(k3, des_decrypt(k2, c2)), 8)
+    print(f"[+] Flag: {flag.decode()}")
+    io.close()
+
+if __name__ == "__main__":
+    exploit()
+```
+
+## 4. Flag
+
+```text
+BITSCTF{5up3r_d35_1z_n07_53cur3}
+```

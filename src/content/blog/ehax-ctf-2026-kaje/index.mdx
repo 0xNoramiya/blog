@@ -1,0 +1,156 @@
+---
+title: 'EHAX CTF 2026 - Kaje (Reverse Engineering)'
+description: 'Writeup for Kaje from EHAX CTF 2026. A reverse engineering challenge involving analyzing an ELF64 binary to understand its custom MurmurHash3-based PRNG keystream, and exploiting the environment-based seed branching.'
+date: 2026-03-02
+tags: ['writeup', 'reverse-engineering', 'binary', 'prng', 'ehax']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Reverse Engineering
+**Points:** 440
+**Provided file:** `kaje` (ELF64 binary)
+
+**TL;DR:** The unstripped ELF64 binary branch logs environment checks (like the presence of `/.dockerenv` or "overlay" in `mountinfo`) to determine a random 64-bit seed. This seed is transformed via a MurmurHash3 finalizer and then used in a feedback loop to generate 32 bytes of keystream. This keystream is XORed against ciphertext stored in `.rodata`. By reversing the seed branches and testing the four state combinations, we can reliably decrypt the flag.
+
+## 1. Initial Triage
+
+Initial basic binary triage starts with file inspections:
+
+```bash
+file kaje
+checksec --file=kaje
+strings -n 6 kaje
+```
+
+**Key Observations:**
+- It is a 64-bit PIE ELF, dynamically linked.
+- It is **not stripped** (all function names are comfortably present).
+- Security mitigations: Full RELRO, Canary, NX, PIE, SHSTK, IBT.
+- Useful exported symbols exist:
+  - `main`
+  - `gen_entropy`
+  - `gen_keystream`
+- Interesting strings identified:
+  - `/.dockerenv`
+  - `/proc/self/mountinfo`
+  - `overlay`
+
+The presence of descriptive symbol names drastically lowers the effort required to reverse this challenge.
+
+## 2. Analyzing `main`
+
+The disassembly of the `main` function displays a highly standardized decryption cycle:
+
+1. Call `gen_entropy()` to extract a 64-bit starting seed.
+2. Call `gen_keystream(out_buf, seed)` to push 32 bytes of keystream.
+3. XOR the requested keystream byte-by-byte with 32 encrypted bytes hardcoded into `.rodata`.
+4. Output the result using `puts`.
+
+The compiled encrypted data is split across two consecutive 16-byte constant structures at `.rodata`:
+
+- `0x2030`: `9f12d91be212bbbafbf5fee8a632acc6`
+- `0x2040`: `043692d4c93bbdbe22a2b4836b4503d3`
+
+Combined continuous ciphertext stream:
+
+```text
+9f12d91be212bbbafbf5fee8a632acc6043692d4c93bbdbe22a2b4836b4503d3
+```
+
+## 3. Reversing `gen_entropy`
+
+The `gen_entropy` function calculates its initial procedural seed based strictly on characteristics of the executing runtime environment.
+
+### 3.1 Initial Seed Branching
+
+The absolute default seed assumes a Docker execution footprint:
+
+```c
+seed = 0xcd9aadd8d9c9a989;
+```
+
+However, if `/.dockerenv` is **missing** (calculated via `access("/.dockerenv", 0) != 0`):
+
+```c
+seed = 0x1337133713371337;
+```
+
+This presents logic branch 1:
+- Running in Docker -> Seed: `0xcd9aadd8d9c9a989`
+- Not in Docker -> Seed: `0x1337133713371337`
+
+### 3.2 Overlay Environment Check
+
+Next, the binary sequentially opens `/proc/self/mountinfo` and scans each line logically for the string instance `"overlay"` (`strstr(line, "overlay")`).
+
+If the filesystem shows `"overlay"` is found anywhere in that target scope:
+
+```c
+seed ^= 0xabcdef1234567890;
+```
+
+This sets logical branch 2. After execution of this check, the file descriptor closes and the subroutine shifts to finalizing.
+
+### 3.3 The Final Transform
+
+Before handing the procedural seed back to `main`, the subroutine applies a MurmurHash3-style finalization mix `fmix64` directly against the value:
+
+```c
+x ^= x >> 33;
+x *= 0xff51afd7ed558ccd;
+x ^= x >> 33;
+x *= 0xc4ceb9fe1a85ec53;
+x ^= x >> 33;
+```
+
+The `gen_entropy` subroutine natively returns this transformed 64-bit value to seed the PRNG stream.
+
+## 4. Reversing `gen_keystream`
+
+The `gen_keystream` algorithm uses the exact same `fmix64` transform sequentially inside a loop to emit and populate all 32 bytes.
+
+The single most pivotal implementation detail discovered here is that the state algorithm functions on a **closed feedback loop**, iterating off of the output of the prior cycles:
+
+```c
+state = seed;
+for (i = 0; i < 32; i++) {
+    state = fmix64(state + i);
+    out[i] = state & 0xff;
+}
+```
+
+It is NOT performing `fmix64(seed + i)` independently per round. It permanently mutates `state` linearly on every iteration step.
+
+## 5. Decryption Execution Strategy
+
+The final plaintext results identically from the simple XOR operation described by:
+
+```text
+plaintext[i] = ciphertext[i] XOR keystream[i]
+```
+
+Because the runtime execution exclusively relies on two independent state variables (`dockerenv`, `overlay`), the entire probability space collapses into exactly **4 distinct initial output paths**.
+
+When simulating all four combination iterations sequentially over the encrypted bytes in the `solve.py` script:
+- `dockerenv = yes`
+- `overlay = yes`
+
+Provides the only functional plaintext capable of holding the required CTF flag wrapper footprint.
+
+## 6. Mathematical Solution Execution
+
+I codified the reversed architecture into `solve.py` to procedurally check the valid outputs. Upon manual execution of the Python solver across the `dockerenv=yes`, `overlay=yes` logic branch:
+
+```text
+dockerenv=yes, overlay=yes: EH4X{dUnn0_wh4tt_1z_1nt3NTenD3d}
+[+] Flag: EH4X{dUnn0_wh4tt_1z_1nt3NTenD3d}
+```
+
+## Final Flag
+
+```text
+EH4X{dUnn0_wh4tt_1z_1nt3NTenD3d}
+```

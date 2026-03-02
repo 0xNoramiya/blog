@@ -1,0 +1,153 @@
+---
+title: 'BITSCTF 2026 - Bank Heist'
+description: 'Writeup for Bank Heist from BITSCTF 2026. A hard blockchain challenge exploiting missing program_id checks in CPI verification.'
+date: 2026-03-02
+tags: ['writeup', 'blockchain', 'hard', 'solana', 'cpi', 'bitsctf']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Blockchain / Solana Smart Contracts
+**Objective:** Drain the bank vault below 1,000,000 lamports.
+
+Target service:
+
+```bash
+nc 20.193.149.152 5000
+```
+
+Goal from server logic:
+- Start balance of bank vault PDA: `1_000_000_000` lamports.
+- Win condition: final bank vault balance `< 1_000_000` lamports.
+
+## 1. Source Recon
+
+Relevant files provided in the challenge:
+- `server/src/main.rs`
+- `program/src/processor.rs`
+- `program/src/lib.rs`
+- `framework/src/lib.rs`
+
+High-level server flow (`server/src/main.rs`):
+1. Read attacker-supplied solve program (`program pubkey`, `.so` bytes).
+2. Load challenge program (`bank_heist.so`).
+3. Create a random `user` account with `1_000_000` lamports.
+4. Create bank vault PDA account with `1_000_000_000` lamports.
+5. Ask attacker for exactly 2 instructions, both targeting the attacker's solve program.
+6. Execute transaction with signer `[user]` and payer `user`.
+7. Check bank vault balance and print flag if `< 1_000_000`.
+
+## 2. Network Protocol
+
+Understanding the custom framework interaction from `framework/src/lib.rs` is critical.
+
+### Stage 1: Upload solve program
+The server prompts for details to deploy our exploit program:
+- `program pubkey:` -> send base58 pubkey + `\n`
+- `program len:` -> send decimal length + `\n`
+- then send exactly that many raw `.so` bytes
+
+### Stage 2: Submit instructions
+For each of the 2 instructions the server demands:
+- server prints `num accounts:`
+- send the number of accounts
+- send account metas as lines: `<meta> <pubkey>` (meta uses `s` for signer, `w` for writable)
+- server prints `ix len:`
+- send length line
+- send raw instruction bytes
+
+The framework builds the instruction as:
+- `Instruction::new_with_bytes(program_id = solve_pubkey, data, metas)`
+
+This means **both top-level instructions always execute our attacker code.**
+
+## 3. Vulnerability Analysis
+
+The core vulnerability lies in `program/src/processor.rs`, specifically within the `verify_repayment` function.
+
+The bank's `RequestLoan` flow is intended to work as follows:
+1. Transfers lamports from bank PDA to the user via CPI system transfer.
+2. Calls `verify_repayment(instructions_sysvar, bank_pda, amount)`.
+
+`verify_repayment` inspects the *next transaction instruction* from the instructions sysvar to "verify" the user paid back the loan. It only checks:
+1. The first 4 bytes of data interpreted as `u32` equals `2`.
+2. The next 8 bytes interpreted as `u64` is `>= expected_amount`.
+3. Account index 1 pubkey equals `bank_pda`.
+
+**What it completely fails to check:**
+- Whether the next instruction's `program_id` is actually the **System Program**.
+- Whether the next instruction actually executes a transfer at all.
+- Source account correctness.
+- Any actual state delta proving repayment happened (i.e. measuring balances before/after).
+
+This omission allows us to create a fake repayment instruction that merely *looks like* system transfer bytes in its data payload, but doesn't actually transfer any funds.
+
+## 4. Exploit Strategy
+
+Since we supply exactly two instructions that both route to our solve program, we structure our transaction as follows:
+
+### Instruction #1 (Exploit Logic)
+Inside our deployed solve program, perform 3 CPIs back to the challenge program:
+1. `OpenAccount`
+2. `VerifyKYC` (Compute valid proof by reading the `slot_hashes` sysvar).
+3. `RequestLoan { amount }`
+
+### Instruction #2 (The Fake Repayment Bait)
+We provide raw bytes natively in our client that are formatted exactly as the verification routine expects for a "System Transfer":
+- `discriminant = 2u32 (LE)`
+- `amount = loan_amount u64 (LE)`
+- Accounts where index 1 is `bank_pda`
+
+However, this instruction still executes **our attacker solve program**, not the System Program. Our solve program is designed to detect this payload and simply return `Ok(())` immediately (a no-op).
+
+**Result:**
+The bank program's `verify_repayment` reads this second instruction from the sysvar, sees the correct bytes and correct PDA account at index 1, and considers the repayment "verified". No actual repayment occurs, and the vault remains drained.
+
+## 5. Instruction Encoding Details
+
+From `program/src/lib.rs`, `BankInstruction` is a Borsh enum.
+Encodings used in CPI:
+- `OpenAccount` => `[0]`
+- `VerifyKYC { proof }` => `[1] + proof_le_u64`
+- `RequestLoan { amount }` => `[2] + amount_le_u64`
+
+Fake repayment payload for instruction #2 (top-level):
+- `[2u32_le (4 bytes)] + [loan_amount_u64_le (8 bytes)]`
+- Total 12 bytes
+
+## 6. Accounts Used
+
+**Top-level Instruction #1 accounts (to solve program):**
+1. `sw user`
+2. `r bank_program`
+3. `w bank_pda`
+4. `w user_pda`
+5. `r SysvarS1otHashes111111111111111111111111111`
+6. `r Sysvar1nstructions1111111111111111111111111`
+7. `r 11111111111111111111111111111111` (system program)
+
+**Top-level Instruction #2 accounts (fake repayment parser bait):**
+1. `r user`
+2. `r bank_pda` (must be exactly at index 1)
+
+## 7. Edge Cases & Troubleshooting
+
+### 1) Duplicate program pubkey panic
+If the attacker sends `Pubkey::new_unique()` as the solve pubkey, it can probabilistically collide with the server's own `Pubkey::new_unique()` used for the challenge program, causing a panic on duplicate add.
+**Fix:** The client script derives the solve pubkey deterministically: `sha256(solve.so)[0..32]`.
+
+### 2) Rent floor rollback
+Initially draining the exact amount needed left the bank at exactly `500,000` lamports. The transaction rolled back with `InsufficientFundsForRent { account_index: 1 }`.
+**Fix:** We set `LOAN_AMOUNT = 999_050_000`, leaving the bank at `950,000`. This successfully satisfied the challenge win condition (`< 1,000,000`) while staying above the runtime rent floor for the PDA account.
+
+## 8. Flag
+
+With the local exploit built via `cargo-build-sbf` and the client executed against the remote target, the expected interaction works:
+
+```text
+Bank Vault Balance: 950000
+Congratulations! You robbed the bank!
+Flag: BITSCTF{8ANk_h3157_1n51D3_A_8L0cK_ChA1n_15_cRa2Y}
+```

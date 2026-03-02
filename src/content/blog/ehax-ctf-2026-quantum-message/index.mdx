@@ -1,0 +1,189 @@
+---
+title: 'EHAX CTF 2026 - Quantum Message (Forensics)'
+description: 'Writeup for Quantum Message from EHAX CTF 2026. A forensic audio challenge analyzing high-speed custom DTMF-style symbol transmission and extracting the encoded decimal streams.'
+date: 2026-03-02
+tags: ['writeup', 'forensics', 'audio', 'dtmf', 'signal-processing', 'ehax']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Forensics
+**Files provided:** `challenge.wav`
+**Hint:** *"he types very fast like 20ms"*
+
+**Objective:** Recover the hidden message or flag stored inside the provided audio file.
+
+**TL;DR:** The 82-second audio file contains no plaintext or payloads natively within its metadata. A spectrogram analysis reveals structured 1-second long tonal blocks separated by ~20ms gaps. Processing each 1-second segment through a periodogram uncovers two dominant frequencies per block: one "low" and one "high", operating effectively as a custom high-speed DTMF keypad. Extracting these frequency pairs gives an 80-digit string, which perfectly maps back to concatenated decimal ASCII text representing the flag.
+
+## 1. Initial Triage
+
+The first step is checking the basic audio formats and metadata available in the file:
+
+```bash
+file challenge.wav
+exiftool challenge.wav
+```
+
+**Observations:**
+- WAV format, mono stream, 44.1 kHz, float32 encoding.
+- Duration is approximately 82 seconds.
+- No obvious metadata flag inside the headers.
+
+Quickly checking for common "easy wins" natively embedded in the file data:
+
+```bash
+strings challenge.wav
+binwalk challenge.wav
+```
+
+No useful embedded plaintext, Steghide payloads, or concatenated files are present.
+
+## 2. Signal-Level Observation
+
+Opening the file in a spectrogram (or analyzing the envelope natively) shows a distinct, repetitive structural pattern:
+- Successive long tone blocks, with each continuous tonal pulse taking exactly ~1 second.
+- Very short, sharp silence gaps between the blocks.
+- The gap length measures precisely ~17-20 ms (perfectly matching the prompt's hint: *"he types very fast like 20ms"*).
+
+From basic envelope and run-length analysis, we calculate:
+- There are exactly ~80 tone segments.
+- Each tone segment is ~1002 ms.
+- The silence gaps functionally act as symbol delimiters.
+
+**Conclusion:** The audio is not an organically recorded speech file or ambient noise; it is strictly a mathematically structured, machine-generated symbol transmission.
+
+## 3. Frequency Structure & Demodulation
+
+For each ~1-second tone block, we identify the dominant frequencies.
+
+Each discrete sound block contains:
+- 1 dominant frequency sourced from a **low group**: `{300, 900, 1500, 2100}` (in Hz)
+- 1 dominant frequency sourced from a **high group**: `{2700, 3300, 3900}` (in Hz)
+
+This configuration is perfectly analogous to a custom Dual-Tone Multi-Frequency (DTMF) keypad matrix.
+
+We can map every `(low_index, high_index)` pair to a 2D integer keypad grid:
+
+| Low \ High | 2700 | 3300 | 3900 |
+|---|---|---|---|
+| **300** | 1 | 2 | 3 |
+| **900** | 4 | 5 | 6 |
+| **1500** | 7 | 8 | 9 |
+| **2100** | | 0 | |
+
+Running this operation iteratively across all 80 tone segments produced the following continuous 80-digit numerical stream:
+
+```text
+69725288123113117521101161171099511210412111549995395495395534895539952114121125
+```
+
+## 4. Final Decode
+
+Treating the 80-digit stream as concatenated, variable-length decimal ASCII chars requires simple length-based parsing logic:
+- Parse exactly 2 digits if the parsed value falls cleanly in the standard printable ASCII range `32..99`.
+- Otherwise, parse exactly 3 digits (for higher 3-digit ASCII characters like `104` ('h'), `121` ('y'), etc.).
+
+Processing the stream via this logical translation decrypts the string to:
+
+```text
+EH4X{qu4ntum_phys1c5_15_50_5c4ry}
+```
+
+## 5. Reproducible Solve Script
+
+This standalone Python script using `numpy` and `scipy` automates the entire analytical process directly from the raw WAV file:
+
+```python
+#!/usr/bin/env python3
+import numpy as np
+from scipy.io import wavfile
+from scipy.ndimage import uniform_filter1d
+from scipy.signal import periodogram
+
+sr, x = wavfile.read("challenge.wav")
+if x.ndim > 1:
+    x = x[:, 0]
+x = x.astype(float)
+
+# 1) Detect tone-present regions (separated by ~20ms silence)
+env = uniform_filter1d(np.abs(x), size=int(sr * 0.005))
+mask = env > 0.1
+
+runs = []
+cur = mask[0]
+start = 0
+for i, v in enumerate(mask[1:], 1):
+    if v != cur:
+        runs.append((cur, start, i))
+        cur = v
+        start = i
+runs.append((cur, start, len(mask)))
+
+# Keep only long "on" segments (the ~1 second symbols)
+segments = [(s, e) for on, s, e in runs if on and (e - s) > sr * 0.5]
+
+low_group = [300, 900, 1500, 2100]
+high_group = [2700, 3300, 3900]
+
+keypad = {
+    (0, 0): "1", (0, 1): "2", (0, 2): "3",
+    (1, 0): "4", (1, 1): "5", (1, 2): "6",
+    (2, 0): "7", (2, 1): "8", (2, 2): "9",
+    (3, 1): "0",
+}
+
+digits = []
+for s, e in segments:
+    sig = x[s:e]
+    f, p = periodogram(sig, fs=sr, scaling="spectrum")
+
+    # Determine strongest low-group bin
+    low_amp = []
+    for c in low_group:
+        m = (f > c - 20) & (f < c + 20)
+        low_amp.append(p[m].max() if m.any() else 0.0)
+    r = int(np.argmax(low_amp))
+
+    # Determine strongest high-group bin
+    high_amp = []
+    for c in high_group:
+        m = (f > c - 20) & (f < c + 20)
+        high_amp.append(p[m].max() if m.any() else 0.0)
+    c = int(np.argmax(high_amp))
+
+    digits.append(keypad[(r, c)])
+
+digit_stream = "".join(digits)
+print("[+] Digit stream:", digit_stream)
+
+# 2) Parse concatenated decimal ASCII
+i = 0
+out = []
+while i < len(digit_stream):
+    v2 = int(digit_stream[i:i+2]) if i + 2 <= len(digit_stream) else -1
+    if 32 <= v2 <= 99:
+        out.append(chr(v2))
+        i += 2
+    else:
+        out.append(chr(int(digit_stream[i:i+3])))
+        i += 3
+
+flag = "".join(out)
+print("[+] Flag:", flag)
+```
+
+**Console Execution Output:**
+
+```bash
+python3 solve.py
+[+] Digit stream: 69725288123113117521101161171099511210412111549995395495395534895539952114121125
+[+] Flag: EH4X{qu4ntum_phys1c5_15_50_5c4ry}
+```
+
+## Final Flag
+
+```text
+EH4X{qu4ntum_phys1c5_15_50_5c4ry}
+```

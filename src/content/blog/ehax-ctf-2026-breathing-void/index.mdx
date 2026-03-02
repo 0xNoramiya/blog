@@ -1,0 +1,153 @@
+---
+title: 'EHAX CTF 2026 - Breathing Void (Misc)'
+description: 'Writeup for Breathing Void from EHAX CTF 2026. A miscellanious forensics challenge involving isolating covert timing channels from huge pcap noise.'
+date: 2026-03-02
+tags: ['writeup', 'misc', 'forensics', 'pcap', 'covert-channel', 'ehax']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Miscellaneous  
+**Points:** 419  
+**Given artifact:** `Breathing_Void.tar.gz`
+
+**Objective:** Recover the real flag from a massive, 1.1 GB PCAP network capture file that intentionally contains both excessive background noise and a deliberate decoy payload.
+
+**TL;DR:** Information is hidden in an extremely subtle covert timing channel inside a tiny subset of Raw IPv4 packets within a massive multi-interface PCAP. By leveraging `tshark` and `awk`, we isolate these packets, eliminate the decoy packet, measure the inter-packet arrival gaps, and decode the timing deltas back into binary bytes to reveal the true flag.
+
+## 1. Initial Triage
+
+First, we extract the provided archive:
+
+```bash
+tar -xzf Breathing_Void.tar.gz
+ls -lah
+```
+
+To understand the scope of the file, we pull quick metadata using `capinfos`:
+
+```bash
+capinfos Breathing_Void.pcap
+```
+
+This yields a few critically important observations:
+- There are ~4.2 million packets in total.
+- The capture comment embedded in the file explicitly states it is merged from three different sources:
+  - `massive.pcap`
+  - `decoy_trap.pcap`
+  - `covert_timing_2.pcap`
+- The file uses `pcapng` formatting with three internal interfaces:
+  - **Interface `0`:** Ethernet, ~4,198,011 packets (The huge background noise).
+  - **Interface `1`:** Raw IPv4, exactly 1 packet (The decoy).
+  - **Interface `2`:** Raw IPv4, exactly 272 packets (The actual covert signal).
+
+This interface breakdown is the crucial first step: the hidden signal is overwhelmingly likely to be contained solely within the small Raw IPv4 subsets, not the generic Ethernet bulk.
+
+## 2. Isolating the Suspicious Streams
+
+We can verify our packet counts by pcapng interface ID:
+
+```bash
+tshark -r Breathing_Void.pcap -T fields -e frame.interface_id 2>/dev/null | sort | uniq -c
+```
+
+**Result:**
+- `1` packet on interface `1`
+- `272` packets on interface `2`
+
+Next, we inspect the behavior of only these Raw IPv4 packets:
+
+```bash
+tshark -r Breathing_Void.pcap \
+  -Y 'frame.interface_id == 1 || frame.interface_id == 2' \
+  -T fields -e frame.number -e frame.interface_id -e frame.time_epoch -e ip.src -e ip.dst -e ip.len
+```
+
+You will notice two things:
+1. The single packet on interface `1` arrives before all the packets on interface `2`, essentially acting as a setup or tripwire.
+2. The 272 packets on interface `2` display a very uniform TCP structure but possess highly controlled, unnatural timestamps.
+
+## 3. Analyzing the Decoy Packet
+
+Let's look at that single interface `1` packet. We can isolate and extract it to a new file using `editcap`:
+
+```bash
+editcap -r Breathing_Void.pcap pkt14031.pcapng 14031-14031
+tshark -r pkt14031.pcapng -V -x
+```
+
+Inside this packet is a cleartext payload containing an explicit "override" message alongside a fake flag-like string. This packet is an intentional decoy meant to create a rabbit hole. It explicitly tries to convince analysts to stop their forensics and submit the fake flag.
+
+**Conclusion:** We must completely ignore this payload and shift focus to the timing of the real stream.
+
+## 4. Recovering the Covert Timing Channel
+
+The true data is encoded horizontally via inter-packet timing (the gaps between packet arrivals) rather than vertically inside packet payloads.
+
+We can extract the raw timestamps of interface `2` using `tshark`:
+
+```bash
+tshark -r Breathing_Void.pcap -Y 'frame.interface_id == 2' -T fields -e frame.time_epoch 2>/dev/null
+```
+
+To see the timing channel, we compute the temporal gaps (`delta = t[i] - t[i-1]`) and analyze their frequencies:
+
+```bash
+tshark -r Breathing_Void.pcap -Y 'frame.interface_id == 2' -T fields -e frame.time_epoch 2>/dev/null \
+| awk 'NR>1{d=$1-p; printf "%.6f\n", d} {p=$1}' \
+| sort | uniq -c | sort -nr
+```
+
+**Observed deltas:**
+- `0.010000` (short gap)
+- `0.100000` (long gap)
+- Plus one initial anomalous gap (`10.01`) if we include the jump across the boundary between interface `1` and interface `2`.
+
+**Interpretation:**
+This is classic binary pulse-width encoding:
+- A short gap (`0.01` seconds) represents binary `0`.
+- A long gap (`0.1` seconds) represents binary `1`.
+- The initial `10.01` gap acts as an artificial synchronization marker and should be handled logically as the leading short bit.
+
+## 5. Decoding the Bits to Bytes
+
+Summing it up, there are exactly 273 timestamps when evaluating both interface 1 and 2 sequentially. This gives us 272 computable timing deltas, translating perfectly to 34 bytes of decoded binary data ($272 \div 8 = 34$).
+
+We can automate the extraction and binary conversion using a reproducible Python script:
+
+```python
+#!/usr/bin/env python3
+import subprocess
+
+# Extract timestamps for both the decoy and the actual stream
+cmd = "tshark -r Breathing_Void.pcap -Y 'frame.interface_id == 1 || frame.interface_id == 2' -T fields -e frame.time_epoch 2>/dev/null"
+out = subprocess.check_output(cmd, shell=True, text=True)
+
+times = [float(x) for x in out.split()]
+diffs = [round(times[i] - times[i - 1], 2) for i in range(1, len(times))]
+
+# Treat the massive sync gap (10.01) as the leading bit mapping to a short timing (0)
+norm = [0.01 if d == 10.01 else d for d in diffs]
+
+# Translate timing floats back to binary strings
+mapping = {0.01: "0", 0.1: "1"}
+bits = "".join(mapping[d] for d in norm)
+
+# Group bits into bytes and decode cleanly to ASCII
+data = bytes(int(bits[i:i+8], 2) for i in range(0, len(bits), 8))
+print(data.decode('ascii'))
+```
+
+**Execution Output:**
+
+```text
+EH4X{pc@p5_@re_of+en_mo5+1y_noi5e}
+```
+
+## 6. Final Flag
+
+```text
+EH4X{pc@p5_@re_of+en_mo5+1y_noi5e}
+```

@@ -1,0 +1,189 @@
+---
+title: 'EHAX CTF 2026 - #808080'
+description: 'Writeup for #808080 from EHAX CTF 2026. A miscellanious challenge requiring generation of a 5-bit Gray Code sequence to decode a custom Caesar cipher.'
+date: 2026-03-02
+tags: ['writeup', 'misc', 'crypto', 'ehax', 'gray-code']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Miscellaneous
+**Points:** 492
+**Target:** `http://chall.ehax.in:8076/`
+
+**Prompt artifacts:**
+- A long binary string within the description.
+- Hint text: `gray code ? nah grey code`
+- Flag format: `CTF{...}`
+
+**TL;DR:** The challenge involves interacting with a remote "binary wheel decoder" web page. By reversing the API validation rules, we discover it requires a 32-element sequence of 5-bit strings forming a valid valid **Gray Code path**. Submitting this sequence paired with the binary blob decodes the text into a secondary cipher, which is further decrypted using a custom 32-character alphabet Caesar shift (`-4`) to produce the flag.
+
+## 1. Initial Observations
+
+The prompt strongly hints at **Gray code** (`gray/grey code`), and the remote page visually represents an interactive "binary wheel decoder".
+
+Opening the web page source code reveals:
+- A wheel UI configured with:
+  - `SLICES = 32`
+  - `RINGS = 5`
+- The client sends the user's arranged wheel data to the backend via:
+  - `POST /api/validate-wheel`
+  - `POST /api/decode`
+- The wheel is sent to the backend as an array of **32 elements**, with each element being a **5-bit string**.
+
+This structure implies the challenge expects us to construct a valid sequence of 32 unique 5-bit codes where adjacent entries satisfy a formal Gray-code property.
+
+## 2. Reversing the Validation Rules
+
+Instead of manually clicking wheel slices in the UI to brute-force combinations, we can programmatically query the backend validation endpoint to read the exact error messages thrown:
+
+```python
+import requests
+url='http://chall.ehax.in:8076/api/validate-wheel'
+
+tests = [
+    ['00000']*32,                         # duplicates
+    ['00000']*31,                         # wrong length
+    ['0000a'] + ['00001']*31,             # invalid chars
+    [format(i,'05b') for i in range(32)]  # plain binary order
+]
+
+for i,t in enumerate(tests,1):
+    r=requests.post(url,json={'wheelData':t},timeout=10)
+    print(i, r.status_code, r.text)
+```
+
+The server's error responses neatly expose the underlying rules:
+- The array must have exactly 32 elements.
+- Every element must be a 5-bit string composed exclusively of `0` and `1`.
+- All elements must be globally unique.
+- Adjacent elements (including the wrap-around between index 31 and 0) must differ by **exactly 1 bit**.
+
+This strictly defines the requirement as a complete **5-bit Gray code cycle**.
+
+## 3. Building a Valid Wheel
+
+We can easily generate a standard reflected Gray code sequence using the standard bitwise formula:
+
+$$G(i) = i \oplus (i \gg 1), \quad i=0..31$$
+
+Implemented in Python:
+
+```python
+wheel = [format(i ^ (i >> 1), '05b') for i in range(32)]
+```
+
+If we send this array to the `/api/validate-wheel` endpoint:
+
+```python
+import requests
+url='http://chall.ehax.in:8076/api/validate-wheel'
+wheel=[format(i^(i>>1),'05b') for i in range(32)]
+r=requests.post(url,json={'wheelData':wheel},timeout=10)
+print(r.status_code, r.text)
+```
+
+The server responds beautifully:
+- `200 {"valid":true}`
+
+## 4. Decoding the Provided Binary Blob
+
+Now we take the long binary input provided directly in the challenge description:
+
+```text
+0010111100011010000101111111110110010010000100010111011001000110010000011111101101100111010000010101011001111110010000000111010001111110010000011
+```
+
+We POST this to `/api/decode` paired with our validated Gray code wheel sequence:
+
+```python
+import requests
+bits='0010111100011010000101111111110110010010000100010111011001000110010000011111101101100111010000010101011001111110010000000111010001111110010000011'
+wheel=[format(i^(i>>1),'05b') for i in range(32)]
+r=requests.post('http://chall.ehax.in:8076/api/decode',
+                json={'binaryInput':bits,'wheelData':wheel},
+                timeout=15)
+print(r.status_code, r.text)
+```
+
+The backend successfully executes the first layer of decryption and yields an obfuscated string:
+
+```text
+GXJBKVI_DGSHI&KSIWAZIV_AL}VHC
+```
+
+## 5. Identifying the Secondary Cipher
+
+The string isn't readable yet. However, by probing how the backend decodes all 32 possible Gray code symbols consecutively, we can dump the backend's custom substitution alphabet:
+
+```text
+ABCDEFGHIJKLMNOPQRSTUVWXYZ@#_{}&
+```
+
+Applying a Caesar cipher shift of **-4** across this specific 32-character alphabet transforms:
+
+```text
+GXJBKVI_DGSHI&KSIWAZIV_AL}VHC
+```
+
+Perfectly into the flag format:
+
+```text
+CTF{GREY&CODE#GOES_VERY_H@RD}
+```
+
+## 6. Full Solver Script (Automated)
+
+Here is a standalone script that orchestrates the entire exploit chain in a single execution:
+
+```python
+#!/usr/bin/env python3
+import requests
+
+BASE = "http://chall.ehax.in:8076"
+BITS = "0010111100011010000101111111110110010010000100010111011001000110010000011111101101100111010000010101011001111110010000000111010001111110010000011"
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ@#_{}&"
+
+def gray_wheel():
+    return [format(i ^ (i >> 1), "05b") for i in range(32)]
+
+def decode_backend(bits, wheel):
+    r = requests.post(f"{BASE}/api/decode", json={"binaryInput": bits, "wheelData": wheel}, timeout=15)
+    r.raise_for_status()
+    return r.json()["decoded"]
+
+def caesar_custom(s, shift, alpha):
+    n = len(alpha)
+    out = []
+    for ch in s:
+        if ch in alpha:
+            out.append(alpha[(alpha.index(ch) + shift) % n])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+if __name__ == "__main__":
+    wheel = gray_wheel()
+    v = requests.post(f"{BASE}/api/validate-wheel", json={"wheelData": wheel}, timeout=10).json()
+    assert v.get("valid") is True, v
+
+    stage1 = decode_backend(BITS, wheel)
+    flag = caesar_custom(stage1, -4, ALPHABET)
+    print("stage1:", stage1)
+    print("flag:  ", flag)
+```
+
+**Execution Output:**
+
+```text
+stage1: GXJBKVI_DGSHI&KSIWAZIV_AL}VHC
+flag:   CTF{GREY&CODE#GOES_VERY_H@RD}
+```
+
+## Final Flag
+
+```text
+CTF{GREY&CODE#GOES_VERY_H@RD}
+```
