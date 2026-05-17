@@ -1,0 +1,91 @@
+---
+title: 'NDIAS 2026 - Classic KeeLoq Garage: Find the Key'
+description: 'Writeup for Classic KeeLoq Garage Find the Key from NDIAS Automotive/IoT CTF 2026. Recovering a 64-bit KeeLoq DeviceKey from RF captures using the legacy SEED || (SEED XOR SERIAL) derivation.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'keeloq', 'manchester', 'key-recovery', 'crypto', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c5c6.bin`, `memo_c5c6.txt`
+**Flag format:** `flag{KEY64}`
+
+Recover the 64-bit DeviceKey of a "Classic" KeeLoq garage remote.
+
+## 1. Memo
+
+The installer memo gives the legacy key derivation explicitly:
+
+```text
+Model: KG-370
+Button map: 0x01 = OPEN
+Fixed part: SERIAL(32) || BTN(8)
+Legacy derive: K = SEED || (SEED XOR SERIAL)
+Seed: 6D3A91C4
+Disc bits: lower 10 bits
+Learn window: 16
+```
+
+So the manufacturer key derivation is:
+
+```text
+DeviceKey = (SEED << 32) | (SEED XOR SERIAL)
+```
+
+with `SEED = 0x6D3A91C4`. `SERIAL` is the 32-bit fixed code in every wire frame, which we still need to demodulate.
+
+## 2. Demodulation
+
+Same OOK / Manchester pipeline as the earlier Falcon X1 fob challenges: 500 µs chip period, sync byte `0xD5`, G.E. Thomas convention.
+
+Each Classic KeeLoq frame is **80 bits / 10 bytes** on the wire:
+
+```text
+SYNC(8) | HOP(32, MSB-first) | SERIAL(32, MSB-first) | BTN(8)
+```
+
+## 3. Decoded Frames
+
+| Press | Frame (hex)                              |
+|-------|------------------------------------------|
+| 1     | `D5 91 3B 00 D7 01 D4 A2 B7 01`         |
+| 2     | `D5 00 20 D1 FB 01 D4 A2 B7 01`         |
+| 3     | `D5 80 ED 14 5B 01 D4 A2 B7 01`         |
+| 4     | `D5 31 4C 03 E4 01 D4 A2 B7 01`         |
+
+So:
+
+- `SERIAL = 0x01D4A2B7`
+- `BTN = 0x01` — matches the memo's `0x01 = OPEN`
+
+## 4. Key Recovery
+
+```text
+SERIAL       = 0x01D4A2B7
+SEED         = 0x6D3A91C4
+SEED ^ SER   = 0x6CEE3373
+DeviceKey    = SEED || (SEED ^ SERIAL)
+             = 0x6D3A91C4 6CEE3373
+```
+
+## 5. Verification
+
+Decrypting each captured hop with this key using standard KeeLoq (NLF table `0x3A5C742E`, 528 rounds) gives clean `(DISC || COUNTER)` plaintexts:
+
+| Press | Hop        | Decrypted plain   |
+|-------|------------|-------------------|
+| 1     | `913B00D7` | `ADC4 0040`       |
+| 2     | `0020D1FB` | `ADC4 0041`       |
+| 3     | `80ED145B` | `ADC4 0042`       |
+| 4     | `314C03E4` | `ADC4 0043`       |
+
+The high 16 bits stay constant at `0xADC4` (the DISC) and the low 16 bits are a monotone counter — exactly the sanity check we want.
+
+## Flag
+
+```text
+flag{6D3A91C46CEE3373}
+```

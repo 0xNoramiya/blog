@@ -1,0 +1,67 @@
+---
+title: 'NDIAS 2026 - Real KeeLoq Garage: Next HOP'
+description: 'Writeup for Real KeeLoq Garage Next HOP from NDIAS Automotive/IoT CTF 2026. Predicting the next valid HCS301 logical OPEN frame using the recovered DeviceKey.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'keeloq', 'hcs301', 'replay', 'prediction', 'crypto', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c7c8.bin`, `memo_c7c8.txt`
+**Flag format:** `flag{FRAMEHEX}`
+
+Reuse the DeviceKey from [Normal Learn](/blog/ndias-2026-real-keeloq-garage-normal-learn) to predict the next valid **logical** OPEN frame.
+
+## 1. Inputs
+
+- `DeviceKey = 0xBF61DA58FE545128`
+- `SERIAL    = 0x107A4C3D`
+- Last observed hop (press 4) = `0x13472C1C`
+- Last decrypted plaintext = `0x103D 0043` → counter = `0x0043`, DISC = `0x103D`
+
+## 2. Wire vs Logical Frame
+
+The wire frame is 90 bits at a 250 µs Manchester chip period:
+
+```text
+bits[ 0..15]  preamble 1010_1010_1010_1010 (= AA AA)
+bits[16..23]  sync     0xD5
+bits[24..55]  HOP (32 bits, MSB-first)
+bits[56..57]  status   "00" (VLOW=0, RPT=0)
+bits[58..89]  SERIAL   0x107A4C3D (32 bits, MSB-first)
+```
+
+The challenge asks for the **logical** frame, not the raw wire bits — so the 2 inter-field status bits are *not* part of the answer. The logical frame is just the meaningful fields concatenated:
+
+```text
+preamble | sync | HOP | SERIAL
+=
+AA AA | D5 | hh hh hh hh | 10 7A 4C 3D
+```
+
+That's 11 bytes total.
+
+## 3. Prediction
+
+Increment the counter, keep DISC and BTN the same:
+
+```text
+plaintext_next = 0x103D 0044
+hop_next       = KeeLoq_encrypt(0x103D0044, 0xBF61DA58FE545128)
+               = 0x2675F6FA
+```
+
+So the predicted logical frame is:
+
+```text
+AA AA D5 | 26 75 F6 FA | 10 7A 4C 3D
+```
+
+## Flag
+
+```text
+flag{AAAAD52675F6FA107A4C3D}
+```

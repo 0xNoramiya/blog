@@ -1,0 +1,107 @@
+---
+title: 'NDIAS 2026 - Gate to the Past'
+description: 'Writeup for Gate to the Past from NDIAS Automotive/IoT CTF 2026. Decrypting an old OpenSSH 4.3 session by exploiting CVE-2008-0166, the Debian OpenSSL weak PRNG, to recover the DH private exponent.'
+date: 2026-05-16
+tags: ['writeup', 'network', 'crypto', 'ssh', 'cve-2008-0166', 'diffie-hellman', 'weak-prng', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Network
+**Files:** `dist-gate_to_the_past.zip` (an SSHv2 packet capture)
+
+The capture is an SSHv2 session from `OpenSSH_4.3p2 Debian-9etch3`. That Debian/OpenSSL era is the giveaway: it's affected by **CVE-2008-0166**, where OpenSSL's PRNG had only process-ID-scale entropy. OpenSSH uses that PRNG for Diffie-Hellman private exponents, so the client/server DH secret can be recovered by enumerating the weak PRNG outputs.
+
+## 1. Negotiated Algorithms
+
+From the plaintext handshake:
+
+- KEX: `diffie-hellman-group-exchange-sha1`
+- Cipher: `aes128-cbc`
+- MAC: `hmac-md5`
+- Compression: `none`
+
+The handshake also exposes:
+
+- Client DH public value `e`
+- Server DH public value `f`
+- 1024-bit safe prime `p`, generator `g = 2`
+- Client request: `min = 1024`, `n = 1024`, `max = 8192`
+
+## 2. Recovering the Client DH Private Exponent
+
+I reproduced the vulnerable Debian OpenSSL PRNG and brute-forced two parameters:
+
+- the process ID used to seed the PRNG, and
+- a small amount of "prior" random-byte consumption (bytes pulled from the PRNG before the DH exponent draw).
+
+The unique matching candidate for the client public key was:
+
+```text
+pid = 13
+prior RAND_bytes consumption = 11 bytes
+x = 0xbd886dabb7951ae7495f31444753098d07db09b9357d8df2795f88012158a351
+```
+
+This satisfies:
+
+```python
+pow(2, x, p) == e
+```
+
+Once `x` is known, the SSH shared secret falls out:
+
+```python
+K = pow(f, x, p)
+```
+
+## 3. Computing the Exchange Hash
+
+One detail mattered enough to call out: the SSH exchange hash uses the `SSH_MSG_KEXINIT` payloads **without** their packet padding. Including the padding bytes yields the wrong exchange hash and the wrong derived keys.
+
+With the right payload boundaries, the exchange hash is:
+
+```text
+H = 3800bc5ef9859a61c28bfcc4fdd43b5bc9bcfdca
+```
+
+This also verifies against the server's RSA signature — the decrypted signature contains `SHA1(H)`:
+
+```text
+825b5504f079b2466ad9f9772aa9dec3161d5da2
+```
+
+## 4. Key Derivation and Decryption
+
+Using RFC 4253 key derivation with `session_id = H`:
+
+```python
+IV_c2s  = SHA1(K || H || "A" || session_id)
+IV_s2c  = SHA1(K || H || "B" || session_id)
+key_c2s = SHA1(K || H || "C" || session_id)
+key_s2c = SHA1(K || H || "D" || session_id)
+mac_c2s = SHA1(K || H || "E" || session_id)
+mac_s2c = SHA1(K || H || "F" || session_id)
+```
+
+Decrypting both directions with AES-128-CBC and verifying every packet with HMAC-MD5 gives clean plaintext.
+
+The recovered client command was:
+
+```text
+echo "flag: FLAG{n3v3r_f0rg3t_13g4cy_bug5}"
+```
+
+The server replied:
+
+```text
+flag: FLAG{n3v3r_f0rg3t_13g4cy_bug5}
+```
+
+## Flag
+
+```text
+FLAG{n3v3r_f0rg3t_13g4cy_bug5}
+```

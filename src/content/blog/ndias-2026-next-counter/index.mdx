@@ -1,0 +1,61 @@
+---
+title: 'NDIAS 2026 - Next Counter'
+description: 'Writeup for Next Counter from NDIAS Automotive/IoT CTF 2026. Manchester-decoding Falcon X1 Unlock frames, recovering the monotone counter, and predicting the next valid frame.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'sdr', 'ook', 'manchester', 'replay', 'prediction', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c3.bin`
+**Flag format:** `flag{FRAMEHEX}`
+
+Predict the next Falcon X1 Unlock frame after observing several repeated presses in the capture.
+
+## 1. Wire Format
+
+Same demodulation pipeline as Read the simple fob — OOK at a 500 µs Manchester chip period, sync byte `0xD5`, G.E. Thomas Manchester convention.
+
+Each burst is **80 bits / 10 bytes** on the wire:
+
+```text
+AA AA | D5 | <device_id 3> | <mode 2> | <counter 1> | 5A
+```
+
+The two `AA AA` bytes are the alternating Manchester preamble. The example flag in the prompt (`flag{1111FFAABBCC10EEEEFF}`) is also 10 bytes wide, so the **preamble must be included** in the answer — it's the easy thing to miss.
+
+## 2. Decoded Frames
+
+Each press repeats three identical frames; one shown per press:
+
+| Press | Frame                                |
+|-------|--------------------------------------|
+| 1     | `AA AA D5 9C 4E 2B 20 01 37 5A`     |
+| 2     | `AA AA D5 9C 4E 2B 20 01 38 5A`     |
+| 3     | `AA AA D5 9C 4E 2B 20 01 39 5A`     |
+| 4     | `AA AA D5 9C 4E 2B 20 01 3A 5A`     |
+| 5     | `AA AA D5 9C 4E 2B 20 01 3B 5A`     |
+
+After the preamble and sync:
+
+- `9C 4E 2B` — Device ID
+- `20 01` — mode / button bytes (constant)
+- `XX` — counter byte, increments by one per press
+- `5A` — footer
+
+## 3. Prediction
+
+The counter is the only thing changing: `0x37, 0x38, 0x39, 0x3A, 0x3B`. Next is `0x3B + 1 = 0x3C`:
+
+```text
+AA AA D5 9C 4E 2B 20 01 3C 5A
+```
+
+## Flag
+
+```text
+flag{AAAAD59C4E2B20013C5A}
+```

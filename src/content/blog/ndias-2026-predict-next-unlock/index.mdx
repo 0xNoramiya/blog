@@ -1,0 +1,72 @@
+---
+title: 'NDIAS 2026 - Predict Next UNLOCK'
+description: 'Writeup for Predict Next UNLOCK from NDIAS Automotive/IoT CTF 2026. Recovering the per-press 16-bit auxiliary delta to predict the next extended Falcon X1 Unlock frame.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'sdr', 'ook', 'manchester', 'replay', 'prediction', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c4.bin`
+**Flag format:** `flag{FRAMEHEX}`
+
+Predict the next valid Unlock frame when both the counter and a 16-bit auxiliary value change.
+
+## 1. Wire Format
+
+Same demodulation pipeline as the simpler fob challenges — OOK at a 500 µs Manchester chip period, sync byte `0xD5`, G.E. Thomas convention.
+
+The full wire pattern is **96 bits / 12 bytes**, starting with the alternating preamble `AA AA`. The preamble must be included in the flag.
+
+## 2. Decoded Frames
+
+| Press | Frame                                          |
+|-------|------------------------------------------------|
+| 1     | `AA AA D5 B8 4F 62 20 02 04 C1 8B 5A`         |
+| 2     | `AA AA D5 B8 4F 62 20 02 05 D4 C2 5A`         |
+| 3     | `AA AA D5 B8 4F 62 20 02 06 E7 F9 5A`         |
+| 4     | `AA AA D5 B8 4F 62 20 02 07 FB 30 5A`         |
+
+Structure after preamble + sync:
+
+- `B8 4F 62` — Device ID
+- `20 02` — mode/button byte; the `02` here (vs `01` for the simple fob) marks this as "extended" Unlock with an extra 16-bit MAC / keystream value
+- `XX` — counter byte (`04, 05, 06, 07`)
+- `YY YY` — 16-bit value that changes per press
+- `5A` — footer
+
+## 3. Finding the Auxiliary Delta
+
+The 16-bit auxiliary values, big-endian:
+
+```text
+0xC18B -> 0xD4C2 -> 0xE7F9 -> 0xFB30
+```
+
+The deltas between consecutive values are constant:
+
+```text
+0xD4C2 - 0xC18B = 0x1337
+0xE7F9 - 0xD4C2 = 0x1337
+0xFB30 - 0xE7F9 = 0x1337
+```
+
+So each press adds **0x1337** to the auxiliary value modulo `0x10000`.
+
+## 4. Prediction
+
+- Next counter: `0x07 + 1 = 0x08`
+- Next aux value: `0xFB30 + 0x1337 = 0x10E67`, truncated to 16 bits → `0x0E67`
+
+```text
+AA AA D5 B8 4F 62 20 02 08 0E 67 5A
+```
+
+## Flag
+
+```text
+flag{AAAAD5B84F622002080E675A}
+```

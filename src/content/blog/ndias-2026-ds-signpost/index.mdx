@@ -1,0 +1,137 @@
+---
+title: "NDIAS 2026 - D's Signpost"
+description: "Writeup for D's Signpost from NDIAS Automotive/IoT CTF 2026. Five overlapping transmissions at 915 MHz hide Morse hints, an FM voice hint, an AX.25/APRS password, and a DQPSK-encoded password-protected ZIP."
+date: 2026-05-17
+tags: ['writeup', 'rf', 'sdr', 'sigmf', 'morse', 'ax25', 'aprs', 'dqpsk', 'signal-processing', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** RF
+**Files:** `dist-ds_signpost.7z` (a SigMF capture)
+
+SigMF metadata:
+
+- `core:datatype`: `cf32_le`
+- `core:sample_rate`: `500000`
+- `core:frequency`: `915000000`
+
+The waterfall shows five clean transmissions at roughly:
+
+- `-180 kHz`
+- `-70 kHz`
+- `+45 kHz`
+- `+115 kHz`
+- `+170 kHz`
+
+Each one has to be demodulated on its own. The last one carries the flag, but it's password-protected.
+
+## 1. `-180 kHz` — OOK Morse Code
+
+After mixing the `-180 kHz` signal to baseband, taking the magnitude, and thresholding the envelope, the pulse timings are Morse code:
+
+- Dot length: ~70 ms
+- Dash length: ~220 ms
+- Word gap: ~530 ms
+
+Decoded text:
+
+```text
+THIS FILE HAS 5 WAVES
+```
+
+So all five visible transmissions are in play.
+
+## 2. `-70 kHz` — AM Voice Hint
+
+The `-70 kHz` signal is AM-like. Envelope demodulation gives a repeated voice clip:
+
+```text
+DQPSK stores data in phase changes. Decode each symbol by comparing it with the previous.
+```
+
+That's the hint for the final `+170 kHz` phase-encoded signal.
+
+## 3. `+45 kHz` — FM Voice Hint
+
+FM-demodulating the `+45 kHz` transmission gives another repeated voice clip:
+
+```text
+Do you know APRS? APRS has a super secret password.
+```
+
+This points at the packet-like bursts at `+115 kHz`.
+
+## 4. `+115 kHz` — AX.25 / APRS Password
+
+FM-demodulating the `+115 kHz` bursts gives Bell 202 AFSK. Decoding as 1200 baud AX.25 / APRS:
+
+- mark / space tones: `1200 Hz` / `2200 Hz`
+- NRZI decode
+- HDLC flag search and bit unstuffing
+- AX.25 address and payload parse
+
+The valid APRS frame was:
+
+```text
+N0CALL-1>APCTF:>The password is dWt4Wxm6Xfn1ot02
+```
+
+So the password is:
+
+```text
+dWt4Wxm6Xfn1ot02
+```
+
+## 5. `+170 kHz` — DQPSK ZIP Payload
+
+The `+170 kHz` signal is a four-state phase signal. After downconverting, the active burst has:
+
+- symbol length: `200` samples
+- symbol rate: `500000 / 200 = 2500` baud
+- phases quantised to four quadrants
+
+The hint from step 2 is exactly the trick: don't use the absolute phases, **diff** them.
+
+```python
+q = quantized_phase_symbols
+d = (q[1:] - q[:-1]) % 4
+```
+
+With the natural two-bit mapping:
+
+```text
+0 -> 00
+1 -> 01
+2 -> 10
+3 -> 11
+```
+
+and prepending the first phase difference against a zero-phase reference, the recovered bytes start with:
+
+```text
+50 4b 03 04
+```
+
+That's a ZIP file header. The reconstructed ZIP contains `flag.txt`, but it is password-protected. Plugging in the APRS password:
+
+```python
+import zipfile
+
+with zipfile.ZipFile("sig5_payload.zip") as z:
+    print(z.read("flag.txt", pwd=b"dWt4Wxm6Xfn1ot02"))
+```
+
+Output:
+
+```text
+FLAG{R4D10_FR3Q_L1TTL3_M4Z3}
+```
+
+## Flag
+
+```text
+FLAG{R4D10_FR3Q_L1TTL3_M4Z3}
+```

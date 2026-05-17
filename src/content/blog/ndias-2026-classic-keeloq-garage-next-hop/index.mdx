@@ -1,0 +1,50 @@
+---
+title: 'NDIAS 2026 - Classic KeeLoq Garage: Next HOP'
+description: 'Writeup for Classic KeeLoq Garage Next HOP from NDIAS Automotive/IoT CTF 2026. Using the recovered DeviceKey to predict the next valid Classic KeeLoq OPEN frame.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'keeloq', 'replay', 'prediction', 'crypto', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c5c6.bin`, `memo_c5c6.txt`
+**Flag format:** `flag{FRAMEHEX}`
+
+Reuse the DeviceKey from [Find the Key](/blog/ndias-2026-classic-keeloq-garage-find-the-key) to predict the next valid OPEN frame.
+
+## 1. Inputs
+
+- `DeviceKey = 0x6D3A91C46CEE3373`
+- Last observed hop (press 4) = `0x314C03E4`
+- Last decrypted plaintext = `0xADC40043` → counter = `0x0043`, DISC = `0xADC4`
+
+## 2. Prediction
+
+Increment the counter by one and keep DISC and BTN unchanged:
+
+```text
+plaintext_next = 0xADC40044
+hop_next       = KeeLoq_encrypt(0xADC40044, 0x6D3A91C46CEE3373)
+               = 0x65317ADF
+```
+
+Each captured burst was **96 bits / 12 bytes** with the alternating preamble `AA AA` up front. The full wire layout is:
+
+```text
+AA AA | D5 | <hop 4> | <serial 4> | <btn 1>
+```
+
+For the predicted press:
+
+```text
+AA AA D5 | 65 31 7A DF | 01 D4 A2 B7 | 01
+```
+
+## Flag
+
+```text
+flag{AAAAD565317ADF01D4A2B701}
+```

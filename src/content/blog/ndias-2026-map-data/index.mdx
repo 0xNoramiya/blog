@@ -1,0 +1,160 @@
+---
+title: 'NDIAS 2026 - Map data'
+description: 'Writeup for Map data from NDIAS Automotive/IoT CTF 2026. Streaming a million-tile 7z archive through a fixed-size PNG splitter and using a label-pixel anomaly check to find the one tile whose label starts with FLAG.'
+date: 2026-05-16
+tags: ['writeup', 'misc', 'forensics', 'png', 'streaming', 'python', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Misc
+**Files:** `dist-map_data.7z`
+
+The archive holds 1,000,000 256×256 PNG map tiles. Every normal tile has a black label strip at the bottom that starts with `MAP00000...`. The real flag is the only tile whose label starts with `FLAG`. Find the tile and read the label.
+
+## 1. Constraints
+
+Naively extracting everything is painful:
+
+```text
+dist-map_data.7z
+1,000,000 PNG files
+12,051 bytes per PNG  -> ~12 GB extracted
+```
+
+So extraction has to be streaming. One detail makes this tractable: every PNG is **exactly 12,051 bytes**. Decompressing 7z to stdout gives a contiguous stream that splits cleanly into 12,051-byte PNGs in archive order.
+
+## 2. Approach
+
+1. Extract a small sample (the first ~1000 tiles) by index to learn what a normal label looks like.
+2. Stream the rest of the archive to stdout with a standalone `7zz` binary, in `maps/` order.
+3. For each 12,051-byte chunk, parse the PNG `IDAT`, decompress to raw pixels, and look at the label region.
+4. Compare the label pixels to the set of normal labels. The flag tile is whichever one doesn't fit any normal pattern.
+
+Two cheap comparisons are enough:
+
+- **Exact raw match** of the label pixel bytes against a known-good set. Most tiles hit this and bail out immediately.
+- **Visual mask** (text vs background) compared via Hamming distance to the most-common normal masks. Used only when the raw match misses, so the check is fast.
+
+The flag tile's label uses different glyphs (`FLAG{...}` vs `MAP00000...`), so its mask distance to every normal mask is large.
+
+## 3. Result
+
+The anomaly hits exactly one tile:
+
+```text
+maps/85/37/76.png
+```
+
+Opening that tile shows:
+
+```text
+FLAG{m1ll10n_f1l35_0n3_s1gn4l_XD}
+```
+
+## 4. Scanner
+
+```python
+import io
+import struct
+import subprocess
+import zlib
+from collections import Counter
+from pathlib import Path
+
+from PIL import Image
+
+ARCHIVE = "files/dist-map_data.7z"
+SEVEN = "/tmp/7zz/7zz"
+PNG_SIZE = 12051
+WIDTH = 256
+STRIDE = 1 + WIDTH * 4
+Y0, Y1 = 236, 252
+XPIX = 45
+
+
+def parse_png(data: bytes) -> bytes:
+    pos = 8
+    idats = []
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        typ = data[pos + 4 : pos + 8]
+        chunk = data[pos + 8 : pos + 8 + length]
+        if typ == b"IDAT":
+            idats.append(chunk)
+        pos += 12 + length
+    return b"".join(idats)
+
+
+def raw_prefix(data: bytes) -> bytes:
+    raw = zlib.decompress(parse_png(data))
+    return b"".join(
+        raw[y * STRIDE + 1 : y * STRIDE + 1 + XPIX * 4]
+        for y in range(Y0, Y1)
+    )
+
+
+def visual_mask(data: bytes) -> bytes:
+    im = Image.open(io.BytesIO(data)).convert("RGBA").crop((0, Y0, XPIX, Y1))
+    return bytes(1 if px[0] > 100 and px[3] > 180 else 0 for px in im.getdata())
+
+
+def hdist(a: bytes, b: bytes) -> int:
+    return sum(x != y for x, y in zip(a, b))
+
+
+# Learn normal label prefixes from previously extracted sample tiles.
+normal = Counter()
+raw_known = set()
+for sample in Path("work/first1000").rglob("*.png"):
+    data = sample.read_bytes()
+    normal[visual_mask(data)] += 1
+    raw_known.add(raw_prefix(data))
+normal_masks = [mask for mask, _ in normal.most_common()]
+
+names = (
+    f"maps/{i:02d}/{j:02d}/{k:02d}.png"
+    for i in range(100)
+    for j in range(100)
+    for k in range(100)
+)
+
+proc = subprocess.Popen(
+    [SEVEN, "x", "-so", "-bsp0", ARCHIVE, "maps"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+)
+
+while True:
+    data = proc.stdout.read(PNG_SIZE)
+    if not data:
+        break
+
+    name = next(names)
+    if len(data) != PNG_SIZE:
+        raise RuntimeError(f"short PNG chunk at {name}")
+
+    prefix = raw_prefix(data)
+    if prefix in raw_known:
+        continue
+
+    mask = visual_mask(data)
+    dist = min(hdist(mask, normal_mask) for normal_mask in normal_masks)
+    if dist > 50:
+        Path(name.replace("/", "__")).write_bytes(data)
+        print("candidate:", name, "distance:", dist)
+        break
+
+    raw_known.add(prefix)
+
+proc.stdout.close()
+proc.wait()
+```
+
+## Flag
+
+```text
+FLAG{m1ll10n_f1l35_0n3_s1gn4l_XD}
+```

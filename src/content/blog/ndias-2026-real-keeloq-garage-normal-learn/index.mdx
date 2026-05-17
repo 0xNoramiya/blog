@@ -1,0 +1,101 @@
+---
+title: 'NDIAS 2026 - Real KeeLoq Garage: Normal Learn'
+description: 'Writeup for Real KeeLoq Garage Normal Learn from NDIAS Automotive/IoT CTF 2026. Recovering an HCS301 DeviceKey from a 250 µs Manchester capture using the HCS301 Normal Learn derivation.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'keeloq', 'hcs301', 'manchester', 'key-recovery', 'crypto', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c7c8.bin`, `memo_c7c8.txt`
+**Flag format:** `flag{KEY64}`
+
+Recover the 64-bit DeviceKey of an HCS301-compatible KeeLoq garage remote.
+
+## 1. Memo
+
+```text
+Model: KG-401
+Encoder family: HCS301-compatible
+Remote label: ??7A4C3D
+Button wiring: S0 = OPEN
+Learn mode: Normal
+Algorithm: KeeLoq
+Mfr Code: 89ABCDEF01234567
+Disc check: lower bits
+Window: 16 / 32K
+```
+
+We need the full 32-bit SERIAL (lower 24 bits = `0x7A4C3D` are known, the high byte is unknown), then HCS301 **Normal Learn** gives us the DeviceKey:
+
+```text
+K_low  = KeeLoq_decrypt(0x20000000 | (SERIAL & 0x0FFFFFFF), MFR_KEY)
+K_high = KeeLoq_decrypt(0x60000000 | (SERIAL & 0x0FFFFFFF), MFR_KEY)
+DeviceKey = (K_high << 32) | K_low
+```
+
+with `MFR_KEY = 0x89ABCDEF01234567`.
+
+## 2. Demodulation
+
+The IQ capture is complex float32 LE at 2,000,000 sps. Envelope detection on the magnitude finds 12 bursts (5 presses × ~3 repeats, with one mis-detected pair), each ~46 ms long.
+
+Within each burst the on/off pulse widths are multiples of **250 µs** — half the chip period of the Classic KeeLoq challenge — so this encoding is **Manchester at a 250 µs chip period**. With the G.E. Thomas convention (`10` → `1`, `01` → `0`), each burst decodes to 90 valid bits with the following layout:
+
+```text
+bits[ 0..15]  preamble 1010_1010_1010_1010
+bits[16..23]  sync byte 0xD5
+bits[24..55]  HOP (32 bits, MSB-first)
+bits[56..57]  status (2 bits: VLOW=0, RPT=0)
+bits[58..89]  SERIAL (32 bits, MSB-first)
+```
+
+## 3. Decoded Frames
+
+Four distinct presses (each repeated 3×):
+
+| Press | HOP        | SERIAL      |
+|-------|------------|-------------|
+| 1     | `8955C1B4` | `107A4C3D`  |
+| 2     | `867E2B59` | `107A4C3D`  |
+| 3     | `39EB128D` | `107A4C3D`  |
+| 4     | `13472C1C` | `107A4C3D`  |
+
+The lower 24 bits of SERIAL match the memo's `??7A4C3D` exactly, and the unknown high byte falls out as **`0x10`** → `SERIAL = 0x107A4C3D`.
+
+## 4. Key Recovery
+
+Standard HCS301 Normal Learn with `MFR_KEY = 0x89ABCDEF01234567`:
+
+```text
+SERIAL & 0x0FFFFFFF = 0x007A4C3D
+low_data            = 0x207A4C3D
+high_data           = 0x607A4C3D
+K_low  = KeeLoq_decrypt(0x207A4C3D, MFR_KEY) = 0xFE545128
+K_high = KeeLoq_decrypt(0x607A4C3D, MFR_KEY) = 0xBF61DA58
+DeviceKey = 0xBF61DA58_FE545128
+```
+
+## 5. Verification
+
+Decrypting each captured hop with this key (standard KeeLoq, NLF `0x3A5C742E`, 528 rounds) gives a clean `(BTN || DISC || COUNTER)` plaintext:
+
+| Press | Hop        | Decrypted plain  |
+|-------|------------|------------------|
+| 1     | `8955C1B4` | `103D 0040`      |
+| 2     | `867E2B59` | `103D 0041`      |
+| 3     | `39EB128D` | `103D 0042`      |
+| 4     | `13472C1C` | `103D 0043`      |
+
+- High nibble `0x1` = button code (S0 = OPEN, matches memo)
+- 12-bit DISC `0x03D` = lower 12 bits of SERIAL (`0x107A4C3D & 0xFFF = 0x3D`) — matches "Disc check: lower bits"
+- Low 16 bits are a monotone counter `0x40 … 0x43` — clean sanity check
+
+## Flag
+
+```text
+flag{BF61DA58FE545128}
+```

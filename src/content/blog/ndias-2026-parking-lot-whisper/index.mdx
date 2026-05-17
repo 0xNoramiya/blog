@@ -1,0 +1,69 @@
+---
+title: 'NDIAS 2026 - Parking Lot Whisper'
+description: 'Writeup for Parking Lot Whisper from NDIAS Automotive/IoT CTF 2026. Identifying the carrier frequency, modulation, and chip period of a 433 MHz Falcon X1 keyfob IQ capture.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'sdr', 'ook', 'manchester', 'iq-capture', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c1c2.bin`
+**Flag format:** `flag{freq_mod_period}`
+
+The capture is a complex float32 little-endian IQ stream at 2,000,000 sps recorded around 433.92 MHz. The task is to identify the Falcon X1 signal's **center frequency** (in Hz), **modulation**, and **shortest fundamental symbol period** (in µs).
+
+## 1. Capture Properties
+
+- SDR center frequency: `433.92 MHz` (from the challenge description)
+- Sample rate: `2_000_000` Hz
+- Format: `complex float32 LE`
+- Duration: ~10 seconds
+
+## 2. Locating the Bursts
+
+Loading the IQ stream and looking at the magnitude envelope and spectrogram shows six long bursts of about 82 ms each — two button presses with three identical repeats per press. The shorter bursts inside each frame are just the individual chip pulses.
+
+## 3. Center Frequency
+
+Taking the FFT of the on-time portion of a single burst (with the amplitude normalised so the AM envelope doesn't smear the spectrum) places the carrier at **exactly 0 Hz offset** from the SDR tune frequency:
+
+```text
+carrier = 433.92 MHz + 0 Hz = 433_920_000 Hz
+```
+
+## 4. Modulation
+
+Two checks pin the modulation:
+
+- The magnitude envelope of each burst is a clean on/off pattern.
+- The instantaneous frequency during the "on" portion has zero deviation.
+
+That is **OOK** — equivalent to 100% depth ASK.
+
+## 5. Symbol Period
+
+A pulse-width histogram of the on/off runs in a burst shows only two distinct run lengths:
+
+- 500 µs
+- 1000 µs
+
+So the shortest fundamental period is **500 µs**. This is the Manchester chip period — confirmed in the next challenges by Manchester-decoding a frame and recovering the expected sync byte `0xD5`.
+
+## 6. Findings
+
+| Field            | Value           |
+|------------------|-----------------|
+| Center frequency | 433,920,000 Hz  |
+| Modulation       | OOK             |
+| Symbol period    | 500 µs          |
+
+The challenge requires the frequency in Hz (not as an offset) and the period as a bare number in µs (no `us` suffix). The example given in the prompt is `flag{500000000_ASK_250}`.
+
+## Flag
+
+```text
+flag{433920000_OOK_500}
+```

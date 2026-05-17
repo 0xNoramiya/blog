@@ -1,0 +1,47 @@
+---
+title: 'NDIAS 2026 - Read the simple fob'
+description: 'Writeup for Read the simple fob from NDIAS Automotive/IoT CTF 2026. Manchester-decoding the Falcon X1 Unlock burst and reading the Device ID out of the wire frame.'
+date: 2026-05-15
+tags: ['writeup', 'keyfob', 'rf', 'sdr', 'ook', 'manchester', 'demodulation', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Overview
+
+**Category:** Keyfob
+**Files:** `capture_c1c2.bin`
+**Flag format:** `flag{XXXXXX}` — the 3 bytes immediately after the sync word `0xD5`.
+
+The capture is the same one from Parking Lot Whisper, so the modulation parameters carry over: OOK with a 500 µs Manchester chip period at a 0 Hz offset from 433.92 MHz.
+
+## 1. Demodulation Pipeline
+
+1. **Envelope detection.** Take the magnitude of the complex samples, then low-pass / box-filter to smooth out noise.
+2. **Threshold.** Pick a threshold between the noise floor and the burst peak, giving a binary on/off square wave.
+3. **Chip sampling.** Sample the square wave at the center of each 500 µs chip. Use the leading rising edge of the burst to align the chip grid.
+4. **Manchester decode.** Use the G.E. Thomas convention: `10` decodes to `1`, `01` decodes to `0`. Pair up consecutive chips.
+5. **Frame sync.** Search the recovered bit stream for the sync byte `0xD5` (`11010101`).
+6. **Byte read-out.** Slice bytes out of the bits after the sync.
+
+## 2. Decoded Frame
+
+All six 80 ms bursts in the capture decode identically:
+
+```text
+D5 7A 21 CC 20 01 37 5A
+```
+
+Layout:
+
+- Sync: `D5`
+- **Device ID** (3 bytes after sync): `7A 21 CC`
+- Trailer: `20 01 37 5A` — mode byte, button code, counter, footer
+
+The trailer fields show up clearly in the follow-on challenges (Next Counter, Predict Next UNLOCK), but here we only need the Device ID.
+
+## Flag
+
+```text
+flag{7A21CC}
+```
