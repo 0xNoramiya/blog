@@ -1,0 +1,68 @@
+---
+title: 'BYU CTF 2026 - Chromatic'
+description: 'Decoding a flag from the red channel of every frame in an mp4'
+date: 2026-05-30
+tags: ['writeup', 'misc', 'forensics', 'stego', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> Red.
+
+We get `chromatic.mp4` and a one-word hint.
+
+## Initial Analysis
+
+The file is a genuine H.264/MP4 video (the x264 string is in the header), about 1620 frames. The hint "Red." points straight at the **red channel**.
+
+Extract the frames and sample a pixel from one:
+
+```bash
+ffmpeg -i chromatic.mp4 frames/f_%04d.png
+```
+
+```python
+from PIL import Image
+im = Image.open("frames/f_0001.png").convert("RGB")
+print(im.getpixel((w // 2, h // 2)))   # (98, 0, 0)  -> R=98 == 'b'
+```
+
+Each frame is a flat color whose **red value is an ASCII code** (`98` is `b`, `121` is `y`, and so on); green and blue stay at zero. The same byte repeats for a run of frames.
+
+> [!WARNING]
+> The obvious shortcut — collapse *consecutive duplicate* red values into one character — is wrong. It silently eats **doubled letters**: `ll` becomes `l`, so `all` reads as `al` and `really` as `realy`. Decode by fixed-size frame blocks instead.
+
+A run-length pass shows the encoding is regular: **every character occupies exactly 30 frames** (1620 / 30 = 54 characters), so we slice the frame list into 30-frame blocks and read one byte per block.
+
+## Decode
+
+```python
+from PIL import Image
+import glob
+
+reds = []
+for f in sorted(glob.glob("frames/*.png")):
+    im = Image.open(f).convert("RGB")
+    w, h = im.size
+    reds.append(im.getpixel((w // 2, h // 2))[0])   # red channel
+
+N = 30   # frames per character (from run-length analysis)
+flag = "".join(chr(reds[i + N // 2]) for i in range(0, len(reds), N))
+print(flag)
+```
+
+Output:
+
+```
+byuctf{It's_all_red_I_really_thought_it_would_be_more}
+```
+
+The text is a pun on "it is all red" — the flag really is *all red*, encoded one character per 30 frames.
+
+## Flag
+
+```
+byuctf{It's_all_red_I_really_thought_it_would_be_more}
+```

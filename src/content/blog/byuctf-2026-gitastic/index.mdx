@@ -1,0 +1,130 @@
+---
+title: 'BYU CTF 2026 - Gitastic 1-5'
+description: 'Five git forensics challenges on one repo: hidden commit messages, odd authorship, mistagged releases, deleted blobs, and replace refs'
+date: 2026-05-30
+tags: ['writeup', 'git', 'misc', 'forensics', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+All five **Gitastic** challenges share a single repository:
+
+```bash
+git clone git://chals.cyberjousting.com:1363/challenge
+cd challenge
+```
+
+The repo has roughly 2,324 commits with deliberately verbose, AI-generated junk messages, thousands of tags (`v1.0`, `v1.0.1`, ...), and a few decoy files (`Donald.md`, `coolFile.txt`, `secrets.txt`, some stork images). Each challenge pokes at a different corner of git's data model.
+
+> The recurring theme: git is content-addressed and append-only. "Deleting" or "replacing" something usually just moves a ref; the underlying objects stick around. Every Gitastic flag exploits that.
+
+## Gitastic 1 - secret in the commit messages
+
+> We've recently found out that one of our employees has been exfiltrating information to a competitor. They did it via messages attached to each code change he made. Find the secret that was exfiltrated!
+
+"Messages attached to each code change" means **commit messages**. Rather than read 2,324 essays, grep them all:
+
+```bash
+git log --all --format='%B' | grep -ioE "byuctf\{[^}]+\}" | sort -u
+```
+
+```
+byuctf{I_hop3_y0u_didnt_s3@rch_manually}
+```
+
+## Gitastic 2 - the odd committer
+
+> Some mysterious person made a commit to our repo! Who's the odd one out?
+
+Tally commits per author:
+
+```bash
+git log --all --format='%an <%ae>' | sort | uniq -c | sort -n
+```
+
+```
+      1 byuctf{wh0s_th3_auth0r?} <zinkogamez@gmail.com>
+      1 zinkozapper <zinkogamez@gmail.com>
+    387 Zinko   <zinkogamez@gmail.com>
+    387 sawyer  <zinkogamez@gmail.com>
+    387 walker  <zinkogamez@gmail.com>
+    387 walter  <zinkogamez@gmail.com>
+    387 william <zinkogamez@gmail.com>
+    387 wyatt   <zinkogamez@gmail.com>
+```
+
+The six regular authors each have 387 commits. The odd one out is an author whose **name is the flag**.
+
+## Gitastic 3 - the mistagged release
+
+> With the increased growth of our startup we've decided that we should start tagging our code releases! However we accidentally tagged one with the wrong thing, can you find it?
+
+Thousands of annotated tags exist. Search every tag annotation for the flag:
+
+```bash
+git for-each-ref refs/tags --format='%(refname:short)|%(contents)' | grep -i byuctf
+```
+
+```
+v1.0.129|sdasdkjg...badnabyuctf{that's_a_lot_of_tags_wow}bkmsldfvn...
+```
+
+The flag is buried in the annotation of tag `v1.0.129`.
+
+## Gitastic 4 - the "deleted" API key
+
+> Walker reported that he accidentally pushed an API key to our public repo. Luckily he deleted it afterward so we're completely safe and secure!
+
+Deleting a file in a later commit does not remove the old **blob** object. Enumerate every blob in the object store and scan it:
+
+```bash
+git cat-file --batch-all-objects --batch-check \
+  | awk '$2=="blob"{print $1}' \
+  | while read b; do git cat-file -p "$b"; done \
+  | grep -ioE "byuctf\{[^}]+\}" | sort -u
+```
+
+```
+byuctf{But_th3s_was_d3l3t3d?}
+```
+
+## Gitastic 5 - the replaced secrets.txt
+
+> We're certain that someone put critical info in the secrets.txt file yet we can't see anything. It's like someone has replaced it with something else!
+
+`secrets.txt` looks innocent:
+
+```bash
+$ cat secrets.txt
+This is where we've already put our secrets!
+```
+
+"Replaced ... with something else" is a direct hint at **`git replace`**, which transparently substitutes one object for another via refs under `refs/replace/*`. The catch: `git clone` does **not** fetch `refs/replace/*` by default, so we pull them explicitly:
+
+```bash
+git fetch origin 'refs/replace/*:refs/replace/*'
+git replace -l
+# f88c2adbe25705ad54cabfd0c84826235446ffd0
+```
+
+A replacement exists for the commit that introduced `secrets.txt`. With it active, the real content appears:
+
+```bash
+$ git show HEAD:secrets.txt              # replace ref applied
+byuctf{I_lov3_s3cr3t_files}
+
+$ git --no-replace-objects show HEAD:secrets.txt   # the decoy
+This is where we've already put our secrets!
+```
+
+## Flags
+
+```
+Gitastic 1: byuctf{I_hop3_y0u_didnt_s3@rch_manually}
+Gitastic 2: byuctf{wh0s_th3_auth0r?}
+Gitastic 3: byuctf{that's_a_lot_of_tags_wow}
+Gitastic 4: byuctf{But_th3s_was_d3l3t3d?}
+Gitastic 5: byuctf{I_lov3_s3cr3t_files}
+```

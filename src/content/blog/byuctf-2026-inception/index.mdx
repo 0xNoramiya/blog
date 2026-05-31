@@ -1,0 +1,74 @@
+---
+title: 'BYU CTF 2026 - Inception'
+description: 'Carving a PNG plus ZIP plus PDF polyglot to reassemble a three-part flag'
+date: 2026-05-30
+tags: ['writeup', 'misc', 'forensics', 'polyglot', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> I found this weird file on my computer. I tried opening it, but there were some problems.
+
+We get a single file named `inception`.
+
+## Initial Analysis
+
+`file` calls it a PNG, but `strings` and a hexdump show several file formats stacked into one. A file within a file within a file, hence *Inception*. Locating the signatures:
+
+```python
+import re
+data = open("inception", "rb").read()
+# IEND (PNG end)   @ 815
+# PK\x03\x04 (ZIP) @ 823   -> contains data.bin
+# %PDF             @ 964
+# %%EOF            @ 1617
+```
+
+So there are three payloads in one blob: a PNG, a ZIP appended after it, and a PDF after that. Each holds one part of the flag.
+
+## Extraction
+
+**Part 1 - the PNG itself.** Rendering the image shows text:
+
+```
+flag part 1
+================================
+byuctf{wh4t_
+```
+
+**Part 2 - the appended ZIP.** Carve from the `PK` offset and read `data.bin`:
+
+```python
+import zipfile, io
+pk = data.find(b"PK\x03\x04")
+z = zipfile.ZipFile(io.BytesIO(data[pk:]))
+print(z.read("data.bin").decode())
+# flag part 2
+# ================================
+#   th3
+```
+
+**Part 3 - the trailing PDF.** Decode its FlateDecode content stream:
+
+```python
+import zlib, re
+m = re.search(rb"stream\r?\n(.*?)\r?\nendstream", data, re.S)
+print(zlib.decompress(m.group(1)).decode())
+# ... (flag part 3) ... (_fr3ak}) ...
+```
+
+## Assemble
+
+```
+part1: byuctf{wh4t_
+part2: th3
+part3: _fr3ak}
+```
+
+## Flag
+
+```
+byuctf{wh4t_th3_fr3ak}
+```

