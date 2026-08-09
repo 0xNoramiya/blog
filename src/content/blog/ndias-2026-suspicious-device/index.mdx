@@ -1,0 +1,153 @@
+---
+title: 'NDIAS 2026 - Suspicious device 1-3'
+description: 'Carving an SD-card image with debugfs, then pulling a QEMU machine model, an XOR-encoded cloud endpoint, and a hidden debug-exec opcode out of the same IoT firmware'
+date: 2026-08-09
+tags: ['writeup', 'forensics', 'reverse-engineering', 'xor', 'ndias', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+All three **Suspicious device** challenges share a single artifact, `dist-suspicious_device.zip`:
+
+> Analyze an SD card image from an IoT device.
+
+The device advertises itself as a thermostat gateway. Each part digs one layer deeper into the same image: the hardware it really runs on, the endpoint it really talks to, and the command it does not admit to supporting.
+
+## Suspicious device 1 - the real machine behind the device
+
+The archive holds one file:
+
+```bash
+python3 -m zipfile -e files/dist-suspicious_device.zip /tmp/suspicious_device_solve
+file /tmp/suspicious_device_solve/sdcard.img
+fdisk -l /tmp/suspicious_device_solve/sdcard.img
+```
+
+`sdcard.img` is a 128 MiB DOS/MBR disk image with two partitions:
+
+```text
+start sector 1      size 65536 sectors   boot/FAT partition
+start sector 65537  size 196608 sectors  Linux rootfs
+```
+
+Carving both partitions out avoids mounting the image at all:
+
+```bash
+dd if=sdcard.img of=part1.fat  bs=512 skip=1     count=65536
+dd if=sdcard.img of=part2.ext4 bs=512 skip=65537 count=196608
+```
+
+The second partition is ext4, so `debugfs` dumps it without a loop mount or root:
+
+```bash
+mkdir rootfs
+debugfs -R 'rdump / rootfs' part2.ext4
+```
+
+The root filesystem carries an application-level IoT profile at `/etc/iot-device/profile.conf`:
+
+```text
+[device]
+device_id=dev-7f3a91c2
+model=thermo-gw-200
+region=jp-east
+```
+
+That is the device's *claim*, not its identity — it is a config file the firmware writes about itself. The real hardware identity is in the boot files, which no application can rewrite. The FAT partition holds the device-tree blob `vexpress-v2p-ca9.dtb`, whose root properties read:
+
+```text
+model = "V2P-CA9"
+compatible = "arm,vexpress,v2p-ca9", "arm,vexpress"
+```
+
+`/var/log/messages` agrees, and adds the giveaway:
+
+```text
+OF: fdt: Machine model: V2P-CA9
+mmcblk0: mmc0:4567 QEMU! 128 MiB
+```
+
+So the "thermo-gw-200 gateway" is a QEMU ARM Versatile Express A9 machine, and its canonical model string is `V2P-CA9`.
+
+## Suspicious device 2 - the XOR-encoded cloud endpoint
+
+With the rootfs extracted, `/etc/iot-device/provision.bin` stands out — 32 bytes of nothing readable:
+
+```text
+58 ea f9 40 81 27 c6 1f bb 6f b3 7b 5c 5d c2 00
+28 d3 77 a2 29 2b 93 07 2a 38 c2 69 f5 03 0b 83
+```
+
+The firmware binary `/usr/bin/iot-agent` reads exactly 32 bytes from that path. Around the provision-loading routine it XORs the first 22 bytes against a 22-byte key held in `.rodata`, at file offset `0x64f34` / virtual address `0x74f34` — immediately after the embedded debug-token string and its padding:
+
+```text
+31 85 8d 6d e2 4b a9 6a df 41 d0 0f 3a 73 ac 64
+41 b2 04 8c 43 5b
+```
+
+The remaining two bytes are the port, decoded separately with XOR constants `0x8a` and `0x33`:
+
+```python
+prov = bytes.fromhex(
+    "58eaf9408127c61fbb6fb37b5c5dc20028d377a2292b"
+    "93072a38c269f5030b83"
+)
+key = bytes.fromhex(
+    "31858d6de24ba96adf41d00f3a73ac6441b2048c435b"
+)
+
+host = bytes(a ^ b for a, b in zip(prov[:22], key)).decode("ascii")
+port = (prov[0x16] ^ 0x8a) | ((prov[0x17] ^ 0x33) << 8)
+print(f"{host}:{port}")
+```
+
+```text
+iot-cloud.ctf.ndias.jp:13337
+```
+
+## Suspicious device 3 - the opcode that is not in the help text
+
+`iot-agent --debug-proto` advertises four commands:
+
+```text
+IOT1 commands (normal operation):
+  HELLO
+  PING
+  GET_PROFILE
+  UPLOAD_TELEMETRY
+```
+
+The help text is hand-written; the dispatch table is the truth. At virtual address `0x87a10` it holds six entries, not four:
+
+| Opcode | Name | Handler |
+| --- | --- | --- |
+| `0x01` | `HELLO` | `0x10bc4` |
+| `0x02` | `PING` | `0x10b54` |
+| `0x03` | `GET_PROFILE` | `0x10ad0` |
+| `0x04` | `UPLOAD_TELEMETRY` | `0x10c50` |
+| `0x7e` | `DIAG_INFO` | `0x10a50` |
+| `0x7f` | `DEBUG_EXEC` | `0x109a0` |
+
+The two high opcodes are simply omitted from the printed list. `DEBUG_EXEC` is the interesting one — its handler builds this payload:
+
+```text
+{"token":"%s","cmd":"id"}
+```
+
+and fills the `%s` from a hard-coded token at virtual address `0x74f1c`:
+
+```text
+dbg-9b7c4a1e-prod-only
+```
+
+It then ships that over the same IOT1 framing the device uses for its normal cloud traffic. The production debug-exec token is the deepest secret in the firmware, and the `prod-only` suffix says it was never meant to leave the build.
+
+## Flags
+
+```text
+Suspicious device 1: flag{V2P-CA9}
+Suspicious device 2: flag{iot-cloud.ctf.ndias.jp:13337}
+Suspicious device 3: flag{dbg-9b7c4a1e-prod-only}
+```
