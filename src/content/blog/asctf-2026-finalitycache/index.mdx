@@ -1,0 +1,209 @@
+---
+title: 'ASCTF 2026 - FinalityCache'
+description: 'Proving a stripped validator is secret-independent, re-implementing its integrity VM and XOR keystream, then taking the uncapped base credit path the 40000 bonus cap was there to hide'
+date: 2026-08-09
+tags: ['writeup', 'pwn', 'reverse-engineering', 'smart-contracts', 'logic-bug', 'asctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+The distribution `dist.zip` holds three files:
+
+| File | Type | Role |
+| --- | --- | --- |
+| `BridgeVault.sol` | Solidity 0.8.24 | The on-chain vault whose `redeem()` logic the server mirrors |
+| `guardian` | x86-64 ELF, stripped | The relayer's claim validator, and the real reversing target |
+| `sample.receipt` | 236 bytes binary | A known-good `attest` input |
+
+The remote is a thin TCP wrapper that prints a JSON banner on connect:
+
+```json
+{
+  "format": "FCR10",
+  "session_id": 12249790986447750745,
+  "target": "0x31092441B62e1a0f6EeB426c7bE3Fe7b7A6Dd2B1",
+  "goal": 80000,
+  "route_bonus_cap": 40000,
+  "trace_cap": 48,
+  "settles_once": true,
+  "commands": {
+    "info": "show session info",
+    "attest <receipt_hex>": "run guardian and register a staged claim hash",
+    "redeem <claim_blob_hex> <sig_hex>": "redeem the current attestation",
+    "balance": "show session balance",
+    "quit": "close connection"
+  }
+}
+```
+
+`attest` runs `guardian` with three **secret** environment variables and, on `OK`, signs the resulting claim with the relayer key. `redeem` runs `BridgeVault.redeem`, which verifies that signature and credits the session balance. The goal is a balance of at least 80000 in a single settle.
+
+A normal attest/redeem of the sample credits 20000. We need 80000, and `route_bonus_cap` is 40000 — which loudly suggests you *must* reach the uncapped checkpoint bonus, and that needs the secret route salt and epoch seed. That hint is a red herring.
+
+## Source Code Analysis
+
+The relevant part of `redeem()`:
+
+```solidity
+ClaimState memory state;
+_mergeClaim(claimBlob, 0, state);
+require(state.recipient == sessionTarget[sessionId], "wrong recipient");
+
+uint64 committedAmount = pendingCommittedAmount[sessionId];   // set by register()
+...
+require(digest.recover(signature) == relayer, "bad signer");  // EIP-712 over the TransitClaim
+
+uint64 credit = state.amount;
+if (credit > committedAmount) credit = committedAmount;        // credit = min(amount, committed)
+
+bool routeOk = false;
+if (state.routeSalt.length == 32 && state.routeTicket.length == 16) {
+    bytes32 routeSalt = _loadBytes32(state.routeSalt);
+    bytes16 expectedTicket = bytes16(keccak256(abi.encodePacked(
+        routeSalt, batchId, state.laneHint, keccak256(state.memo))));
+    if (computeRouteTarget(routeSalt) == sessionTarget[sessionId]      // CREATE2(salt) == target
+        && _loadBytes16(state.routeTicket) == expectedTicket) {
+        routeOk = true;
+        if (state.routeBonusAmount > credit)
+            credit = state.routeBonusAmount > ROUTE_BONUS_CAP ? ROUTE_BONUS_CAP : state.routeBonusAmount;
+    }
+}
+if (routeOk && state.checkpointSeal.length == 16) {
+    bytes16 expectedSeal = computeEpochSeal(routeSalt, sessionEpochSeed[sessionId], batchId, state.memo);
+    if (_loadBytes16(state.checkpointSeal) == expectedSeal && state.checkpointBonusAmount > credit)
+        credit = state.checkpointBonusAmount;                          // UNCAPPED
+}
+balances[sessionId] += credit;
+```
+
+There are three ways to be credited. The base path is `min(state.amount, committedAmount)`. The route bonus needs `routeSalt` to be the secret CREATE2 salt the target was derived from, and caps at 40000. The checkpoint bonus is uncapped but additionally needs a valid seal over the secret epoch seed.
+
+Paths two and three need secrets we do not have, so the base path is the only attacker-reachable one — and it is sufficient *if* both `state.amount` and `committedAmount` can reach 80000. Note that `_mergeClaim` sets `state.amount` on every field-2 occurrence, last one wins.
+
+## Reversing guardian
+
+`guardian` takes a session id and a receipt hex. It is stripped but statically analyzable, and its strings lay out the whole structure: a small VM, a lane decoder, a seal policy, and `OK %llx`.
+
+### The decisive observation: the secrets do not matter
+
+The first thing worth checking is whether the secret environment actually changes anything. Running the sample under three different random env triples — each with the right lengths, or it bails early — gives byte-for-byte identical output every time:
+
+```text
+$ SESSION_ROUTE_SALT_HEX=<32B> SESSION_EPOCH_SEED_HEX=<16B> SESSION_ENVELOPE_KEY_HEX=<32B> \
+  ./guardian 1234605616436508552 <sample_hex>
+OK 4e20 0a14 65ebf0d49788ac66e26d99130056cb25f92c067d 10a09c01 1a11 6d656d6f3d726f7574652d77696e646f77 200b
+```
+
+So the base path is fully deterministic and secret-independent. The secrets only feed the route and checkpoint bonus verification, which means guardian can be emulated locally and anything crafted locally will behave identically on the remote.
+
+Decoding the `OK` line: `4e20` is 20000, the credit. The claim blob is protobuf — a 20-byte recipient, `amount=20000`, the memo `memo=route-window`, and `laneHint=11`. The relayer signs `keccak(claimBlob)`, so the redeemed blob has to be exactly guardian's output; any tampering after the fact breaks the signature.
+
+### Receipt format
+
+Reading the header parser and confirming field by field against the binary as an oracle:
+
+```text
+off    size  field
+0x00   5     magic "FCRA\n"
+0x05   1     lane_count (1..8)
+0x06   2     vm_len  (u16 LE, must == 25)
+0x08   8     session_id (u64 LE; must equal argv[1])
+0x10   8     fA  -> batchId
+0x18   8     fB  -> nullifier
+0x20   8     fC  -> committedAmount
+0x28   52    blob52 = recipient[20] || commitment[32]
+0x5c   25    VM program (fixed 25 bytes)
+0x75   ...   lanes: each = [u16 tag][u16 len][len bytes data]
+```
+
+### The integrity VM
+
+The 25-byte program is `memcmp`'d against a fixed copy in `.rodata`, so it cannot be changed. It drives a small stack machine:
+
+| op | meaning |
+| --- | --- |
+| `01/02/03/04` | push header register (session / fA / fB / fC) |
+| `05` | push weighted checksum of the 20-byte recipient |
+| `06 k` | push a custom per-lane fingerprint of lane k |
+| `07 k` | push the tag of lane k |
+| `08` | push lane_count |
+| `10/11` | XOR / ADD top two |
+| `12 n` / `13 n` | ROL-by-n / MUL-by-n of top |
+| `7f` | HALT |
+
+At HALT a SipHash-like finalizer mixes the result with the per-lane fingerprints, the recipient checksum, the lane count and the tag sum, producing four qwords that must equal `blob52[20:52]`, or it fails with `ERR bad vm commitment`.
+
+This is an integrity tag with no secret in it. Re-implementing the VM and finalizer in Python, then brute-forcing the header-field to VM-register permutation against the sample, produced a unique match — so `recompute_commitment(...)` reproduces `blob52[20:52]` exactly and any header field can be changed and re-sealed.
+
+### Lanes are an LZ plus XOR-keystream codec
+
+A second VM decompresses the lanes into one shared output buffer, where lane `i` writes at the prefix sum of the preceding tags and must emit exactly `tag[i]` bytes. For the sample, tags are `[47, 19, 18, 15]`:
+
+```text
+output[ 0:47] = lane[0]  ->  the protobuf CLAIM BLOB (47 bytes)
+output[47:66] = lane[1]  ->  the trace  ("trace:sealed-window")
+output[66:84] = lane[2]  ->  seal/checkpoint material
+output[84:99] = lane[3]  ->  seal/checkpoint material
+```
+
+Each lane byte is an opcode — literal run, back-reference copy, signed literal, or skip — with the count in the low six bits. For a literal run the output is the operand XORed with a keystream:
+
+```text
+ks(lane_idx, p) = ( (lane_key[lane_idx] >> ((p & 7)*8)) + global_off + p*41 ) & 0xff
+lane_key[i]     = rol(fA, i+7) ^ session ^ (0xcc623af8783354e7 + i*GOLD)     (mod 2^64)
+global_off[i]   = i * 0x33
+```
+
+Lane 0 of the sample is a single literal run, so recovering `ks` from the sample and matching it byte for byte confirms the formula — and means lane 0 can emit an arbitrary claim blob.
+
+### The "seal policy" is not what it looks like
+
+guardian parses its own emitted claim with another protobuf parser, then runs a seal-policy check over the resulting struct before computing the credit.
+
+Flipping single bytes in lane 0 and watching which output bytes move shows the recipient and memo are freely editable, while touching the amount varint or the protobuf tags produces `ERR seal policy`. That looks like the amount is MAC-protected.
+
+It is not. Flipping a varint byte truncates the protobuf field and corrupts the message structure, which then fails the struct-shape checks. The seal policy validates protobuf well-formedness, not the amount value — so a *structurally valid* amount of any size passes.
+
+## The Vulnerability
+
+`state.amount` and `committedAmount` are both attacker-controlled, and nothing on the base path bounds either one. The amount is whatever bytes lane 0 decompresses to, and `committedAmount` is header field `fC`, a plain u64 that can be re-sealed with a recomputed commitment.
+
+So keeping the protobuf structure byte-identical and swapping only the amount varint `a09c01` (20000) for `80f104` (80000), then setting `fC` to 80000:
+
+```text
+credit = min(state.amount, committedAmount) = min(80000, 80000) = 80000  >=  goal(80000)
+```
+
+No route bonus, no checkpoint seal, no secrets. The 40000 cap is pure misdirection: it caps a path we never take, while the base path has no cap at all. Locally guardian will happily print `OK 13880`, `OK 186a0`, even `OK ffffffff`.
+
+## Exploitation
+
+The remote serves a fresh session and a session-tailored sample receipt whose recipient already matches the target, so the per-connection sample just needs patching:
+
+```python
+from client import Client
+from solve_local import craft_amount   # parse sample, set amount + fC, recompute commitment
+
+c = Client()                            # reads JSON banner -> session_id, target, sample
+rb, sid, _, _ = craft_amount(c.info["sample_receipt_hex"], 80000, new_fC=80000)
+r = c.cmd("attest " + rb.hex())         # preview=80000 ... sig=<relayer sig>
+claim, sig = parse_attest(r)
+print(c.cmd(f"redeem {claim} {sig}"))   # -> the flag
+print(c.cmd("balance"))                 # -> 80000
+```
+
+```text
+[amount=80000,fC=80000] session=12249790986447750745 target=0x31092441...A6Dd2B1 goal=80000
+   local-guardian on craft : OK 13880 0a1431092441b62e1a0f6eeb426c7be3fe7b7a6dd2b11080f10...
+   attest: preview=80000 claim=0a1431092441b62e1a0f6eeb426c7be3fe7b7a6dd2b11080f1041a11... sig=...
+   redeem: slopped{wrapped_lane_offsets_expose_seal_keys_then_sign_recursive_checkpoints}
+   balance: 80000
+```
+
+## Flag
+
+```text
+slopped{wrapped_lane_offsets_expose_seal_keys_then_sign_recursive_checkpoints}
+```
