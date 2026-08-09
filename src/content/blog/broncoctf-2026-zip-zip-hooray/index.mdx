@@ -1,0 +1,163 @@
+---
+title: 'broncoCTF 2026 - Zip, Zip, Hooray!'
+description: 'Peeling 1000 nested archive layers by magic byte, using the fact that 7-zip leaves its filename table readable to recover each layer password'
+date: 2026-08-09
+tags: ['writeup', 'forensics', 'zip', 'python', 'broncoctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> I was trying to compress my files and my script got a little carried away... Can you help me find my original file?
+>
+> **Hint:** the 7z files are password protected, and the password is the name of the first file inside.
+
+We get a single `challenge.zip`.
+
+## Initial Analysis
+
+Despite the name, the magic bytes say otherwise:
+
+```bash
+$ file challenge.zip
+challenge.zip: gzip compressed data, was "layer1.tar", ... original size ... 481280
+```
+
+It is a gzip of `layer1.tar`. Peeling a few layers by hand exposes a repeating cycle:
+
+```text
+challenge.zip (gzip)  ->  layer1.tar        (tar)
+layer1.tar            ->  layer2.bz2        (bzip2)
+layer2.bz2            ->  layer2            (7-zip archive, password protected)
+layer2 (7z)           ->  layer4.zip        (zip)
+layer4.zip            ->  layer5.tar.gz     (gzip)
+...
+```
+
+The "script that got carried away" wrapped the original file in a deep stack cycling through five formats:
+
+```text
+zip  ->  gzip  ->  tar  ->  bzip2  ->  7z (encrypted)  ->  zip  ->  ...
+```
+
+## The Vulnerability
+
+Only the 7-zip stage is non-trivial, and it gives itself away. 7-zip encrypts *file contents* by default but leaves the *filename table* in cleartext — header encryption (`-mhe=on`) was not used here. So the archive can be listed without the password:
+
+```python
+import py7zr
+with py7zr.SevenZipFile("layer2", "r") as z:
+    print(z.getnames())       # ['layer4.zip']
+    print(z.needs_password()) # True
+```
+
+The archive holds exactly one file, `layer4.zip` — and per the hint, that filename *is* the password. Listing the archive hands you the very string needed to decrypt it:
+
+```python
+with py7zr.SevenZipFile("layer2", "r", password="layer4.zip") as z:
+    z.extractall("out")
+```
+
+Every 7z layer works the same way: read the first name, feed it back as the key.
+
+## Exploitation
+
+Doing that a thousand times by hand is not happening. A recursive unpacker that detects each layer by magic byte, dispatches to the right decompressor, and for 7z reads the first filename to use as the password, peels the whole stack unattended:
+
+```python
+#!/usr/bin/env python3
+import os, sys, gzip, bz2, lzma, tarfile, zipfile, shutil
+import py7zr
+
+WORK = os.path.abspath("unpack")
+
+def magic(path):
+    with open(path, "rb") as f:
+        h = f.read(16)
+    if h[:2] == b"\x1f\x8b": return "gzip"
+    if h[:3] == b"BZh": return "bzip2"
+    if h[:6] == b"\xfd7zXZ\x00": return "xz"
+    if h[:6] == b"7z\xbc\xaf\x27\x1c": return "7z"
+    if h[:4] in (b"PK\x03\x04", b"PK\x05\x06"): return "zip"
+    with open(path, "rb") as f:
+        f.seek(257)
+        if f.read(5) == b"ustar": return "tar"
+    return "unknown"
+
+def unpack(path, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    kind = magic(path)
+    base = os.path.basename(path)
+    if kind in ("gzip", "bzip2", "xz"):
+        opener = {"gzip": gzip.open, "bzip2": bz2.open, "xz": lzma.open}[kind]
+        name = base
+        for ext in (".gz", ".bz2", ".xz", ".tgz"):
+            if name.endswith(ext): name = name[:-len(ext)]; break
+        else:
+            name += ".out"
+        out = os.path.join(outdir, name)
+        with opener(path, "rb") as fi, open(out, "wb") as fo:
+            shutil.copyfileobj(fi, fo)
+        return [out]
+    if kind == "tar":
+        with tarfile.open(path) as t:
+            t.extractall(outdir)
+            return [os.path.join(outdir, m.name) for m in t.getmembers() if m.isfile()]
+    if kind == "zip":
+        produced = []
+        with zipfile.ZipFile(path) as z:
+            for n in z.namelist():
+                z.extract(n, outdir)
+                p = os.path.join(outdir, n)
+                if os.path.isfile(p): produced.append(p)
+        return produced
+    if kind == "7z":
+        with py7zr.SevenZipFile(path, "r") as z:
+            names = z.getnames()
+        pw = names[0]                      # the hint: password == first filename
+        with py7zr.SevenZipFile(path, "r", password=pw) as z:
+            z.extractall(outdir)
+        return [os.path.join(outdir, n) for n in names]
+    return None
+
+def main():
+    start = sys.argv[1]
+    if os.path.exists(WORK): shutil.rmtree(WORK)
+    os.makedirs(WORK)
+    seed = os.path.join(WORK, "layer_0")
+    shutil.copy(start, seed)
+    queue, finals = [(seed, 0)], []
+    while queue:
+        path, d = queue.pop(0)
+        outdir = os.path.join(WORK, f"d{d}_{os.path.basename(path)}_out")
+        produced = unpack(path, outdir)
+        if produced is None:
+            finals.append(path); continue
+        for p in produced:
+            queue.append((p, d + 1))
+    print("FINAL:", *[os.path.relpath(f, WORK) for f in finals])
+
+if __name__ == "__main__":
+    main()
+```
+
+`py7zr` is the only non-stdlib dependency; gzip, bzip2, xz, tar and zip are all handled by the standard library.
+
+Running it bottoms out after exactly 1000 layers:
+
+```text
+$ python3 solve.py challenge.zip
+...
+[d1248] .../layer998         -> 7z
+    [7z] password='layer1000.zip' OK
+[d1249] .../layer1000.zip    -> zip
+[d1250] .../flag.txt         -> unknown
+FINAL: .../flag.txt
+```
+
+## Flag
+
+```text
+bronco{i_h4te_f1l3_c0mpr3ssi0n}
+```

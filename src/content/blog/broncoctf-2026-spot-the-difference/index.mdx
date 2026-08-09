@@ -1,0 +1,89 @@
+---
+title: 'broncoCTF 2026 - Spot The Difference'
+description: 'Separating 50 decoy case-flips from 29 real substitutions by aligning two files on their lowercased form with difflib'
+date: 2026-08-09
+tags: ['writeup', 'forensics', 'stego', 'python', 'broncoctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> My friend said that she updated file1 to send me a top-secret message, but I don't get it. File2 is still just a bunch of random characters?
+
+We get `file1.txt` and `file2.txt`.
+
+## Initial Analysis
+
+Both files are ASCII, roughly 700 bytes, laid out one character per line:
+
+```text
+$ head -8 file1.txt        $ head -8 file2.txt
+x                          x
+e                          E
+c                          C
+2                          2
+V                          V
+K                          K
+w                          w
+G                          G
+```
+
+They are nearly identical — `file1.txt` has 350 characters, `file2.txt` has 351. This is a literal spot-the-difference: the message lives in whatever changed between them.
+
+## First attempt, and why it is noisy
+
+A straight position-by-position comparison finds 79 differing positions. Reading `file2`'s character at each gives something *almost* right:
+
+```text
+bronco{y@yyy_Y0u_f0und_m3!!}[
+```
+
+The shape of the flag is visible, but there is junk in the middle and a stray bracket at the end. Two things are muddying the channel:
+
+1. **Case-flip decoys.** Classifying the 79 diffs shows **50 are pure case flips** (same letter, different case) and only **29 are real substitutions**. The flips are noise sprinkled in to bury the real edits.
+2. **Insertions.** `file1` has two extra characters and `file2` has one, so a positional walk drifts out of alignment partway through and starts reading the wrong column.
+
+## The Vulnerability
+
+Both problems dissolve with one change: align the two sequences on their **lowercased** form. Case flips then compare equal and vanish from the opcode list, and using a real alignment instead of a positional zip absorbs the indels so the two sides never drift:
+
+```python
+import difflib
+
+f1 = [c for c in open("file1.txt").read().split("\n") if c != ""]
+f2 = [c for c in open("file2.txt").read().split("\n") if c != ""]
+
+# file2 (the "random" file) actually carries the message;
+# align on lowercase so decoy case-flips count as EQUAL.
+sm = difflib.SequenceMatcher(a=[c.lower() for c in f2],
+                             b=[c.lower() for c in f1],
+                             autojunk=False)
+
+msg = []
+for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    if tag in ("replace", "delete"):
+        msg.append("".join(f2[i1:i2]))   # read the ORIGINAL (file2) char
+print("".join(msg))
+```
+
+```text
+file2 @ true substitutions: bronco{y@yyy_Y0u_f0und_m3!!}
+file1 @ true substitutions: gd6VeBn9ltja5VoTt3WmTyThP5q
+```
+
+The flag comes out clean and brace-balanced. Reading `file1` at the exact same positions yields only noise, which confirms the direction of the channel: the message lives in `file2` and was destroyed in `file1`.
+
+## What actually happened
+
+`file2` is the carrier. The flag's 27 characters sit at 27 specific positions surrounded by random filler. To produce `file1`, the author took `file2`, overwrote the flag characters with random ones, and flipped the case of 50 unrelated letters as decoys.
+
+That inverts the usual framing. The recipient holding `file1` sees no message and `file2` looks like garbage, so neither file alone reveals anything — only diffing them, and discounting the case flips, lights up the flag positions.
+
+Decoded, the message reads "yayyy, you found me!!".
+
+## Flag
+
+```text
+bronco{y@yyy_Y0u_f0und_m3!!}
+```
