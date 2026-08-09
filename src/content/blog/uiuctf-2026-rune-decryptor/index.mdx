@@ -1,0 +1,197 @@
+---
+title: 'UIUCTF 2026 - Rune Decryptor'
+description: 'Cracking 20 rounds of monoalphabetic substitution across ten languages with space-aware quadgram hill-climbing and a dictionary polish pass'
+date: 2026-08-09
+tags: ['writeup', 'crypto', 'substitution-cipher', 'cryptanalysis', 'python', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> I came across an oracle speaking in strange runes - can you help me decipher them?
+>
+> Please do not hammer the server.
+>
+> `ncat --ssl rune-decryptor.chal.uiuc.tf 1337`
+
+No handout — everything is learned from the service itself.
+
+## Initial Analysis
+
+Connecting (after the kCTF proof of work) prints the rules:
+
+```text
+ - original paragraph is of unknown language
+ - language from one of
+  - de=German   en=English  es=Spanish  fr=French   grc=Ancient Greek
+  - it=Italian  la=Latin    nl=Dutch    ru=Russian  sv=Swedish
+ - text is mapped via monoalphabetic substitution
+ - submit decrypted text (5 attempts per round)
+ - if you get text wrong, we report back # of correct symbols
+ - >70% of 20 rounds = flag
+```
+
+then a paragraph of Elder Futhark:
+
+```text
+ᛈᛝ ᛦᛝᛉᚱᚦᛏ ᛒᚴᚱᚠᚱᛃᚦᛝ ᛒᛚᚴ ᛈᛝᚨ ᛚᚺᛏᛝᚨ ᛈᛝᚨ ᛒᛈᚦᚨ ᛚᛞᚱᛟᚾᚸᛚᛞᛈᛝᚨ ᛝᛏ ᛈᛝᚨ ᛒᛈᚦᚨ ᛒᛝᚴᚠᛝᚴᚨ
+ᚺᚱᚾᛏᚦᚨ ᚾᚸ ᛚᚲᚾᛈᛈᛚ ᚾᚸᛏᛝᚴ ᛟᛚᛟᛟᛚᚨ ᛝᛏᚺ. ...
+```
+
+Two probes pin the format down. The rune inventory is small and the punctuation
+is not enciphered:
+
+```python
+runes = [c for c in t if c not in ' .\n']
+# total letters 382, distinct 21
+# punct: {'.', ' '}
+```
+
+21 distinct symbols over 382 letters, only `.` and space surviving — so accents
+are stripped and case is folded before enciphering, and word boundaries are
+preserved. And submitting junk reveals the length check:
+
+```text
+[5 attempt(s) left] > test
+
+Submission has 4 letters, expected 382. Not counted as an attempt.
+```
+
+Malformed submissions are free, so the only real cost is a wrong *answer*. The
+answer has to be exact, which rules out a solver that gets 95% of the letters and
+calls it a day.
+
+## The Approach
+
+A monoalphabetic substitution over ~400 letters is comfortably solvable by
+n-gram hill-climbing. The wrinkles here are that the language is unknown, that
+two of the ten alphabets are not Latin, and that the answer must be letter-perfect.
+
+**Corpora.** Gutendex indexes Project Gutenberg by language, so a few MB per
+language comes down with one crawl:
+
+```python
+GUT = {'de': 'de', 'en': 'en', 'es': 'es', 'fr': 'fr', 'it': 'it',
+       'la': 'la', 'nl': 'nl', 'ru': 'ru', 'sv': 'sv', 'grc': 'el'}
+```
+
+**Normalization** has to match whatever the challenge did to produce 21 symbols
+and no accents — NFD decompose, drop the combining marks, fold `ß` and final
+sigma, and keep only the language's own alphabet plus single spaces:
+
+```python
+def normalize(text, alpha):
+    text = text.replace('ß', 'ss').replace('ẞ', 'ss')
+    text = unicodedata.normalize('NFD', text.lower())
+    text = ''.join(c for c in text if not unicodedata.combining(c))
+    text = text.replace('ς', 'σ').replace('ϲ', 'σ')
+    keep = set(alpha)
+    ...
+```
+
+Letter frequencies out of the finished models line up with the languages they
+claim to be, which is the cheapest sanity check available:
+
+```text
+de  chars 1805688  vocab 14542  top enirsatd
+en  chars 1866723  vocab 11469  top etaoinsh
+fr  chars 1475238  vocab  9350  top eaistnru
+ru  chars  292167  vocab  4175  top оеиатнср
+grc chars  735217  vocab  7809  top αοισετνρ
+```
+
+**Scoring.** The model is quadgrams over the alphabet *plus space*. Since the
+cipher leaves word boundaries alone, letting spaces participate in the n-grams is
+free signal and it is a large amount of it — word-initial and word-final letter
+distributions are far more discriminating than raw letter frequency.
+
+Scoring is a numpy gather so a full 2-opt sweep costs microseconds:
+
+```python
+def score(key):
+    idx = key[base]
+    k = ((idx[:-3] * S + idx[1:-2]) * S + idx[2:-1]) * S + idx[3:]
+    return float(table[k].sum())
+```
+
+**Getting to exact.** Quadgram hill-climbing plateaus a few letters short, and a
+few letters short is a wrong answer. The fix is a second 2-opt pass whose
+objective adds a heavy bonus for decrypted tokens that appear in the corpus
+vocabulary:
+
+```python
+def total(key):
+    txt = ''.join(alpha[key[toks[i]]] if toks[i] >= 0 else ct[i] for i in range(len(ct)))
+    return score(key) + 60.0 * vocab_hits(lang, txt) * len(txt.split())
+```
+
+That same vocabulary-hit fraction doubles as the **language classifier**. Raw
+quadgram log-probabilities are not comparable across models built on different
+alphabets, but "what fraction of the output words are real words in this
+language" is, and it separates cleanly:
+
+```text
+de:  vocab=0.649  le degout provoque par les actes les plus abominables et les plus perv
+en:  vocab=0.365  me wedous procohue pir met ibset met pmut ivolanivmet es met pmut perc
+fr:  vocab=0.757  le degout provoque par les actes les plus abominables et les plus perv
+la:  vocab=0.473  le yefout provoque par les actes les plus abominables et les plus perv
+ru:  vocab=0.351  те дегами прабауме пор тел ониел тел птмл очавскочтел еи тел птмл перб
+grc: vocab=0.432  πα ταγδεν ιυδξδθεα ιου πασ ομνασ πασ ιπεσ ορδκωηορπασ αν πασ ιπεσ ιαυξ
+```
+
+French wins, and it is French. German scores 0.649 on the *French* plaintext
+purely because the shared Latin function words happen to be in its vocabulary —
+which is exactly why the tie-break has to be the top score and not a threshold.
+
+**Spending the other four attempts.** When the first submission comes back
+`Incorrect. 28/30 symbols mapped correctly`, the key is a transposition or two
+away. Rather than re-running the climb, rank every pairwise swap of the winning
+key by the combined objective and submit the best ones:
+
+```python
+def swap_variants(lang, ct, key, topk=8):
+    for i in range(A):
+        for j in range(i + 1, A):
+            ...
+            sc = score(k2) + 60.0 * vocab_hits(lang, txt) * len(txt.split())
+            out.append((sc, txt))
+    out.sort(reverse=True)
+```
+
+## Exploitation
+
+Twenty rounds, roughly 8-10 seconds of solving each:
+
+```text
+--- round 2: 462 chars best=grc vocab=0.49 (8s)
+    ο δε ανδοκιδησ πολιτικοσ μεν ειναι προαιρειται ου μην παντη επιτυγχανει
+    try1 [grc] CORRECT.   [Ancient Greek]
+--- round 8: 396 chars best=la vocab=0.86 (8s)
+    quid est in tormentis quid est in aliis quae adversa appellamus mali.
+    try1 [la] CORRECT.   [Latin]
+--- round 13: 515 chars best=nl vocab=0.94 (9s)
+    zijn voorgevoel scheen juist te zijn want de detective keek leelijk op zijn neus
+    try1 [nl] CORRECT.   [Dutch]
+--- round 20: 401 chars best=ru vocab=0.54 (4s)
+    горничная скрылась. рубашкин обомлел. перебоченская как ни в чем не бывало
+    try1 [ru] Incorrect. 27/28 symbols mapped correctly.
+    ...
+```
+
+Sixteen of the twenty fell on the first attempt. The misses were all Russian —
+its corpus came out at 292K normalized characters against 1.5-1.9M for every
+Latin language, because Gutenberg simply has less Russian, and a thinner quadgram
+table leaves one or two rare letters ambiguous. The swap-repair variants covered
+it each time.
+
+```text
+Solved 18/20 (90%).
+uiuctf{Po1ygl0t_Pr4ctIC3}
+```
+
+## Flag
+
+```text
+uiuctf{Po1ygl0t_Pr4ctIC3}
+```

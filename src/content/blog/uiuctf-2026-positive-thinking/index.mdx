@@ -1,0 +1,241 @@
+---
+title: 'UIUCTF 2026 - positive-thinking'
+description: 'Turning a CKKS Chebyshev sign oracle into a 50-bit binary search using ciphertext additions only, with exact rational interval tracking'
+date: 2026-08-09
+tags: ['writeup', 'crypto', 'homomorphic-encryption', 'oracle-attack', 'interval-arithmetic', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+> Here when adventuring, we like positive thinking, even when you can't know the thoughts of others.
+>
+> We'll let you put other's thoughts through something that gets you something positive!
+>
+> `ncat --ssl positive-thinking.chal.uiuc.tf 1337`
+
+The handout is a `Dockerfile`, an `nsjail.cfg`, and `main.py`.
+
+## Source Code Analysis
+
+The server builds a TenSEAL CKKS context, encrypts a 50-bit secret under it, and
+hands you the **public** context plus the ciphertext:
+
+```python
+POLY_MODULUS_DEGREE = 16384
+COEFF_MOD_BIT_SIZES = [60, 40, 40, 40, 40, 40, 40, 60]
+GLOBAL_SCALE = 2**40
+
+SECRET_BITS = 50
+NORMALIZATION1 = 2**24
+NORMALIZATION2 = 2**25
+MAX_QUERIES = 100
+
+secret = secrets.randbelow(2**SECRET_BITS)
+encrypted_secret = ts.ckks_vector(context, [secret])
+
+public_context = context.copy()
+public_context.make_context_public()
+```
+
+Then it loops 100 times. Each round takes a serialized ciphertext, evaluates the
+degree-8 Chebyshev polynomial on it, and leaks **one bit** — the sign of the
+result:
+
+```python
+ciphertext = ts.ckks_vector_from(context, blob)
+
+normalized = ciphertext * (1.0 / NORMALIZATION1) * (1.0 / NORMALIZATION2)
+
+result = (
+    chebyshev8(normalized)
+    .decrypt()[0]
+)
+...
+print("Positive" if result > 0 else "Not positive")
+
+guess = int(input("Secret: "))
+if guess == secret:
+    print(FLAG)
+```
+
+So the oracle is `sign(T8(v / 2^49))` for any `v` I can produce homomorphically,
+and I get one guess per round alongside it. Fifty bits, one hundred bits of
+feedback — a binary search fits, if each query can be aimed.
+
+## The Vulnerability
+
+Having the public context means I can evaluate on the ciphertext myself before
+submitting it. If I can build `v = m·secret − c` for chosen `m` and `c`, then
+
+```text
+x = (m·secret − c) / 2^49
+```
+
+and the oracle tells me whether `T8(x)` is positive. `T8` is even, so the sign of
+`T8` is a function of `|x|` alone. Its roots are at `cos((2k+1)π/16)`, giving four
+positive radii:
+
+```text
+r1 = 0.19509   r2 = 0.55557   r3 = 0.83147   r4 = 0.98079
+```
+
+and `T8(x) > 0` exactly on
+
+```text
+|x| < r1     or     r2 < |x| < r3     or     |x| > r4
+```
+
+Keep the whole candidate range inside `|x| <= r2` and the middle two bands never
+come into play, so the oracle degrades to a clean membership test:
+
+```text
+Positive  <=>  |m·secret − c| < r1 · 2^49
+```
+
+which is "is the secret inside this interval". Pick `m` and `c` so the interval
+covers a little more than half the remaining candidates and each round halves
+the search space.
+
+## The First Obstacle: No Plaintext Multiplication
+
+Building `m·secret` looks like a one-liner, and it is not. Any plaintext
+multiply from the client side kills the server's evaluation:
+
+```python
+tests = {
+ "mult only":     lambda: c0 * 0.5,
+ "add only":      lambda: c0 + 123.0,
+ "mult then add": lambda: (c0 * 0.5) + 123.0,
+ "add then mult": lambda: (c0 + 123.0) * 0.5,
+}
+```
+
+```text
+mult only      FAILED: ValueError('scale out of bounds')
+add only    -> 0.9757967994716341
+mult then add  FAILED: ValueError('scale out of bounds')
+add then mult  FAILED: ValueError('scale out of bounds')
+double 3x   -> 424279.9436124598
+```
+
+The modulus chain has no room for an extra rescale before the server's own two
+divisions and the degree-8 polynomial. Only **additions** survive — and addition
+is enough: `ct + ct` doubles the value at no level cost, so double-and-add builds
+`m·secret` for any positive integer `m`, and plaintext constants can be added for
+free at any point.
+
+## The Second Obstacle: The Constant Does Not Fit In A Double
+
+At the end of the search `m` is around `2·10^14`, so `c ≈ m·secret ≈ 2^98`. A
+float64 at that magnitude has a granularity of `2^-52 · 2^98 ≈ 4·10^13`, which is
+a sizeable fraction of the `1.1·10^14` decision threshold. Handing the server one
+big constant would smear the boundary.
+
+The fix is to fold `c` into the doubling ladder. Walking the bits of `m` from the
+top, each step doubles whatever constant has accumulated so far, so subtracting
+`a_R` at the step with `R` doublings remaining contributes `a_R · 2^R`. Splitting
+`c` into digits that are each exact integers below `2^53` makes every added
+constant exactly representable:
+
+```python
+def decompose(m, c):
+    """split constant c across the double-and-add steps"""
+    bits = bin(m)[2:]; K = len(bits) - 1
+    rem = c; a = {}
+    for Rr in range(K, -1, -1):
+        a[Rr] = float(int(rem / (2.0 ** Rr))); rem -= a[Rr] * (2.0 ** Rr)
+    a[0] += rem
+    cexact = sum(F(a[Rr]) * (2 ** Rr) for Rr in a)
+    return bits, a, cexact
+
+
+def build(m, c):
+    bits, a, cx = decompose(m, c)
+    K = len(bits) - 1
+    q = c0 + (-a[K])
+    for idx, b in enumerate(bits[1:], 1):
+        Rr = K - idx
+        q = q + q
+        if b == '1':
+            q = q + c0
+        q = q + (-a[Rr])
+    return q, cx
+```
+
+`decompose` also returns the **exact rational** value of the constant it actually
+realized. That matters for the next part.
+
+## Tracking The Candidate Set Exactly
+
+Early on, the candidate range spans the full `2^50` and no integer `m >= 1` makes
+it fit inside `|x| <= r2`, so the outer bands really are in play and a "positive"
+answer means the secret lies in a union of up to five intervals. Rather than
+special-case that, I kept the candidate set as a **union of integer intervals**
+and applied the true predicate every round:
+
+```python
+POS_X = [(-INF, -r4), (-r3, -r2), (-r1, r1), (r2, r3), (r4, INF)]
+
+def pos_int_intervals(m, cexact, lo, hi):
+    res = []
+    for x0, x1 in POS_X:
+        a = lo if x0 == -INF else max(lo, math.ceil((cexact + F(x0) * U) / m))
+        b = hi if x1 == INF else min(hi, math.floor((cexact + F(x1) * U) / m))
+        if a <= b:
+            res.append((a, b))
+    ...
+```
+
+Everything runs through `fractions.Fraction`. Computing the interval endpoints in
+float64 was the bug that cost me the most time — with `c` near `2^98`, adding
+`r1·2^49 ≈ 10^14` to it is lost entirely in the rounding, so the solver's model of
+its own query drifted away from what the server was actually being asked, and the
+search converged confidently onto the wrong value.
+
+Query selection then just picks the `(m, c)` that splits the remaining set most
+evenly, trying a spread of rank-based split points plus a scan over `c` at `m = 1`
+for the opening rounds where no integer `m` gives a clean test:
+
+```python
+def choose_query(C):
+    lo = C[0][0]; hi = C[-1][1]; W = hi - lo + 1; n = size(C)
+    cands = []
+    for q in [x / 40 for x in range(1, 40)]:
+        p = nth(C, int(q * n))
+        d = (p - lo) / 2.0
+        if d <= 0: continue
+        m = max(1, int(round(r1 * U / d)))
+        cands.append((m, float(m) * (lo + p) / 2.0))
+    if r1 * U / (0.28 * W) < 1.0:
+        s0 = lo - 1.05 * U; s1 = hi + 1.05 * U
+        for k in range(801):
+            cands.append((1, s0 + (s1 - s0) * k / 800))
+    ...
+```
+
+## Exploitation
+
+Against a local replica the search closes in 50 queries with every decision
+correct. Remotely it took 49, including the kCTF proof of work:
+
+```text
+q0  m=1          |C|=1125899906842624 Not positive guess=...
+q1  m=1          |C|=562949953421312  Positive     guess=...
+...
+q45 m=2496047447544   |C|=12 Positive     guess=51385970989688
+q46 m=2678685065657   |C|=6  Positive     guess=51385970989765
+q47 m=73217391794619  |C|=3  Not positive guess=51385970989768
+q48 m=219652175383856 |C|=2  Positive     guess=51385970989769 -> uiuctf{s34rch1ng_th3_sp4c3_667f4c3d}
+```
+
+CKKS noise never became a factor — the polynomial evaluation stayed accurate to
+about `5·10^-8` at `T8(0)`, and every decision boundary sat orders of magnitude
+away from that.
+
+## Flag
+
+```text
+uiuctf{s34rch1ng_th3_sp4c3_667f4c3d}
+```
